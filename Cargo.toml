@@ -1,0 +1,8 @@
+[package]
+name = "mcts"
+version = "0.1.0"
+edition = "2024"
+description = "Generic N-player MCTS, AlphaZero, and Minimax engine in Rust"
+license = "MIT"
+
+[dependencies]
