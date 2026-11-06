@@ -22,9 +22,10 @@
 //!   and call `backpropagate`—achieving full GPU saturation with **zero virtual loss** and 100%
 //!   informed PUCT selections.
 
+use rand::prelude::{IndexedRandom, RngExt, SeedableRng, SliceRandom, SmallRng};
+
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::player::Player;
-use crate::rng::Rng;
 use crate::tree::{GenerationalTree, Node, NodeId};
 
 /// Per-node statistics stored inside [`Node<M, MctsPayload>`].
@@ -166,7 +167,7 @@ pub trait LeafEvaluator<R: GameRules<N>, const N: usize> {
 /// Classical uniform random rollout evaluator (port of `montecarlo::Player::playout`).
 #[derive(Clone, Debug)]
 pub struct PlayoutEvaluator<M> {
-    rng: Rng,
+    rng: SmallRng,
     move_buf: Vec<M>,
     playout_count: u64,
 }
@@ -174,7 +175,7 @@ pub struct PlayoutEvaluator<M> {
 impl<M> PlayoutEvaluator<M> {
     pub fn new(seed: u64) -> Self {
         Self {
-            rng: Rng::from_seed(seed),
+            rng: SmallRng::seed_from_u64(seed),
             move_buf: Vec::with_capacity(32),
             playout_count: 0,
         }
@@ -199,12 +200,11 @@ impl<R: GameRules<N>, const N: usize> LeafEvaluator<R, N> for PlayoutEvaluator<R
                 return payoffs;
             }
             sim_game.write_valid_moves(&mut self.move_buf);
-            assert!(
-                !self.move_buf.is_empty(),
-                "Ongoing game state produced no valid moves during playout"
-            );
-            let choice = self.rng.random_range(self.move_buf.len());
-            sim_game = sim_game.apply(self.move_buf[choice]);
+            let &mv = self
+                .move_buf
+                .choose(&mut self.rng)
+                .expect("Ongoing game state produced no valid moves during playout");
+            sim_game = sim_game.apply(mv);
         }
     }
 }
@@ -245,7 +245,7 @@ pub struct MctsSearch<R: GameRules<N>, const N: usize, S: SelectionPolicy> {
     root_game: Game<R, N>,
     tree: GenerationalTree<R::Move, MctsPayload>,
     selector: S,
-    rng: Rng,
+    rng: SmallRng,
     /// Reusable root-to-leaf `(child_id, acting_player_who_chose_child)` stack.
     path_buf: Vec<(NodeId, PlayerIndex<N>)>,
     /// Reusable buffer for bulk move generation during leaf expansion.
@@ -267,7 +267,7 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
             root_game,
             tree: GenerationalTree::new(arena_capacity, dummy_move, MctsPayload::default()),
             selector,
-            rng: Rng::from_seed(seed),
+            rng: SmallRng::seed_from_u64(seed),
             path_buf: Vec::with_capacity(64),
             move_buf: Vec::with_capacity(32),
         }
@@ -315,7 +315,7 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
                     "Ongoing game state must yield at least one valid move"
                 );
                 // Shuffle move order once at expansion to eliminate board-index tie bias.
-                self.rng.shuffle(&mut self.move_buf);
+                self.move_buf.shuffle(&mut self.rng);
 
                 let uniform_prior = 1.0 / (self.move_buf.len() as f32);
                 self.tree.active_mut().expand_from_iter(
@@ -422,12 +422,12 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
 
         let total_visits: u64 = children.iter().map(|c| c.payload.visits as u64).sum();
         if total_visits == 0 {
-            let idx = self.rng.random_range(children.len());
+            let idx = self.rng.random_range(0..children.len());
             let first = self.tree.root().first_child().index();
             return (NodeId::from_index(first + idx), children[idx].mv);
         }
 
-        let mut target = self.rng.random_range(total_visits as usize) as u64;
+        let mut target = self.rng.random_range(0..total_visits);
         let first = self.tree.root().first_child().index();
         for (offset, child) in children.iter().enumerate() {
             let v = child.payload.visits as u64;
@@ -443,7 +443,7 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     /// reusing the surviving subtree if `mv` was already expanded.
     pub fn advance(&mut self, mv: R::Move) -> bool {
         self.root_game = self.root_game.apply(mv);
-        self.tree.advance_by_move(mv, MctsPayload::default())
+        self.tree.advance_or_reset(mv)
     }
 
     /// Shannon entropy `-sum(p_i * ln(p_i))` of the root's normalized child visit distribution

@@ -4,6 +4,8 @@
 
 use std::time::Instant;
 
+use rand::prelude::{SeedableRng, SmallRng};
+
 use mcts::game::PlayerIndex;
 use mcts::games::tic_tac_toe::{EMPTY_STATE, NO_MOVE, TttGame, TttMove};
 use mcts::games::twist_puzzle::{
@@ -14,7 +16,6 @@ use mcts::mcts::{
     assign_masked_softmax_priors,
 };
 use mcts::player::Player;
-use mcts::rng::Rng;
 use mcts::tree::Node;
 
 fn main() {
@@ -32,8 +33,8 @@ fn main() {
         std::mem::size_of::<MctsPayload>()
     );
     println!(
-        "sizeof(Rng [Xoshiro256++]):           {} bytes",
-        std::mem::size_of::<Rng>()
+        "sizeof(SmallRng [rand crate]):        {} bytes",
+        std::mem::size_of::<SmallRng>()
     );
     println!();
 
@@ -166,7 +167,7 @@ fn main() {
     // 3. Single-player (`N = 1`) TwistPuzzle solving benchmark
     let puzzles = 100usize;
     let mut solved = 0usize;
-    let mut rng = Rng::from_seed(12345);
+    let mut rng = SmallRng::seed_from_u64(12345);
     let start_puzzle = Instant::now();
     for i in 0..puzzles {
         let state = TwistState::scrambled(3, 5, &mut rng);

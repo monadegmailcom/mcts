@@ -6,3 +6,4 @@ description = "Generic N-player MCTS, AlphaZero, and Minimax engine in Rust"
 license = "MIT"
 
 [dependencies]
+rand = "0.10.3"

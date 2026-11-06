@@ -290,10 +290,19 @@ impl<M: Copy, P: Copy> GenerationalTree<M, P> {
     }
 
     /// Advances the root to the child matching `mv` if already expanded; otherwise resets
-    /// to a fresh unexpanded root `(mv, fallback_payload)`.
+    /// to a fresh unexpanded root `(mv, P::default())`.
     ///
-    /// Returns `true` if an existing child subtree was reused.
-    pub fn advance_by_move(&mut self, mv: M, fallback_payload: P) -> bool
+    /// Returns `true` if an existing child subtree (with its accumulated visits/values) was reused.
+    pub fn advance_or_reset(&mut self, mv: M) -> bool
+    where
+        M: Eq,
+        P: Default,
+    {
+        self.advance_or_reset_with(mv, P::default)
+    }
+
+    /// Like [`Self::advance_or_reset`], computing `fallback` lazily only if `mv` was not expanded.
+    pub fn advance_or_reset_with(&mut self, mv: M, fallback: impl FnOnce() -> P) -> bool
     where
         M: Eq,
     {
@@ -307,7 +316,7 @@ impl<M: Copy, P: Copy> GenerationalTree<M, P> {
             self.advance_to(child_id);
             true
         } else {
-            self.reset_root(mv, fallback_payload);
+            self.reset_root(mv, fallback());
             false
         }
     }
@@ -368,7 +377,7 @@ mod tests {
         assert_eq!(tree.active().subtree_count(root), 6);
 
         // Advance to mv=20: only mv=20 and its two children [21, 22] survive (3 nodes total).
-        let reused = tree.advance_by_move(20, 0);
+        let reused = tree.advance_or_reset(20);
         assert!(reused);
         assert_eq!(tree.active().len(), 3);
         assert_eq!(tree.root().mv, 20);

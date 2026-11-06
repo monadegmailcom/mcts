@@ -12,8 +12,9 @@
 //! - Reaching `SOLVED_BOARD` yields `GameStatus::Terminal([1.0])`.
 //! - Exhausting `remaining_steps == 0` without solving yields `GameStatus::Terminal([-1.0])`.
 
+use rand::prelude::{Rng, RngExt};
+
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
-use crate::rng::Rng;
 
 pub type TwistMove = u8;
 pub const NO_MOVE: TwistMove = u8::MAX;
@@ -49,12 +50,12 @@ impl TwistState {
 
     /// Generates a scrambled puzzle state `scramble_depth` random rotations away from solved,
     /// avoiding immediate inverse move cancellations (`mv ^ 4`).
-    pub fn scrambled(scramble_depth: u8, step_budget: u8, rng: &mut Rng) -> Self {
+    pub fn scrambled(scramble_depth: u8, step_budget: u8, rng: &mut impl Rng) -> Self {
         let mut board = SOLVED_BOARD;
         let mut prev_move: Option<u8> = None;
         for _ in 0..scramble_depth {
             let mv = loop {
-                let candidate = rng.random_range(NUM_MOVES as usize) as u8;
+                let candidate = rng.random_range(0..NUM_MOVES);
                 if prev_move != Some(candidate ^ 4) {
                     break candidate;
                 }
@@ -148,7 +149,8 @@ mod tests {
 
     #[test]
     fn single_player_mcts_solves_scrambled_rotation_puzzle() {
-        let mut rng = Rng::from_seed(2026);
+        use rand::prelude::{SeedableRng, SmallRng};
+        let mut rng = SmallRng::seed_from_u64(2026);
         // Scramble 3 moves from solved with a 5-step budget (`N = 1` single-player search!).
         let state = TwistState::scrambled(3, 5, &mut rng);
         assert!(!state.is_solved());

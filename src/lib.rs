@@ -9,6 +9,5 @@ pub mod game;
 pub mod games;
 pub mod mcts;
 pub mod player;
-pub mod rng;
 pub mod statistics;
 pub mod tree;
