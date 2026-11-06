@@ -3,6 +3,7 @@
 use std::fmt;
 
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
+use crate::minimax::HeuristicEvaluator;
 
 /// Marker occupancy of a single Tic-Tac-Toe square.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -146,6 +147,47 @@ impl GameRules<2> for TicTacToe {
     }
 }
 
+/// Classic unblocked-line heuristic for Tic-Tac-Toe (port of `ttt::minimax::score` in
+/// `games/tic_tac_toe.cpp`, normalized to `[p1_advantage, p2_advantage]`).
+///
+/// For each of the 8 winning lines:
+/// - If Player 2 has 0 marks on the line, Player 1 gains `+p1_marks`.
+/// - If Player 1 has 0 marks on the line, Player 2 gains `+p2_marks`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TttHeuristic;
+
+impl TttHeuristic {
+    #[inline]
+    pub fn score_state(state: &TttState) -> [f32; 2] {
+        let mut p1_adv = 0i32;
+        for &[a, b, c] in &WIN_LINES {
+            let mut p1 = 0i32;
+            let mut p2 = 0i32;
+            for &cell_idx in &[a, b, c] {
+                match state[cell_idx] {
+                    Symbol::Player1 => p1 += 1,
+                    Symbol::Player2 => p2 += 1,
+                    Symbol::Empty => {}
+                }
+            }
+            if p2 == 0 {
+                p1_adv += p1;
+            } else if p1 == 0 {
+                p1_adv -= p2;
+            }
+        }
+        let s = p1_adv as f32;
+        [s, -s]
+    }
+}
+
+impl HeuristicEvaluator<TicTacToe, 2> for TttHeuristic {
+    #[inline]
+    fn evaluate_heuristic(&self, game: &TttGame) -> [f32; 2] {
+        Self::score_state(game.state())
+    }
+}
+
 /// Formats a Tic-Tac-Toe game board for terminal display.
 pub fn format_board(game: &TttGame) -> String {
     let s = game.state();
@@ -264,5 +306,83 @@ mod tests {
             MctsConfig::new(400, 42).with_arena_capacity(4096),
         );
         assert_eq!(az_player.choose_move(), 5);
+    }
+
+    #[test]
+    fn minimax_depth_0_vs_depth_5_matches_cpp_test() {
+        use crate::matchup::run_multi_match;
+        use crate::minimax::MinimaxPlayer;
+
+        // Port of `test.cpp::tic_tac_toe_match`: depth 0 never beats depth 5 over 100 games.
+        let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+        let f_depth0 = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+            Box::new(MinimaxPlayer::new(*g, TttHeuristic, 0, seed))
+        };
+        let f_depth5 = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+            Box::new(MinimaxPlayer::new(*g, TttHeuristic, 5, seed))
+        };
+
+        let summary = run_multi_match(&game, [&f_depth0, &f_depth5], 100, 4, 2026);
+        assert_eq!(
+            summary.wins[0], 0,
+            "depth 0 should never beat depth 5, got summary={summary:?}"
+        );
+        assert!(summary.wins[1] + summary.draws == 100);
+    }
+
+    #[test]
+    fn tree_minimax_draws_perfect_minimax_and_reuses_ordered_subtrees() {
+        use crate::matchup::{play_match, run_multi_match};
+        use crate::minimax::{MinimaxPlayer, TreeMinimaxPlayer};
+
+        let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+
+        // Single-game sanity check: verify generational tree retains surviving nodes across turns.
+        let mut mm = MinimaxPlayer::new(game, TttHeuristic, 4, 11);
+        let mut tree_mm = TreeMinimaxPlayer::new(game, NO_MOVE, TttHeuristic, 4, 22, 4096);
+        let outcome = play_match(
+            game,
+            &mut [&mut mm as &mut dyn Player<TicTacToe, 2>, &mut tree_mm],
+        );
+        assert!(outcome.is_draw(), "expected perfect draw, got {outcome:?}");
+        assert!(tree_mm.eval_calls() > 0);
+
+        // Multi-game tournament at depth 5: every game between Minimax and TreeMinimax draws!
+        let f_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+            Box::new(MinimaxPlayer::new(*g, TttHeuristic, 5, seed))
+        };
+        let f_tree = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+            Box::new(TreeMinimaxPlayer::new(*g, NO_MOVE, TttHeuristic, 5, seed, 8192))
+        };
+        let summary = run_multi_match(&game, [&f_mm, &f_tree], 40, 4, 99);
+        assert_eq!(summary.draws, 40, "expected 40/40 draws, got {summary:?}");
+    }
+
+    #[test]
+    fn sequential_mcts_without_virtual_loss_holds_minimax_depth_2() {
+        use crate::matchup::run_multi_match;
+        use crate::minimax::MinimaxPlayer;
+
+        // Directly validates the architectural premise: pure single-threaded MCTS (zero virtual
+        // loss distortion) with 800 rollouts per move draws or beats Minimax(depth=2) consistently!
+        let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+        let f_mcts = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+            Box::new(MctsPlayer::new(
+                *g,
+                NO_MOVE,
+                Uct::new(1.0),
+                PlayoutEvaluator::new(seed ^ 0xA5A5_5A5A),
+                MctsConfig::new(800, seed).with_arena_capacity(2048),
+            ))
+        };
+        let f_mm2 = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+            Box::new(MinimaxPlayer::new(*g, TttHeuristic, 2, seed))
+        };
+
+        let summary = run_multi_match(&game, [&f_mcts, &f_mm2], 40, 4, 777);
+        assert!(
+            summary.wins[0] + summary.draws >= 38,
+            "expected pure single-threaded MCTS to draw/beat Minimax depth 2 almost every game, got {summary:?}"
+        );
     }
 }

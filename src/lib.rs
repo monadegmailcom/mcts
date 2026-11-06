@@ -7,7 +7,9 @@
 
 pub mod game;
 pub mod games;
+pub mod matchup;
 pub mod mcts;
+pub mod minimax;
 pub mod player;
 pub mod statistics;
 pub mod tree;

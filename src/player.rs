@@ -19,3 +19,27 @@ pub trait Player<R: GameRules<N>, const N: usize> {
     /// Advances internal state by a valid move played by another participant.
     fn apply_external_move(&mut self, mv: R::Move);
 }
+
+impl<R: GameRules<N>, const N: usize, P: Player<R, N> + ?Sized> Player<R, N> for Box<P> {
+    #[inline]
+    fn choose_move(&mut self) -> R::Move {
+        (**self).choose_move()
+    }
+
+    #[inline]
+    fn apply_external_move(&mut self, mv: R::Move) {
+        (**self).apply_external_move(mv);
+    }
+}
+
+impl<R: GameRules<N>, const N: usize, P: Player<R, N> + ?Sized> Player<R, N> for &mut P {
+    #[inline]
+    fn choose_move(&mut self) -> R::Move {
+        (**self).choose_move()
+    }
+
+    #[inline]
+    fn apply_external_move(&mut self, mv: R::Move) {
+        (**self).apply_external_move(mv);
+    }
+}

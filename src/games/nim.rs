@@ -111,6 +111,9 @@ impl<const HEAPS: usize> GameRules<2> for Nim<HEAPS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matchup::run_multi_match;
+    use crate::minimax::MinimaxPlayer;
+    use crate::player::Player;
 
     #[test]
     fn nim_progression_matches_cpp_test() {
@@ -154,6 +157,26 @@ mod tests {
         assert_eq!(
             game.status(),
             GameStatus::single_winner(PlayerIndex::PLAYER2)
+        );
+    }
+
+    #[test]
+    fn nim_minimax_match_depth_2_vs_depth_3_matches_cpp_test() {
+        // Port of `test.cpp::nim_match`: 5 heaps [1, 2, 3, 4, 5], depth 2 vs depth 3, 100 rounds.
+        let game = NimGame::<5>::new(PlayerIndex::PLAYER1, [1, 2, 3, 4, 5]);
+        let f_depth2 = |g: &NimGame<5>, seed: u64| -> Box<dyn Player<Nim<5>, 2>> {
+            Box::new(MinimaxPlayer::zero(*g, 2, seed))
+        };
+        let f_depth3 = |g: &NimGame<5>, seed: u64| -> Box<dyn Player<Nim<5>, 2>> {
+            Box::new(MinimaxPlayer::zero(*g, 3, seed))
+        };
+
+        let summary = run_multi_match(&game, [&f_depth2, &f_depth3], 100, 4, 2026);
+        assert_eq!(summary.draws, 0);
+        assert!(
+            summary.wins[0] < 50 && summary.wins[1] > 50,
+            "expected depth 3 to beat depth 2 over 100 Nim games, got wins={:?}",
+            summary.wins
         );
     }
 }

@@ -7,14 +7,16 @@ use std::time::Instant;
 use rand::prelude::{SeedableRng, SmallRng};
 
 use mcts::game::PlayerIndex;
-use mcts::games::tic_tac_toe::{EMPTY_STATE, NO_MOVE, TttGame, TttMove};
+use mcts::games::tic_tac_toe::{EMPTY_STATE, NO_MOVE, TicTacToe, TttGame, TttHeuristic, TttMove};
 use mcts::games::twist_puzzle::{
     NO_MOVE as TWIST_NO_MOVE, TwistGame, TwistMove, TwistState,
 };
+use mcts::matchup::run_multi_match;
 use mcts::mcts::{
     FnEvaluator, MctsConfig, MctsPayload, MctsPlayer, PlayoutEvaluator, Puct, Uct,
     assign_masked_softmax_priors,
 };
+use mcts::minimax::{MinimaxPlayer, TreeMinimaxPayload, TreeMinimaxPlayer};
 use mcts::player::Player;
 use mcts::tree::Node;
 
@@ -27,6 +29,10 @@ fn main() {
     println!(
         "sizeof(Node<u16, MctsPayload>):       {} bytes",
         std::mem::size_of::<Node<u16, MctsPayload>>()
+    );
+    println!(
+        "sizeof(Node<TttMove, TreeMinimax>):   {} bytes",
+        std::mem::size_of::<Node<TttMove, TreeMinimaxPayload>>()
     );
     println!(
         "sizeof(MctsPayload):                  {} bytes",
@@ -192,5 +198,31 @@ fn main() {
     println!(
         "Solved: {solved}/{puzzles} in {:.3} ms",
         elapsed_puzzle.as_secs_f64() * 1000.0
+    );
+    println!();
+
+    // 4. Multithreaded `MultiMatch`: Minimax(depth=5) vs TreeMinimax(depth=5) over 500 games
+    let ttt_root = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+    let f_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+        Box::new(MinimaxPlayer::new(*g, TttHeuristic, 5, seed))
+    };
+    let f_tree_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
+        Box::new(TreeMinimaxPlayer::new(*g, NO_MOVE, TttHeuristic, 5, seed, 8192))
+    };
+
+    let start_mm = Instant::now();
+    let summary = run_multi_match(&ttt_root, [&f_mm, &f_tree_mm], 500, 8, 2026);
+    let elapsed_mm = start_mm.elapsed();
+    println!("=== Benchmark 4: MultiMatch (8 threads, 500 games, Minimax d=5 vs TreeMinimax d=5) ===");
+    println!(
+        "Wins: {:?}, Draws: {}, Wall time: {:.3} ms",
+        summary.wins,
+        summary.draws,
+        elapsed_mm.as_secs_f64() * 1000.0
+    );
+    println!(
+        "Mean choose_move() time — Minimax: {:.2} us, TreeMinimax: {:.2} us",
+        summary.choose_time_us[0].mean(),
+        summary.choose_time_us[1].mean()
     );
 }
