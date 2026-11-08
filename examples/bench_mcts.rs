@@ -7,9 +7,15 @@ use std::time::Instant;
 use rand::prelude::{SeedableRng, SmallRng};
 
 use mcts::game::PlayerIndex;
+use mcts::games::rubiks_cube::{
+    NO_MOVE as RUBIKS_NO_MOVE, RubiksGame, RubiksMove, RubiksState,
+};
 use mcts::games::tic_tac_toe::{EMPTY_STATE, NO_MOVE, TicTacToe, TttGame, TttHeuristic, TttMove};
 use mcts::games::twist_puzzle::{
     NO_MOVE as TWIST_NO_MOVE, TwistGame, TwistMove, TwistState,
+};
+use mcts::games::ultimate_ttt::{
+    EMPTY_STATE as UTTT_EMPTY, NO_MOVE as UTTT_NO_MOVE, UltimateTicTacToe, UtttGame, UtttHeuristic,
 };
 use mcts::matchup::run_multi_match;
 use mcts::mcts::{
@@ -231,5 +237,101 @@ fn main() {
         "Mean choose_move() time — Minimax(d=5): {:.2} us, TreeMinimax(600 evals): {:.2} us",
         summary.choose_time_us[0].mean(),
         summary.choose_time_us[1].mean()
+    );
+    println!();
+
+    // 5. Ultimate Tic-Tac-Toe (`N = 2`, 81 branching):
+    //    (a) Minimax(d=4) vs TreeMinimax(FixedDepth(4)) — measuring move-ordering pruning speedup
+    //    (b) MctsPlayer(1600 sims) vs TreeMinimax(MaxEvaluations(1600)) — equal budget head-to-head
+    let uttt_root = UtttGame::new(PlayerIndex::PLAYER1, UTTT_EMPTY);
+    let uttt_h = UtttHeuristic::default();
+
+    let f_uttt_mm4 = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2>> {
+        Box::new(MinimaxPlayer::new(*g, uttt_h, 4, seed))
+    };
+    let f_uttt_tree4 = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2>> {
+        Box::new(TreeMinimaxPlayer::new(
+            *g,
+            UTTT_NO_MOVE,
+            uttt_h,
+            MinimaxBudget::FixedDepth(4),
+            seed,
+            65_536,
+        ))
+    };
+    let uttt_d4 = run_multi_match(&uttt_root, [&f_uttt_mm4, &f_uttt_tree4], 64, 8, 2026);
+    println!("=== Benchmark 5a: Ultimate TTT FixedDepth=4 (64 games, 8 threads) ===");
+    println!(
+        "Wins [Minimax, TreeMinimax]: {:?}, Draws: {}",
+        uttt_d4.wins, uttt_d4.draws
+    );
+    println!(
+        "Mean choose_move() time — Minimax(d=4): {:.2} us vs TreeMinimax(d=4): {:.2} us ({:.2}x speedup!)",
+        uttt_d4.choose_time_us[0].mean(),
+        uttt_d4.choose_time_us[1].mean(),
+        uttt_d4.choose_time_us[0].mean() / uttt_d4.choose_time_us[1].mean()
+    );
+    println!();
+
+    let f_uttt_mcts = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2>> {
+        Box::new(MctsPlayer::new(
+            *g,
+            UTTT_NO_MOVE,
+            Uct::new(0.5),
+            PlayoutEvaluator::new(seed ^ 0xDEAD_BEEF),
+            MctsConfig::new(1_600, seed).with_arena_capacity(32_768),
+        ))
+    };
+    let f_uttt_tree_1600 = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2>> {
+        Box::new(TreeMinimaxPlayer::new(
+            *g,
+            UTTT_NO_MOVE,
+            uttt_h,
+            MinimaxBudget::MaxEvaluations(1_600),
+            seed,
+            32_768,
+        ))
+    };
+    let uttt_budget = run_multi_match(&uttt_root, [&f_uttt_mcts, &f_uttt_tree_1600], 64, 8, 909);
+    println!("=== Benchmark 5b: Ultimate TTT Equal-Budget Duel (1600 sims MCTS vs 1600 evals TreeMinimax, 64 games) ===");
+    println!(
+        "Wins [UCT-MCTS(1600), TreeMinimax(1600)]: {:?}, Draws: {}",
+        uttt_budget.wins, uttt_budget.draws
+    );
+    println!(
+        "Mean choose_move() time — UCT-MCTS(1600): {:.2} us vs TreeMinimax(1600): {:.2} us",
+        uttt_budget.choose_time_us[0].mean(),
+        uttt_budget.choose_time_us[1].mean()
+    );
+    println!();
+
+    // 6. Single-Player (`N = 1`) 3x3x3 Rubik's Cube (4-move scrambles, pure UCT MCTS before NN)
+    let cube_trials = 50usize;
+    let mut cube_solved = 0usize;
+    let mut cube_rng = SmallRng::seed_from_u64(333);
+    let start_cube = Instant::now();
+    for i in 0..cube_trials {
+        let state = RubiksState::scrambled(4, 5, &mut cube_rng);
+        let mut game = RubiksGame::new(PlayerIndex::P0, state);
+        let mut solver = MctsPlayer::new(
+            game,
+            RUBIKS_NO_MOVE,
+            Uct::new(1.4),
+            PlayoutEvaluator::<RubiksMove>::new(i as u64 + 500),
+            MctsConfig::new(4_000, i as u64 + 900).with_arena_capacity(65_536),
+        );
+        while game.status().is_ongoing() {
+            let mv = solver.choose_move();
+            game = game.apply(mv);
+        }
+        if game.state().is_solved() {
+            cube_solved += 1;
+        }
+    }
+    let elapsed_cube = start_cube.elapsed();
+    println!("=== Benchmark 6: N=1 3x3x3 Rubik's Cube (4-move scrambles, 4000 UCT sims/step, no NN yet) ===");
+    println!(
+        "Solved: {cube_solved}/{cube_trials} in {:.3} ms",
+        elapsed_cube.as_secs_f64() * 1000.0
     );
 }
