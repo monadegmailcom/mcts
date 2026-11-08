@@ -16,7 +16,7 @@ use mcts::mcts::{
     FnEvaluator, MctsConfig, MctsPayload, MctsPlayer, PlayoutEvaluator, Puct, Uct,
     assign_masked_softmax_priors,
 };
-use mcts::minimax::{MinimaxPlayer, TreeMinimaxPayload, TreeMinimaxPlayer};
+use mcts::minimax::{MinimaxBudget, MinimaxPlayer, TreeMinimaxPayload, TreeMinimaxPlayer};
 use mcts::player::Player;
 use mcts::tree::Node;
 
@@ -201,19 +201,26 @@ fn main() {
     );
     println!();
 
-    // 4. Multithreaded `MultiMatch`: Minimax(depth=5) vs TreeMinimax(depth=5) over 500 games
+    // 4. Multithreaded `MultiMatch`: Minimax(depth=5) vs TreeMinimax(MaxEvaluations(600)) over 500 games
     let ttt_root = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
     let f_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
         Box::new(MinimaxPlayer::new(*g, TttHeuristic, 5, seed))
     };
     let f_tree_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
-        Box::new(TreeMinimaxPlayer::new(*g, NO_MOVE, TttHeuristic, 5, seed, 8192))
+        Box::new(TreeMinimaxPlayer::new(
+            *g,
+            NO_MOVE,
+            TttHeuristic,
+            MinimaxBudget::MaxEvaluations(600),
+            seed,
+            8192,
+        ))
     };
 
     let start_mm = Instant::now();
     let summary = run_multi_match(&ttt_root, [&f_mm, &f_tree_mm], 500, 8, 2026);
     let elapsed_mm = start_mm.elapsed();
-    println!("=== Benchmark 4: MultiMatch (8 threads, 500 games, Minimax d=5 vs TreeMinimax d=5) ===");
+    println!("=== Benchmark 4: MultiMatch (8 threads, 500 games, Minimax d=5 vs TreeMinimax MaxEvaluations(600)) ===");
     println!(
         "Wins: {:?}, Draws: {}, Wall time: {:.3} ms",
         summary.wins,
@@ -221,7 +228,7 @@ fn main() {
         elapsed_mm.as_secs_f64() * 1000.0
     );
     println!(
-        "Mean choose_move() time — Minimax: {:.2} us, TreeMinimax: {:.2} us",
+        "Mean choose_move() time — Minimax(d=5): {:.2} us, TreeMinimax(600 evals): {:.2} us",
         summary.choose_time_us[0].mean(),
         summary.choose_time_us[1].mean()
     );

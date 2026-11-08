@@ -333,13 +333,20 @@ mod tests {
     #[test]
     fn tree_minimax_draws_perfect_minimax_and_reuses_ordered_subtrees() {
         use crate::matchup::{play_match, run_multi_match};
-        use crate::minimax::{MinimaxPlayer, TreeMinimaxPlayer};
+        use crate::minimax::{MinimaxBudget, MinimaxPlayer, TreeMinimaxPlayer};
 
         let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
 
         // Single-game sanity check: verify generational tree retains surviving nodes across turns.
         let mut mm = MinimaxPlayer::new(game, TttHeuristic, 4, 11);
-        let mut tree_mm = TreeMinimaxPlayer::new(game, NO_MOVE, TttHeuristic, 4, 22, 4096);
+        let mut tree_mm = TreeMinimaxPlayer::new(
+            game,
+            NO_MOVE,
+            TttHeuristic,
+            MinimaxBudget::FixedDepth(4),
+            22,
+            4096,
+        );
         let outcome = play_match(
             game,
             &mut [&mut mm as &mut dyn Player<TicTacToe, 2>, &mut tree_mm],
@@ -347,12 +354,19 @@ mod tests {
         assert!(outcome.is_draw(), "expected perfect draw, got {outcome:?}");
         assert!(tree_mm.eval_calls() > 0);
 
-        // Multi-game tournament at depth 5: every game between Minimax and TreeMinimax draws!
+        // Multi-game tournament at depth 5 vs dynamic MaxEvaluations(600): every game draws!
         let f_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
             Box::new(MinimaxPlayer::new(*g, TttHeuristic, 5, seed))
         };
         let f_tree = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> {
-            Box::new(TreeMinimaxPlayer::new(*g, NO_MOVE, TttHeuristic, 5, seed, 8192))
+            Box::new(TreeMinimaxPlayer::new(
+                *g,
+                NO_MOVE,
+                TttHeuristic,
+                MinimaxBudget::MaxEvaluations(600),
+                seed,
+                8192,
+            ))
         };
         let summary = run_multi_match(&game, [&f_mm, &f_tree], 40, 4, 99);
         assert_eq!(summary.draws, 40, "expected 40/40 draws, got {summary:?}");

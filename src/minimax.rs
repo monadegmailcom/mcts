@@ -21,6 +21,8 @@
 //! - `depth = 0` expands all legal root moves and evaluates the resulting child positions (1 ply).
 //! - `depth = d` searches `d + 1` plies from the root (`depth = 2` is 3-ply lookahead).
 
+use std::time::{Duration, Instant};
+
 use rand::prelude::{SeedableRng, SliceRandom, SmallRng};
 
 use crate::game::{Game, GameRules, GameStatus};
@@ -310,6 +312,92 @@ where
     best_vec
 }
 
+/// Stopping budget for iterative-deepening [`TreeMinimaxPlayer`].
+///
+/// Replaces C++ `minimax-tree.h`'s fixed `max_depth` loop with an algebraic sum type supporting
+/// both fixed-horizon search and anytime dynamic-depth search capped by evaluation count or clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MinimaxBudget {
+    /// Searches up to `max_depth + 1` plies from the root (matches [`MinimaxPlayer`] at
+    /// `max_depth` 1-to-1, stopping early if the entire remaining game tree reaches terminal states).
+    FixedDepth(u32),
+    /// Dynamically deepens (`1, 2, 3, ...` plies) up to at most `max_evals` node evaluations per
+    /// turn. Always completes the 1-ply root scan (`d = 1`) so every legal move is scored once.
+    MaxEvaluations(usize),
+    /// Dynamically deepens (`1, 2, 3, ...` plies) until `duration` elapses on this turn.
+    /// Always completes the 1-ply root scan (`d = 1`) so a valid legal move is guaranteed.
+    MaxDuration(Duration),
+}
+
+/// Zero-sized error sentinel used to unwind [`TreeMinimaxPlayer::eval_node`] cleanly via Rust's
+/// `?` operator when [`MinimaxBudget::MaxEvaluations`] or [`MinimaxBudget::MaxDuration`] expires
+/// mid-iteration—without C++ exception stack-unwinding or corrupting partial node orderings.
+#[derive(Clone, Copy, Debug)]
+struct SearchAborted;
+
+struct TurnTracker {
+    budget: MinimaxBudget,
+    turn_evals: usize,
+    deadline: Option<Instant>,
+    allow_abort: bool,
+    hit_horizon: bool,
+}
+
+impl TurnTracker {
+    #[inline]
+    fn new(budget: MinimaxBudget) -> Self {
+        let deadline = match budget {
+            MinimaxBudget::MaxDuration(dur) => Some(Instant::now() + dur),
+            _ => None,
+        };
+        Self {
+            budget,
+            turn_evals: 0,
+            deadline,
+            allow_abort: false,
+            hit_horizon: false,
+        }
+    }
+
+    /// Checks whether the budget is already spent before starting a new depth iteration `d >= 2`.
+    #[inline]
+    fn is_exhausted(&self) -> bool {
+        match self.budget {
+            MinimaxBudget::FixedDepth(_) => false,
+            MinimaxBudget::MaxEvaluations(limit) => self.turn_evals >= limit,
+            MinimaxBudget::MaxDuration(_) => {
+                self.deadline.is_some_and(|dl| Instant::now() >= dl)
+            }
+        }
+    }
+
+    /// Accounts for one node evaluation, returning `Err(SearchAborted)` if an active dynamic
+    /// budget is exceeded.
+    #[inline]
+    fn step(&mut self) -> Result<(), SearchAborted> {
+        if self.allow_abort {
+            match self.budget {
+                MinimaxBudget::FixedDepth(_) => {}
+                MinimaxBudget::MaxEvaluations(limit) => {
+                    if self.turn_evals >= limit {
+                        return Err(SearchAborted);
+                    }
+                }
+                MinimaxBudget::MaxDuration(_) => {
+                    // Poll OS clock every 64 evaluations (~0.05 ns/node amortized overhead).
+                    if (self.turn_evals & 63) == 0
+                        && self.deadline.is_some_and(|dl| Instant::now() >= dl)
+                    {
+                        return Err(SearchAborted);
+                    }
+                }
+            }
+        }
+        self.turn_evals += 1;
+        Ok(())
+    }
+}
+
 /// Per-node evaluation payload for [`TreeMinimaxPlayer`] (`4` bytes; total `Node<u8, _>` is **12 bytes**!).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TreeMinimaxPayload {
@@ -319,30 +407,41 @@ pub struct TreeMinimaxPayload {
 }
 
 /// Iterative-deepening Alpha-Beta player with persistent move-ordered search tree
-/// (port of C++ `minimax::tree::Player` in `minimax-tree.h`).
+/// (port & anytime generalization of C++ `minimax::tree::Player` in `minimax-tree.h`).
 ///
-/// Searches depths `0 ..= max_depth + 1` from the root, stably sorting evaluated children
-/// after each node visit so Principal Variation moves are searched first on deeper iterations
-/// and subsequent turns (via [`GenerationalTree::advance_to`]).
+/// Stably sorts evaluated children after each completed node visit so Principal Variation moves
+/// are searched first on deeper iterations and subsequent turns (via [`GenerationalTree::advance_to`]).
+///
+/// ### Dynamic-Depth Safeguards (`MaxEvaluations` / `MaxDuration`)
+/// 1. **Abort-Safe Unwinding (`?`)**: If the budget expires mid-iteration (`d >= 2`), `eval_node`
+///    returns `Err(SearchAborted)` immediately before overwriting unfinished parent orderings.
+/// 2. **Root PV Salvaging**: At the root, if `M0` (from `d - 1`) and a better move `M_k` both
+///    complete cleanly at depth `d` before a later sibling aborts, `M_k` (searched with open
+///    `beta = +INF`, hence exact) is promoted to index `0` via `rotate_right(1)`.
+/// 3. **Exact Endgame Stop (`!hit_horizon`)**: If an iteration finishes without hitting `depth == 0`
+///    anywhere in the unpruned tree, every leaf was a terminal outcome—deepening stops immediately
+///    instead of re-searching a solved endgame until the budget runs out.
 pub struct TreeMinimaxPlayer<R: GameRules<2>, H = ZeroHeuristic> {
     game: Game<R, 2>,
     tree: GenerationalTree<R::Move, TreeMinimaxPayload>,
     heuristic: H,
-    max_depth: u32,
+    budget: MinimaxBudget,
     rng: SmallRng,
     move_buf: Vec<R::Move>,
     eval_calls: usize,
+    last_turn_evals: usize,
+    last_completed_depth: u32,
 }
 
 impl<R: GameRules<2>> TreeMinimaxPlayer<R, ZeroHeuristic> {
     pub fn zero(
         game: Game<R, 2>,
         sentinel_move: R::Move,
-        max_depth: u32,
+        budget: MinimaxBudget,
         seed: u64,
         arena_capacity: usize,
     ) -> Self {
-        Self::new(game, sentinel_move, ZeroHeuristic, max_depth, seed, arena_capacity)
+        Self::new(game, sentinel_move, ZeroHeuristic, budget, seed, arena_capacity)
     }
 }
 
@@ -351,7 +450,7 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
         game: Game<R, 2>,
         sentinel_move: R::Move,
         heuristic: H,
-        max_depth: u32,
+        budget: MinimaxBudget,
         seed: u64,
         arena_capacity: usize,
     ) -> Self {
@@ -363,10 +462,12 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
                 TreeMinimaxPayload::default(),
             ),
             heuristic,
-            max_depth,
+            budget,
             rng: SmallRng::seed_from_u64(seed),
             move_buf: Vec::new(),
             eval_calls: 0,
+            last_turn_evals: 0,
+            last_completed_depth: 0,
         }
     }
 
@@ -381,8 +482,27 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
     }
 
     #[inline]
+    pub const fn budget(&self) -> MinimaxBudget {
+        self.budget
+    }
+
+    /// Cumulative node evaluations across all turns played so far.
+    #[inline]
     pub const fn eval_calls(&self) -> usize {
         self.eval_calls
+    }
+
+    /// Node evaluations performed during the most recent `choose_move()` call.
+    #[inline]
+    pub const fn last_turn_evals(&self) -> usize {
+        self.last_turn_evals
+    }
+
+    /// Deepest full ply horizon `d` from the root (`1` = 1-ply `depth 0`, `6` = 6-ply `depth 5`)
+    /// completed during the most recent `choose_move()` call.
+    #[inline]
+    pub const fn last_completed_depth(&self) -> u32 {
+        self.last_completed_depth
     }
 
     fn ensure_children(&mut self, node_id: NodeId, game: &Game<R, 2>) {
@@ -398,6 +518,86 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
         }
     }
 
+    /// Searches one iterative-deepening ply `plies >= 1` at `root_id`, returning `true` if the
+    /// full root iteration completed or `false` if aborted mid-iteration by `tracker`.
+    fn search_root_iteration(
+        &mut self,
+        root_id: NodeId,
+        root_game: &Game<R, 2>,
+        plies: u32,
+        tracker: &mut TurnTracker,
+    ) -> bool {
+        let actor = root_game.current_player();
+        let root_snapshot = *self.tree.active().get(root_id);
+        let child_count = root_snapshot.child_count();
+        let first_idx = root_snapshot.first_child().index();
+
+        let mut best_score = f32::NEG_INFINITY;
+        let mut best_offset = 0usize;
+        let mut completed_children = 0usize;
+        let mut aborted = false;
+
+        for offset in 0..child_count {
+            let child_id = NodeId::from_index(first_idx + offset);
+            let mv = self.tree.active().get(child_id).mv;
+            let child_game = root_game.apply(mv);
+
+            let res = if child_game.current_player() == actor {
+                self.eval_node(
+                    child_id,
+                    &child_game,
+                    plies - 1,
+                    best_score,
+                    f32::INFINITY,
+                    tracker,
+                )
+            } else {
+                self.eval_node(
+                    child_id,
+                    &child_game,
+                    plies - 1,
+                    f32::NEG_INFINITY,
+                    -best_score,
+                    tracker,
+                )
+                .map(|v| -v)
+            };
+
+            match res {
+                Ok(score) => {
+                    self.tree.active_mut().get_mut(child_id).payload.evaluation = score;
+                    if score > best_score {
+                        best_score = score;
+                        best_offset = offset;
+                    }
+                    completed_children = offset + 1;
+                }
+                Err(SearchAborted) => {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+
+        if !aborted {
+            self.tree
+                .active_mut()
+                .children_mut(root_id)
+                .sort_by(|a, b| b.payload.evaluation.total_cmp(&a.payload.evaluation));
+            self.tree.root_mut().payload.evaluation = best_score;
+            true
+        } else {
+            // Root PV salvaging: if child 0 (`d - 1`'s best move) AND a subsequent move `best_offset`
+            // both completed at depth `plies` with `score(best_offset) > score(0)` (exact because
+            // `beta = +INF`), promote `best_offset` to index 0 while preserving remaining order!
+            if completed_children >= 1 && best_offset > 0 {
+                self.tree.active_mut().children_mut(root_id)[0..=best_offset].rotate_right(1);
+                self.tree.root_mut().payload.evaluation = best_score;
+            }
+            false
+        }
+    }
+
     fn eval_node(
         &mut self,
         node_id: NodeId,
@@ -405,16 +605,19 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
         depth: u32,
         mut alpha: f32,
         beta: f32,
-    ) -> f32 {
-        self.eval_calls += 1;
+        tracker: &mut TurnTracker,
+    ) -> Result<f32, SearchAborted> {
+        tracker.step()?;
+
         let actor = game.current_player();
         let actor_idx = actor.index();
 
         if let GameStatus::Terminal(payoffs) = game.status() {
-            return terminal_score_for(payoffs[actor_idx], depth);
+            return Ok(terminal_score_for(payoffs[actor_idx], depth));
         }
         if depth == 0 {
-            return self.heuristic.evaluate_heuristic(game)[actor_idx];
+            tracker.hit_horizon = true;
+            return Ok(self.heuristic.evaluate_heuristic(game)[actor_idx]);
         }
 
         self.ensure_children(node_id, game);
@@ -432,9 +635,9 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
             let child_game = game.apply(mv);
 
             let score = if child_game.current_player() == actor {
-                self.eval_node(child_id, &child_game, depth - 1, alpha, beta)
+                self.eval_node(child_id, &child_game, depth - 1, alpha, beta, tracker)?
             } else {
-                -self.eval_node(child_id, &child_game, depth - 1, -beta, -alpha)
+                -self.eval_node(child_id, &child_game, depth - 1, -beta, -alpha, tracker)?
             };
 
             self.tree.active_mut().get_mut(child_id).payload.evaluation = score;
@@ -457,7 +660,7 @@ impl<R: GameRules<2>, H: HeuristicEvaluator<R, 2>> TreeMinimaxPlayer<R, H> {
         self.tree.active_mut().children_mut(node_id)[..evaluated_count]
             .sort_by(|a, b| b.payload.evaluation.total_cmp(&a.payload.evaluation));
 
-        best
+        Ok(best)
     }
 }
 
@@ -474,16 +677,45 @@ where
 
         let root_id = self.tree.root_id();
         let root_game = self.game.clone();
-        for d in 0..=(self.max_depth + 1) {
-            let val = self.eval_node(root_id, &root_game, d, f32::NEG_INFINITY, f32::INFINITY);
-            self.tree.root_mut().payload.evaluation = val;
-        }
-
-        let best_child_id = self.tree.root().first_child();
+        self.ensure_children(root_id, &root_game);
         assert!(
-            best_child_id.is_some(),
+            self.tree.root().has_children(),
             "TreeMinimaxPlayer::choose_move found no valid moves"
         );
+
+        let max_plies = match self.budget {
+            MinimaxBudget::FixedDepth(max_depth) => max_depth.saturating_add(1),
+            MinimaxBudget::MaxEvaluations(_) | MinimaxBudget::MaxDuration(_) => u32::MAX,
+        };
+
+        let mut tracker = TurnTracker::new(self.budget);
+        self.last_completed_depth = 0;
+
+        for plies in 1..=max_plies {
+            if plies >= 2 && tracker.is_exhausted() {
+                break;
+            }
+            tracker.allow_abort =
+                !matches!(self.budget, MinimaxBudget::FixedDepth(_)) && plies >= 2;
+            tracker.hit_horizon = false;
+
+            let completed = self.search_root_iteration(root_id, &root_game, plies, &mut tracker);
+            if !completed {
+                break;
+            }
+            self.last_completed_depth = plies;
+
+            // If no branch in the entire unpruned search stopped at `depth == 0`, every leaf was
+            // an exact `GameStatus::Terminal` outcome—further deepening cannot change the move!
+            if !tracker.hit_horizon {
+                break;
+            }
+        }
+
+        self.last_turn_evals = tracker.turn_evals;
+        self.eval_calls += tracker.turn_evals;
+
+        let best_child_id = self.tree.root().first_child();
         let chosen_mv = self.tree.active().get(best_child_id).mv;
 
         self.game = self.game.apply(chosen_mv);
@@ -584,5 +816,139 @@ mod tests {
             "expected deep Max^n agent to dominate shallow agents, got wins={:?}",
             summary.wins
         );
+    }
+
+    #[test]
+    fn max_evaluations_budget_strictly_caps_evals_and_dynamically_deepens() {
+        use crate::games::tic_tac_toe::{EMPTY_STATE, NO_MOVE, Symbol, TttGame, TttHeuristic};
+
+        let budget_limit = 180usize;
+        let mut game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+        let mut p1 = TreeMinimaxPlayer::new(
+            game,
+            NO_MOVE,
+            TttHeuristic,
+            MinimaxBudget::MaxEvaluations(budget_limit),
+            123,
+            4096,
+        );
+        let mut p2 = TreeMinimaxPlayer::new(
+            game,
+            NO_MOVE,
+            TttHeuristic,
+            MinimaxBudget::MaxEvaluations(budget_limit),
+            456,
+            4096,
+        );
+
+        let mut p1_depths = Vec::new();
+        while game.status().is_ongoing() {
+            if game.current_player() == PlayerIndex::PLAYER1 {
+                let mv = p1.choose_move();
+                assert!(
+                    p1.last_turn_evals() <= budget_limit,
+                    "exceeded MaxEvaluations({budget_limit}): {}",
+                    p1.last_turn_evals()
+                );
+                p1_depths.push(p1.last_completed_depth());
+                p2.apply_external_move(mv);
+                game = game.apply(mv);
+            } else {
+                let mv = p2.choose_move();
+                assert!(p2.last_turn_evals() <= budget_limit);
+                p1.apply_external_move(mv);
+                game = game.apply(mv);
+            }
+        }
+
+        // In the 9-move opening, `180` evaluations reaches ~2-3 plies; by the endgame with fewer
+        // legal moves + Alpha-Beta pruning, the exact same budget solves all remaining plies!
+        assert!(
+            p1_depths.first().copied().unwrap_or(0) <= 3,
+            "unexpectedly deep opening depth on 180-eval budget: {p1_depths:?}"
+        );
+
+        // Verify `!hit_horizon` early-stop: with 2 empty squares left, a 10_000-eval budget stops
+        // after solving those 2 plies (< 20 evaluations) instead of spinning forever!
+        let mut near_end = [
+            Symbol::Player1,
+            Symbol::Player2,
+            Symbol::Player1,
+            Symbol::Player2,
+            Symbol::Player1,
+            Symbol::Player2,
+            Symbol::Player2,
+            Symbol::Empty,
+            Symbol::Empty,
+        ];
+        near_end[7] = Symbol::Empty;
+        let endgame = TttGame::new(PlayerIndex::PLAYER1, near_end);
+        let mut solver = TreeMinimaxPlayer::new(
+            endgame,
+            NO_MOVE,
+            TttHeuristic,
+            MinimaxBudget::MaxEvaluations(10_000),
+            99,
+            1024,
+        );
+        let _mv = solver.choose_move();
+        assert!(
+            solver.last_turn_evals() < 30,
+            "expected `!hit_horizon` early-stop in 2-ply endgame, used {} evals",
+            solver.last_turn_evals()
+        );
+    }
+
+    #[test]
+    fn higher_evaluation_budget_dominates_lower_budget_and_duration_budget_works() {
+        use crate::games::nim::{NO_MOVE, Nim, NimGame};
+
+        // 5-heap Misère Nim: 400 evaluations/turn reaches significantly deeper than 30 evaluations/turn!
+        let game = NimGame::<5>::new(PlayerIndex::PLAYER1, [1, 2, 3, 4, 5]);
+        let f_small = |g: &NimGame<5>, seed: u64| -> Box<dyn Player<Nim<5>, 2>> {
+            Box::new(TreeMinimaxPlayer::zero(
+                *g,
+                NO_MOVE,
+                MinimaxBudget::MaxEvaluations(30),
+                seed,
+                2048,
+            ))
+        };
+        let f_large = |g: &NimGame<5>, seed: u64| -> Box<dyn Player<Nim<5>, 2>> {
+            Box::new(TreeMinimaxPlayer::zero(
+                *g,
+                NO_MOVE,
+                MinimaxBudget::MaxEvaluations(500),
+                seed,
+                8192,
+            ))
+        };
+
+        let summary = run_multi_match(&game, [&f_small, &f_large], 80, 4, 2026);
+        assert_eq!(summary.draws, 0);
+        assert!(
+            summary.wins[1] > summary.wins[0],
+            "expected MaxEvaluations(500) to beat MaxEvaluations(30), got wins={:?}",
+            summary.wins
+        );
+
+        // Verify `MaxDuration` completes cleanly and plays a full game under strict clock control.
+        let mut p_clock_1 = TreeMinimaxPlayer::zero(
+            game,
+            NO_MOVE,
+            MinimaxBudget::MaxDuration(Duration::from_micros(300)),
+            1,
+            4096,
+        );
+        let mut p_clock_2 = TreeMinimaxPlayer::zero(
+            game,
+            NO_MOVE,
+            MinimaxBudget::MaxDuration(Duration::from_micros(300)),
+            2,
+            4096,
+        );
+        let clock_outcome = play_match(game, &mut [&mut p_clock_1, &mut p_clock_2]);
+        assert!(clock_outcome.moves_played >= 5);
+        assert!(p_clock_1.last_completed_depth() >= 1);
     }
 }
