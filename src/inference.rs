@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_queue::ArrayQueue;
 use crossbeam_utils::Backoff;
@@ -207,7 +207,7 @@ where
     #[inline]
     fn wake_one_worker(&self) {
         for (parked, handle) in self.shared.worker_parked.iter().zip(self.workers.iter()) {
-            if parked.swap(false, Ordering::AcqRel) {
+            if parked.swap(false, Ordering::SeqCst) {
                 handle.thread().unpark();
                 return;
             }
@@ -217,7 +217,7 @@ where
     #[inline]
     fn wake_workers(&self) {
         for (parked, handle) in self.shared.worker_parked.iter().zip(self.workers.iter()) {
-            parked.store(false, Ordering::Release);
+            parked.store(false, Ordering::SeqCst);
             handle.thread().unpark();
         }
     }
@@ -228,7 +228,6 @@ where
         let mut state_batch: Vec<[f32; G]> = Vec::with_capacity(max_batch_size);
         let mut policy_batch: Vec<[f32; P]> = vec![[0.0; P]; max_batch_size];
         let mut value_batch: Vec<[f32; N]> = vec![[0.0; N]; max_batch_size];
-        let idle_backoff = Backoff::new();
 
         while !shared.stop.load(Ordering::Acquire) {
             while shared.paused.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
@@ -250,17 +249,18 @@ where
 
             let b = req_batch.len();
             if b == 0 {
-                idle_backoff.snooze();
-                if idle_backoff.is_completed() {
-                    shared.worker_parked[worker_id].store(true, Ordering::SeqCst);
-                    if shared.request_queue.is_empty() && !shared.stop.load(Ordering::Acquire) {
-                        thread::park_timeout(Duration::from_micros(200));
-                    }
-                    shared.worker_parked[worker_id].store(false, Ordering::Relaxed);
+                // Pure event-driven sleep: announce we are parked (`SeqCst`), re-check that no
+                // request arrived just before the store, and sleep until a producer unparks us.
+                shared.worker_parked[worker_id].store(true, Ordering::SeqCst);
+                if shared.request_queue.is_empty()
+                    && !shared.stop.load(Ordering::Acquire)
+                    && !shared.paused.load(Ordering::Acquire)
+                {
+                    thread::park();
                 }
+                shared.worker_parked[worker_id].store(false, Ordering::Relaxed);
                 continue;
             }
-            idle_backoff.reset();
 
             let start = Instant::now();
             shared.evaluator.evaluate_batch(
@@ -350,6 +350,7 @@ where
         while received < count {
             // Push as many remaining requests as fit into both the shared request queue
             // and our reply queue capacity.
+            let mut pushed_any = false;
             while submitted < count && (submitted - received) < self.reply_queue.capacity() {
                 let req = InferenceRequest {
                     tag: submitted,
@@ -360,12 +361,13 @@ where
                 match self.service.shared.request_queue.push(req) {
                     Ok(()) => {
                         submitted += 1;
+                        pushed_any = true;
                     }
                     Err(_) => break,
                 }
             }
 
-            if submitted > 0 {
+            if pushed_any {
                 self.service.wake_one_worker();
             }
 
@@ -383,11 +385,12 @@ where
             }
 
             if !made_progress {
-                backoff.snooze();
-                if backoff.is_completed() && submitted == count {
-                    // Permit-based park: if the inference worker already called `caller.unpark()`,
-                    // `park_timeout` consumes the permit and returns immediately without sleeping!
-                    thread::park_timeout(Duration::from_millis(1));
+                if submitted == count {
+                    // All requests have been submitted; sleep until the inference worker
+                    // pushes a response to `reply_queue` and calls `caller.unpark()`.
+                    thread::park();
+                } else {
+                    backoff.snooze();
                 }
             } else {
                 backoff.reset();
