@@ -231,11 +231,11 @@ where
         let idle_backoff = Backoff::new();
 
         while !shared.stop.load(Ordering::Acquire) {
-            if shared.paused.load(Ordering::Acquire) {
-                shared.worker_parked[worker_id].store(true, Ordering::Release);
-                thread::park_timeout(Duration::from_millis(1));
-                shared.worker_parked[worker_id].store(false, Ordering::Relaxed);
-                continue;
+            while shared.paused.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
+                thread::park();
+            }
+            if shared.stop.load(Ordering::Acquire) {
+                break;
             }
 
             // Drain up to `max_batch_size` pending requests from the lock-free queue.
