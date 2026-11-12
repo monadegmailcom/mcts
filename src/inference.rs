@@ -60,6 +60,7 @@ where
 }
 
 /// Completed neural network evaluation for a single submitted state.
+#[derive(Clone, Copy, Debug)]
 pub struct InferenceResponse<const P: usize, const N: usize> {
     pub tag: usize,
     pub policy_logits: [f32; P],
@@ -229,6 +230,11 @@ where
         let mut state_batch: Vec<[f32; G]> = Vec::with_capacity(max_batch_size);
         let mut policy_batch: Vec<[f32; P]> = vec![[0.0; P]; max_batch_size];
         let mut value_batch: Vec<[f32; N]> = vec![[0.0; N]; max_batch_size];
+        let mut postponed: Vec<(
+            Arc<ArrayQueue<InferenceResponse<P, N>>>,
+            Thread,
+            InferenceResponse<P, N>,
+        )> = Vec::with_capacity(max_batch_size);
 
         while !shared.stop.load(Ordering::Acquire) {
             while shared.paused.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
@@ -280,33 +286,45 @@ where
                 st.inference_time_us.update(elapsed_us_per_item as f32);
             }
 
-            // First enqueue all responses into their respective client reply queues, then unpark
-            // each waiting client once its entire batch slice is ready to be drained.
+            // Deliver responses to each caller's lock-free reply queue without head-of-line
+            // blocking: if one caller's reply queue is full, wake that caller and postpone only
+            // its item so other callers in the same batch receive their responses immediately.
             for ((req, &policy_logits), &value) in req_batch
-                .iter()
+                .drain(..)
                 .zip(policy_batch[..b].iter())
                 .zip(value_batch[..b].iter())
             {
-                let mut resp = InferenceResponse {
+                let resp = InferenceResponse {
                     tag: req.tag,
                     policy_logits,
                     value,
                 };
-                let push_backoff = Backoff::new();
-                while let Err(returned) = req.reply_queue.push(resp) {
-                    resp = returned;
-                    req.caller.unpark();
+                match req.reply_queue.push(resp) {
+                    Ok(()) => req.caller.unpark(),
+                    Err(returned) => {
+                        req.caller.unpark();
+                        postponed.push((req.reply_queue, req.caller, returned));
+                    }
+                }
+            }
+
+            let push_backoff = Backoff::new();
+            while !postponed.is_empty() && !shared.stop.load(Ordering::Acquire) {
+                postponed.retain(|(queue, caller, resp)| match queue.push(*resp) {
+                    Ok(()) => {
+                        caller.unpark();
+                        false
+                    }
+                    Err(_) => {
+                        caller.unpark();
+                        true
+                    }
+                });
+                if !postponed.is_empty() {
                     push_backoff.snooze();
                 }
             }
-            let mut prev_queue: Option<*const ArrayQueue<InferenceResponse<P, N>>> = None;
-            for req in req_batch.drain(..) {
-                let q_ptr = Arc::as_ptr(&req.reply_queue);
-                if prev_queue != Some(q_ptr) {
-                    req.caller.unpark();
-                    prev_queue = Some(q_ptr);
-                }
-            }
+            postponed.clear();
             state_batch.clear();
         }
     }
