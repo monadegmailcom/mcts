@@ -59,10 +59,11 @@ where
     }
 }
 
-struct InferenceResponse<const P: usize, const N: usize> {
-    tag: usize,
-    policy_logits: [f32; P],
-    value: [f32; N],
+/// Completed neural network evaluation for a single submitted state.
+pub struct InferenceResponse<const P: usize, const N: usize> {
+    pub tag: usize,
+    pub policy_logits: [f32; P],
+    pub value: [f32; N],
 }
 
 struct InferenceRequest<const G: usize, const P: usize, const N: usize> {
@@ -279,9 +280,10 @@ where
                 st.inference_time_us.update(elapsed_us_per_item as f32);
             }
 
-            // Deliver responses to each caller's lock-free reply queue and unpark caller.
+            // First enqueue all responses into their respective client reply queues, then unpark
+            // each waiting client once its entire batch slice is ready to be drained.
             for ((req, &policy_logits), &value) in req_batch
-                .drain(..)
+                .iter()
                 .zip(policy_batch[..b].iter())
                 .zip(value_batch[..b].iter())
             {
@@ -293,9 +295,17 @@ where
                 let push_backoff = Backoff::new();
                 while let Err(returned) = req.reply_queue.push(resp) {
                     resp = returned;
+                    req.caller.unpark();
                     push_backoff.snooze();
                 }
-                req.caller.unpark();
+            }
+            let mut prev_queue: Option<*const ArrayQueue<InferenceResponse<P, N>>> = None;
+            for req in req_batch.drain(..) {
+                let q_ptr = Arc::as_ptr(&req.reply_queue);
+                if prev_queue != Some(q_ptr) {
+                    req.caller.unpark();
+                    prev_queue = Some(q_ptr);
+                }
             }
             state_batch.clear();
         }
@@ -328,8 +338,49 @@ impl<E, const G: usize, const P: usize, const N: usize> InferenceClient<'_, E, G
 where
     E: BatchEvaluator<G, P, N> + 'static,
 {
-    /// Submits a slice of `states` (e.g., from `K` concurrent self-play games in a single wave)
-    /// to the shared lock-free [`InferenceService`] and waits until all `K` responses return.
+    /// Enqueues a single state evaluation request tagged with `tag` directly into the shared
+    /// lock-free [`InferenceService`] request queue without blocking for the response.
+    ///
+    /// Call [`Self::notify_service`] after enqueuing one or more requests to wake an idle
+    /// inference worker.
+    #[inline]
+    pub fn submit(&self, tag: usize, state: [f32; G]) {
+        let mut req = InferenceRequest {
+            tag,
+            state,
+            reply_queue: Arc::clone(&self.reply_queue),
+            caller: thread::current(),
+        };
+        let backoff = Backoff::new();
+        while let Err(returned) = self.service.shared.request_queue.push(req) {
+            req = returned;
+            self.service.wake_one_worker();
+            backoff.snooze();
+        }
+    }
+
+    /// Wakes one idle background inference worker (if any are currently parked).
+    #[inline]
+    pub fn notify_service(&self) {
+        self.service.wake_one_worker();
+    }
+
+    /// Pops the next completed [`InferenceResponse`] from this client's lock-free reply queue,
+    /// returning `None` if no responses have arrived yet.
+    #[inline]
+    pub fn try_pop(&self) -> Option<InferenceResponse<P, N>> {
+        self.reply_queue.pop()
+    }
+
+    /// Parks the calling thread until at least one response is available in `reply_queue`.
+    #[inline]
+    pub fn wait_for_response(&self) {
+        while self.reply_queue.is_empty() {
+            thread::park();
+        }
+    }
+
+    /// Convenience helper that submits a slice of `states` and blocks until all responses return.
     pub fn evaluate_batch(
         &mut self,
         states: &[[f32; G]],
@@ -342,58 +393,28 @@ where
         }
         assert!(out_policies.len() >= count && out_values.len() >= count);
 
-        let caller = thread::current();
         let mut submitted = 0usize;
         let mut received = 0usize;
-        let backoff = Backoff::new();
 
         while received < count {
-            // Push as many remaining requests as fit into both the shared request queue
-            // and our reply queue capacity.
             let mut pushed_any = false;
             while submitted < count && (submitted - received) < self.reply_queue.capacity() {
-                let req = InferenceRequest {
-                    tag: submitted,
-                    state: states[submitted],
-                    reply_queue: Arc::clone(&self.reply_queue),
-                    caller: caller.clone(),
-                };
-                match self.service.shared.request_queue.push(req) {
-                    Ok(()) => {
-                        submitted += 1;
-                        pushed_any = true;
-                    }
-                    Err(_) => break,
-                }
+                self.submit(submitted, states[submitted]);
+                submitted += 1;
+                pushed_any = true;
             }
-
             if pushed_any {
-                self.service.wake_one_worker();
+                self.notify_service();
             }
 
-            // Drain any completed responses.
-            let mut made_progress = false;
-            while let Some(resp) = self.reply_queue.pop() {
+            while let Some(resp) = self.try_pop() {
                 out_policies[resp.tag] = resp.policy_logits;
                 out_values[resp.tag] = resp.value;
                 received += 1;
-                made_progress = true;
             }
 
-            if received == count {
-                break;
-            }
-
-            if !made_progress {
-                if submitted == count {
-                    // All requests have been submitted; sleep until the inference worker
-                    // pushes a response to `reply_queue` and calls `caller.unpark()`.
-                    thread::park();
-                } else {
-                    backoff.snooze();
-                }
-            } else {
-                backoff.reset();
+            if received < count && submitted == count {
+                self.wait_for_response();
             }
         }
     }
@@ -401,10 +422,14 @@ where
     /// Convenience helper evaluating a single state `[f32; G]` through the batched service.
     #[inline]
     pub fn evaluate_one(&mut self, state: &[f32; G]) -> ([f32; P], [f32; N]) {
-        let mut pol = [[0.0f32; P]; 1];
-        let mut val = [[0.0f32; N]; 1];
-        self.evaluate_batch(std::slice::from_ref(state), &mut pol, &mut val);
-        (pol[0], val[0])
+        self.submit(0, *state);
+        self.notify_service();
+        loop {
+            if let Some(resp) = self.try_pop() {
+                return (resp.policy_logits, resp.value);
+            }
+            thread::park();
+        }
     }
 }
 

@@ -370,7 +370,7 @@ struct SelfPlaySlot<R: GameRules<N>, const G: usize, const P: usize, const N: us
     sims_done: usize,
     move_count: usize,
     root_noise_applied: bool,
-    active: bool,
+    pending_leaf: (NodeId, PlayerIndex<N>),
     pending_turns: Vec<PendingTurn<G, P, N>>,
 }
 
@@ -494,7 +494,7 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
             sims_done: 0,
             move_count: 0,
             root_noise_applied: false,
-            active: true,
+            pending_leaf: (NodeId::ROOT, PlayerIndex::new(0)),
             pending_turns: Vec::with_capacity(64),
         });
     }
@@ -503,12 +503,7 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
         return;
     }
 
-    let mut client = service.client(slots.len());
-    let mut wave_meta: Vec<(usize, NodeId, PlayerIndex<N>)> = Vec::with_capacity(slots.len());
-    let mut wave_states: Vec<[f32; G]> = vec![[0.0; G]; slots.len()];
-    let mut wave_policies: Vec<[f32; P]> = vec![[0.0; P]; slots.len()];
-    let mut wave_values: Vec<[f32; N]> = vec![[0.0; N]; slots.len()];
-
+    let client = service.client(slots.len());
     let mut local_positions: Vec<TrainingPosition<G, P, N>> = Vec::new();
     let mut local_wins = [0usize; N];
     let mut local_draws = 0usize;
@@ -516,19 +511,11 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
     let mut local_moves_stats = Statistics::new();
     let mut local_entropy_stats = Statistics::new();
 
-    loop {
-        wave_meta.clear();
-
-        // Phase 1: Advance each active game slot until it either needs a neural network leaf
-        // evaluation (joining the current wave) or completes all `simulations_per_move`.
-        for (slot_idx, slot) in slots.iter_mut().enumerate() {
-            if !slot.active {
-                continue;
-            }
-
+    // Helper closure that steps `slots[slot_idx]` until it either enqueues a leaf request into
+    // `InferenceService` (returning `true`) or exhausts all games in the pool (returning `false`).
+    let mut step_slot = |slot_idx: usize, slot: &mut SelfPlaySlot<R, G, P, N>| -> bool {
+        loop {
             while slot.sims_done < config.simulations_per_move {
-                // If the root already has evaluated children (e.g. from subtree reuse on move > 1),
-                // mix Dirichlet noise into the root priors before selecting a child.
                 if !slot.root_noise_applied
                     && config.dirichlet_epsilon > 0.0
                     && slot.search.tree().root().payload.visits > 0
@@ -550,72 +537,16 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                         slot.sims_done += 1;
                     }
                     LeafStep::NeedsEvaluation { leaf_id, leaf_game } => {
-                        let batch_idx = wave_meta.len();
-                        R::encode_state(&leaf_game, &mut wave_states[batch_idx]);
-                        wave_meta.push((slot_idx, leaf_id, leaf_game.current_player()));
-                        break;
+                        let mut state = [0.0f32; G];
+                        R::encode_state(&leaf_game, &mut state);
+                        slot.pending_leaf = (leaf_id, leaf_game.current_player());
+                        client.submit(slot_idx, state);
+                        return true;
                     }
                 }
             }
-        }
 
-        // Phase 2: Evaluate all collected leaf states from this wave in one batched call.
-        let wave_len = wave_meta.len();
-        if wave_len > 0 {
-            client.evaluate_batch(
-                &wave_states[..wave_len],
-                &mut wave_policies[..wave_len],
-                &mut wave_values[..wave_len],
-            );
-
-            for (i, &(slot_idx, leaf_id, actor)) in wave_meta.iter().enumerate() {
-                let slot = &mut slots[slot_idx];
-                let logits = &wave_policies[i];
-                let rel_val = &wave_values[i];
-                let abs_payoffs = relative_to_absolute_values(actor, rel_val);
-
-                {
-                    let children = slot.search.tree_mut().active_mut().children_mut(leaf_id);
-                    assign_masked_softmax_priors(children, |mv| {
-                        logits[R::move_to_policy_index(mv)]
-                    });
-                }
-
-                // If `leaf_id == NodeId::ROOT`, this was the root's initial evaluation (Move 1 or
-                // unexpanded subtree). Apply Dirichlet noise immediately *after* setting softmax
-                // priors so subsequent simulations explore with perturbed root priors!
-                if leaf_id == NodeId::ROOT
-                    && !slot.root_noise_applied
-                    && config.dirichlet_epsilon > 0.0
-                {
-                    let (tree, rng) = slot.search.tree_and_rng_mut();
-                    apply_root_dirichlet_noise(
-                        tree.active_mut(),
-                        config.dirichlet_alpha,
-                        config.dirichlet_epsilon,
-                        rng,
-                    );
-                    slot.root_noise_applied = true;
-                }
-
-                slot.search.backpropagate(abs_payoffs);
-                slot.sims_done += 1;
-            }
-        }
-
-        // Phase 3: For any slot that has completed `simulations_per_move`, record its training
-        // target, play the chosen move, and recycle the slot if the game reached a terminal state.
-        let mut any_active = false;
-        for slot in slots.iter_mut() {
-            if !slot.active {
-                continue;
-            }
-            if slot.sims_done < config.simulations_per_move {
-                any_active = true;
-                continue;
-            }
-
-            // Record search entropy and extract normalized visit-count policy target `pi(a | s)`.
+            // Completed `simulations_per_move` for the current turn: record training target & play move.
             local_entropy_stats.update(slot.search.root_visit_entropy());
             let mut policy_target = [0.0f32; P];
             {
@@ -638,7 +569,6 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                 policy: policy_target,
             });
 
-            // Select or sample move and advance the single-threaded search tree.
             slot.move_count += 1;
             let (chosen_id, chosen_mv) = if slot.move_count <= config.opening_moves {
                 slot.search.sample_root_child_by_visits()
@@ -649,7 +579,6 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
             slot.sims_done = 0;
             slot.root_noise_applied = false;
 
-            // Check if the game has terminated.
             if let GameStatus::Terminal(final_abs_payoffs) = slot.search.root_game().status() {
                 for turn in slot.pending_turns.drain(..) {
                     local_positions.push(TrainingPosition {
@@ -667,7 +596,7 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                     local_draws += 1;
                 }
 
-                // Recycle this slot for the next game if any remain.
+                // Pull next game from the shared pool or retire this slot.
                 let next_idx = next_game_id.fetch_add(1, Ordering::Relaxed);
                 if next_idx < config.total_games {
                     let mut new_game = init_game(next_idx, &mut worker_rng);
@@ -676,17 +605,70 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                     }
                     slot.search.reset(new_game, R::SENTINEL_MOVE);
                     slot.move_count = 0;
-                    any_active = true;
                 } else {
-                    slot.active = false;
+                    return false;
                 }
-            } else {
-                any_active = true;
+            }
+        }
+    };
+
+    // Kick off initial leaf requests across all slots.
+    let mut in_flight = 0usize;
+    for (slot_idx, slot) in slots.iter_mut().enumerate() {
+        if step_slot(slot_idx, slot) {
+            in_flight += 1;
+        }
+    }
+    if in_flight > 0 {
+        client.notify_service();
+    }
+
+    // Single-stage asynchronous event loop: drain ready responses from `InferenceService`,
+    // backpropagate, and immediately enqueue the next leaf request for each slot.
+    while in_flight > 0 {
+        let mut pushed_new = false;
+        while let Some(resp) = client.try_pop() {
+            in_flight -= 1;
+            let slot_idx = resp.tag;
+            let slot = &mut slots[slot_idx];
+            let (leaf_id, actor) = slot.pending_leaf;
+            let abs_payoffs = relative_to_absolute_values(actor, &resp.value);
+
+            {
+                let children = slot.search.tree_mut().active_mut().children_mut(leaf_id);
+                assign_masked_softmax_priors(children, |mv| {
+                    resp.policy_logits[R::move_to_policy_index(mv)]
+                });
+            }
+
+            if leaf_id == NodeId::ROOT
+                && !slot.root_noise_applied
+                && config.dirichlet_epsilon > 0.0
+            {
+                let (tree, rng) = slot.search.tree_and_rng_mut();
+                apply_root_dirichlet_noise(
+                    tree.active_mut(),
+                    config.dirichlet_alpha,
+                    config.dirichlet_epsilon,
+                    rng,
+                );
+                slot.root_noise_applied = true;
+            }
+
+            slot.search.backpropagate(abs_payoffs);
+            slot.sims_done += 1;
+
+            if step_slot(slot_idx, slot) {
+                in_flight += 1;
+                pushed_new = true;
             }
         }
 
-        if !any_active {
-            break;
+        if pushed_new {
+            client.notify_service();
+        }
+        if in_flight > 0 {
+            client.wait_for_response();
         }
     }
 
