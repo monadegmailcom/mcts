@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use rand::prelude::{SeedableRng, SmallRng};
 
+use mcts::alphazero::{SelfPlayConfig, run_self_play};
 use mcts::game::PlayerIndex;
 use mcts::games::rubiks_cube::{
     NO_MOVE as RUBIKS_NO_MOVE, RubiksGame, RubiksMove, RubiksState,
@@ -17,6 +18,7 @@ use mcts::games::twist_puzzle::{
 use mcts::games::ultimate_ttt::{
     EMPTY_STATE as UTTT_EMPTY, NO_MOVE as UTTT_NO_MOVE, UltimateTicTacToe, UtttGame, UtttHeuristic,
 };
+use mcts::inference::{FnBatchEvaluator, InferenceService};
 use mcts::matchup::run_multi_match;
 use mcts::mcts::{
     FnEvaluator, MctsConfig, MctsPayload, MctsPlayer, PlayoutEvaluator, Puct, Uct,
@@ -24,6 +26,7 @@ use mcts::mcts::{
 };
 use mcts::minimax::{MinimaxBudget, MinimaxPlayer, TreeMinimaxPayload, TreeMinimaxPlayer};
 use mcts::player::Player;
+use mcts::root_parallel::{RootParallelBudget, RootParallelConfig, RootParallelPlayer};
 use mcts::tree::Node;
 
 fn main() {
@@ -333,5 +336,83 @@ fn main() {
     println!(
         "Solved: {cube_solved}/{cube_trials} in {:.3} ms",
         elapsed_cube.as_secs_f64() * 1000.0
+    );
+    println!();
+
+    // 7. Game-Parallel AlphaZero Self-Play on Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`,
+    //    64 games, 4 workers x 16 concurrent games/worker, 100 PUCT sims/move, zero virtual loss)
+    let uttt_nn = FnBatchEvaluator(
+        |states: &[[f32; 324]], policies: &mut [[f32; 81]], values: &mut [[f32; 2]]| {
+            for ((s, p), v) in states.iter().zip(policies.iter_mut()).zip(values.iter_mut()) {
+                p.fill(0.0);
+                let my_marks: f32 = s[0..81].iter().sum();
+                let opp_marks: f32 = s[81..162].iter().sum();
+                let adv = ((my_marks - opp_marks) * 0.02).clamp(-0.95, 0.95);
+                *v = [adv, -adv];
+            }
+        },
+    );
+    let uttt_service = InferenceService::new(uttt_nn, 64, 1);
+    let sp_cfg = SelfPlayConfig::new(64, 100, 2026)
+        .with_workers(4, 16)
+        .with_opening_moves(6);
+    let start_sp = Instant::now();
+    let sp_res = run_self_play(&uttt_root, &uttt_service, &sp_cfg);
+    let elapsed_sp = start_sp.elapsed();
+    println!("=== Benchmark 7: Game-Parallel AlphaZero Self-Play on Ultimate TTT (64 games, 4x16 multiplexed, 100 sims/move) ===");
+    println!(
+        "Positions generated: {}, Wins: {:?}, Draws: {}, Avg moves/game: {:.1}, Avg root entropy: {:.2}",
+        sp_res.positions.len(),
+        sp_res.wins,
+        sp_res.draws,
+        sp_res.game_moves_stats.mean(),
+        sp_res.root_entropy_stats.mean(),
+    );
+    println!(
+        "Inference batch size stats: {} | Wall time: {:.3} ms ({:.0} positions/sec)",
+        uttt_service.batch_size_stats(),
+        elapsed_sp.as_secs_f64() * 1000.0,
+        (sp_res.positions.len() as f64) / elapsed_sp.as_secs_f64()
+    );
+    println!();
+
+    // 8. Root-Parallel Tournament Player (`RootParallelPlayer`, 4 threads x 400 sims = 1600 sims)
+    //    vs Single-Thread MCTS (`400` sims) on Ultimate Tic-Tac-Toe (64 games)
+    let f_uttt_root_par = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2>> {
+        Box::new(RootParallelPlayer::new(
+            *g,
+            UTTT_NO_MOVE,
+            Uct::new(0.5),
+            4,
+            RootParallelConfig::new(RootParallelBudget::SimulationsPerThread(400), seed)
+                .with_arena_capacity_per_thread(16_384),
+            |_t, eval_seed| PlayoutEvaluator::new(eval_seed),
+        ))
+    };
+    let f_uttt_single_400 = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2>> {
+        Box::new(MctsPlayer::new(
+            *g,
+            UTTT_NO_MOVE,
+            Uct::new(0.5),
+            PlayoutEvaluator::new(seed ^ 0xCAFE_BABE),
+            MctsConfig::new(400, seed).with_arena_capacity(16_384),
+        ))
+    };
+    let root_par_summary = run_multi_match(
+        &uttt_root,
+        [&f_uttt_root_par, &f_uttt_single_400],
+        64,
+        2,
+        4242,
+    );
+    println!("=== Benchmark 8: RootParallelPlayer (4x400 sims) vs Single-Thread MCTS (400 sims) on Ultimate TTT (64 games) ===");
+    println!(
+        "Wins [RootParallel(4x400), SingleThread(400)]: {:?}, Draws: {}",
+        root_par_summary.wins, root_par_summary.draws
+    );
+    println!(
+        "Mean choose_move() wall time — RootParallel(1600 total sims): {:.2} us vs SingleThread(400 sims): {:.2} us",
+        root_par_summary.choose_time_us[0].mean(),
+        root_par_summary.choose_time_us[1].mean(),
     );
 }

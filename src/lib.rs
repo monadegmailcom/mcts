@@ -5,11 +5,14 @@
 //! - Unified single-threaded MCTS engine (`mcts`) shared between playout-based UCT and AlphaZero PUCT.
 //! - Zero-`unsafe` two-generation compact arena (`tree`) with 20-byte nodes and root-to-leaf state reconstruction.
 
+pub mod alphazero;
 pub mod game;
 pub mod games;
+pub mod inference;
 pub mod matchup;
 pub mod mcts;
 pub mod minimax;
 pub mod player;
+pub mod root_parallel;
 pub mod statistics;
 pub mod tree;

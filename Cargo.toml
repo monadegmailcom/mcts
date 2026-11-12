@@ -6,4 +6,7 @@ description = "Generic N-player MCTS, AlphaZero, and Minimax engine in Rust"
 license = "MIT"
 
 [dependencies]
+crossbeam-queue = "0.3.14"
+crossbeam-utils = "0.8.23"
 rand = "0.10.3"
+rand_distr = "0.6.0"

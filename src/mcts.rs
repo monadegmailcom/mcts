@@ -288,6 +288,13 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
         &mut self.tree
     }
 
+    /// Returns disjoint mutable references to the generational arena tree and internal RNG
+    /// (allowing callers such as root Dirichlet noise to mutate `tree` while sampling `rng`).
+    #[inline]
+    pub fn tree_and_rng_mut(&mut self) -> (&mut GenerationalTree<R::Move, MctsPayload>, &mut SmallRng) {
+        (&mut self.tree, &mut self.rng)
+    }
+
     #[inline]
     pub const fn selector(&self) -> &S {
         &self.selector
@@ -444,6 +451,23 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     pub fn advance(&mut self, mv: R::Move) -> bool {
         self.root_game = self.root_game.apply(mv);
         self.tree.advance_or_reset(mv)
+    }
+
+    /// Advances `root_game` by `mv` and promotes `child_id` directly to root without scanning.
+    #[inline]
+    pub fn advance_to_child(&mut self, child_id: NodeId, mv: R::Move) {
+        self.root_game = self.root_game.apply(mv);
+        self.tree.advance_to(child_id);
+    }
+
+    /// Resets the search state machine to a fresh `root_game` in `O(1)` while retaining all
+    /// allocated arena and scratch-buffer capacities (used to recycle slots across self-play games).
+    #[inline]
+    pub fn reset(&mut self, root_game: Game<R, N>, dummy_move: R::Move) {
+        self.root_game = root_game;
+        self.tree.reset_root(dummy_move, MctsPayload::default());
+        self.path_buf.clear();
+        self.move_buf.clear();
     }
 
     /// Shannon entropy `-sum(p_i * ln(p_i))` of the root's normalized child visit distribution
