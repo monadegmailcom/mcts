@@ -28,8 +28,9 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 
-use rand::prelude::{Rng, SeedableRng, SmallRng};
+use rand::prelude::{Rng, RngExt, SeedableRng, SmallRng};
 use rand_distr::{Distribution, Gamma};
 
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
@@ -38,11 +39,11 @@ use crate::games::tic_tac_toe::{self, Symbol as TttSymbol, TicTacToe};
 use crate::games::twist_puzzle::{self, TwistPuzzle};
 use crate::games::ultimate_ttt::{self, UltimateTicTacToe};
 use crate::inference::{BatchEvaluator, InferenceClient, InferenceService};
-use crate::mcts::{
-    LeafEvaluator, LeafStep, MctsPayload, MctsSearch, Puct, assign_masked_softmax_priors,
-};
+use crate::mcts::{LeafStep, MctsPayload, MctsSearch, Puct, assign_masked_softmax_priors};
+use crate::player::Player;
+use crate::root_parallel::AggregatedRootChild;
 use crate::statistics::Statistics;
-use crate::tree::{Node, NodeId, TreeArena};
+use crate::tree::{NodeId, TreeArena};
 
 /// Trait bridging a [`GameRules<N>`] implementation to a neural network with flattened state
 /// input size `G` and policy logit output size `P`.
@@ -207,42 +208,376 @@ pub fn apply_root_dirichlet_noise<M: Copy>(
     }
 }
 
-/// Single-leaf [`LeafEvaluator`] adapter backed by a lock-free [`InferenceClient`].
-///
-/// Allows single-threaded [`crate::mcts::MctsPlayer`] and multi-threaded
-/// [`crate::root_parallel::RootParallelPlayer`] to evaluate leaves through the shared batched
-/// [`InferenceService`].
-pub struct InferenceLeafEvaluator<'a, E, const G: usize, const P: usize, const N: usize>
-where
-    E: BatchEvaluator<G, P, N> + 'static,
-{
-    client: InferenceClient<'a, E, G, P, N>,
+/// Configuration for single-game Root-Parallel [`AlphaZeroPlayer`].
+#[derive(Clone, Copy, Debug)]
+pub struct AlphaZeroConfig {
+    /// Number of independent root-parallel trees `K` multiplexed concurrently per move
+    /// (`0` defaults to `service.max_batch_size()`, saturating a full GPU batch in a single game).
+    pub num_trees: usize,
+    /// Number of PUCT simulations executed per tree on each move
+    /// (total simulations per move = `num_trees * simulations_per_tree`).
+    pub simulations_per_tree: usize,
+    /// Number of initial moves sampled proportionally to aggregated root visits (`0` = always argmax).
+    pub opening_moves: usize,
+    /// PUCT exploration constant `c_base` (default `19_652.0`).
+    pub c_base: f32,
+    /// PUCT exploration constant `c_init` (default `1.25`).
+    pub c_init: f32,
+    /// Symmetric Dirichlet parameter `alpha` for per-tree root exploration noise.
+    pub dirichlet_alpha: f32,
+    /// Weight `epsilon` of Dirichlet noise blended into each tree's root priors (`0.0` disables).
+    pub dirichlet_epsilon: f32,
+    /// Node capacity per tree's generational arena (`0` uses `(simulations_per_tree * 16).max(256)`).
+    pub arena_capacity_per_tree: usize,
+    /// Deterministic base seed.
+    pub seed: u64,
 }
 
-impl<'a, E, const G: usize, const P: usize, const N: usize> InferenceLeafEvaluator<'a, E, G, P, N>
-where
-    E: BatchEvaluator<G, P, N> + 'static,
-{
-    #[inline]
-    pub fn new(service: &'a InferenceService<E, G, P, N>) -> Self {
+impl AlphaZeroConfig {
+    pub const fn new(num_trees: usize, simulations_per_tree: usize, seed: u64) -> Self {
         Self {
-            client: service.client(16),
+            num_trees,
+            simulations_per_tree,
+            opening_moves: 0,
+            c_base: 19_652.0,
+            c_init: 1.25,
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.15,
+            arena_capacity_per_tree: 0,
+            seed,
+        }
+    }
+
+    pub const fn with_opening_moves(mut self, opening_moves: usize) -> Self {
+        self.opening_moves = opening_moves;
+        self
+    }
+
+    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
+        self.dirichlet_alpha = alpha;
+        self.dirichlet_epsilon = epsilon;
+        self
+    }
+
+    pub const fn with_puct(mut self, c_base: f32, c_init: f32) -> Self {
+        self.c_base = c_base;
+        self.c_init = c_init;
+        self
+    }
+
+    pub const fn with_arena_capacity_per_tree(mut self, capacity: usize) -> Self {
+        self.arena_capacity_per_tree = capacity;
+        self
+    }
+
+    #[inline]
+    fn resolved_arena_capacity(&self) -> usize {
+        if self.arena_capacity_per_tree > 0 {
+            self.arena_capacity_per_tree
+        } else {
+            (self.simulations_per_tree * 16).max(256)
         }
     }
 }
 
-impl<R, E, const G: usize, const P: usize, const N: usize> LeafEvaluator<R, N>
-    for InferenceLeafEvaluator<'_, E, G, P, N>
+struct AlphaZeroTreeSlot<R: GameRules<N>, const N: usize> {
+    search: MctsSearch<R, N, Puct>,
+    sims_done: usize,
+    root_noise_applied: bool,
+    pending_leaf: (NodeId, PlayerIndex<N>),
+}
+
+/// Single-game and Multi-Match AlphaZero [`Player`] multiplexed over a batched [`InferenceService`].
+///
+/// - **In single-game play (`num_trees = K > 1`, Root Parallelism)**: Maintains `K` independent
+///   [`MctsSearch`] trees rooted at the current position, steps all `K` trees asynchronously
+///   through `client.submit` / `client.try_pop` so the GPU evaluates batches of up to `K` states
+///   at once, sums the root visits across all `K` trees, and chooses the most visited move.
+/// - **In multi-match evaluation ([`crate::matchup::run_multi_match`], `num_trees = 1` or `K`)**:
+///   Implements [`Player::poll_choose_move`] so each worker thread can interleave `M` concurrent
+///   games on a single thread, batching leaf evaluations across all `M` games automatically.
+pub struct AlphaZeroPlayer<'a, R, E, const G: usize, const P: usize, const N: usize>
 where
     R: AlphaZeroGame<G, P, N>,
     E: BatchEvaluator<G, P, N> + 'static,
 {
-    fn evaluate(&mut self, game: &Game<R, N>, children: &mut [Node<R::Move, MctsPayload>]) -> [f32; N] {
-        let mut state_tensor = [0.0f32; G];
-        R::encode_state(game, &mut state_tensor);
-        let (policy_logits, rel_values) = self.client.evaluate_one(&state_tensor);
-        assign_masked_softmax_priors(children, |mv| policy_logits[R::move_to_policy_index(mv)]);
-        relative_to_absolute_values(game.current_player(), &rel_values)
+    client: InferenceClient<'a, E, G, P, N>,
+    trees: Box<[AlphaZeroTreeSlot<R, N>]>,
+    config: AlphaZeroConfig,
+    move_count: usize,
+    in_flight: usize,
+    unnotified: usize,
+    search_started: bool,
+    rng: SmallRng,
+}
+
+impl<'a, R, E, const G: usize, const P: usize, const N: usize> AlphaZeroPlayer<'a, R, E, G, P, N>
+where
+    R: AlphaZeroGame<G, P, N>,
+    E: BatchEvaluator<G, P, N> + 'static,
+{
+    pub fn new(
+        game: Game<R, N>,
+        service: &'a InferenceService<E, G, P, N>,
+        config: AlphaZeroConfig,
+    ) -> Self {
+        assert!(
+            config.simulations_per_tree > 0,
+            "simulations_per_tree must be > 0"
+        );
+        let num_trees = if config.num_trees > 0 {
+            config.num_trees
+        } else {
+            service.max_batch_size()
+        }
+        .max(1);
+        let puct = Puct::new(config.c_base, config.c_init);
+        let arena_cap = config.resolved_arena_capacity();
+
+        let trees = (0..num_trees)
+            .map(|k| {
+                let tree_seed = config
+                    .seed
+                    .wrapping_add(((k as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                AlphaZeroTreeSlot {
+                    search: MctsSearch::new(
+                        game.clone(),
+                        R::SENTINEL_MOVE,
+                        puct,
+                        arena_cap,
+                        tree_seed,
+                    ),
+                    sims_done: 0,
+                    root_noise_applied: false,
+                    pending_leaf: (NodeId::ROOT, PlayerIndex::new(0)),
+                }
+            })
+            .collect::<Box<[_]>>();
+
+        Self {
+            client: service.client(num_trees),
+            trees,
+            config,
+            move_count: 0,
+            in_flight: 0,
+            unnotified: 0,
+            search_started: false,
+            rng: SmallRng::seed_from_u64(config.seed ^ 0x94D0_49BB_1331_11EB),
+        }
+    }
+
+    #[inline]
+    pub fn num_trees(&self) -> usize {
+        self.trees.len()
+    }
+
+    /// Aggregates `(mv, visits, value_sum)` across all `K` root-parallel trees.
+    pub fn aggregated_root_children(&self) -> Vec<AggregatedRootChild<R::Move>> {
+        let first_children = self.trees[0].search.tree().active().children(NodeId::ROOT);
+        let mut agg: Vec<AggregatedRootChild<R::Move>> = first_children
+            .iter()
+            .map(|c| AggregatedRootChild {
+                mv: c.mv,
+                visits: 0,
+                value_sum: 0.0,
+            })
+            .collect();
+
+        for slot in &self.trees {
+            let children = slot.search.tree().active().children(NodeId::ROOT);
+            debug_assert_eq!(
+                children.len(),
+                agg.len(),
+                "all root-parallel AlphaZero trees must expand identical legal root moves"
+            );
+            for child in children {
+                let entry = agg
+                    .iter_mut()
+                    .find(|s| s.mv == child.mv)
+                    .expect("root child move must exist in aggregated move list");
+                entry.visits += child.payload.visits as u64;
+                entry.value_sum += child.payload.value_sum as f64;
+            }
+        }
+        agg
+    }
+
+    fn step_tree(
+        tree_idx: usize,
+        slot: &mut AlphaZeroTreeSlot<R, N>,
+        client: &InferenceClient<'a, E, G, P, N>,
+        config: &AlphaZeroConfig,
+    ) -> bool {
+        while slot.sims_done < config.simulations_per_tree {
+            if !slot.root_noise_applied
+                && config.dirichlet_epsilon > 0.0
+                && slot.search.tree().root().payload.visits > 0
+                && !slot.search.tree().active().children(NodeId::ROOT).is_empty()
+            {
+                let (tree, slot_rng) = slot.search.tree_and_rng_mut();
+                apply_root_dirichlet_noise(
+                    tree.active_mut(),
+                    config.dirichlet_alpha,
+                    config.dirichlet_epsilon,
+                    slot_rng,
+                );
+                slot.root_noise_applied = true;
+            }
+
+            match slot.search.select_to_leaf() {
+                LeafStep::Terminal(payoffs) => {
+                    slot.search.backpropagate(payoffs);
+                    slot.sims_done += 1;
+                }
+                LeafStep::NeedsEvaluation { leaf_id, leaf_game } => {
+                    let mut state = [0.0f32; G];
+                    R::encode_state(&leaf_game, &mut state);
+                    slot.pending_leaf = (leaf_id, leaf_game.current_player());
+                    client.submit(tree_idx, state);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn finalize_move_choice(&mut self) -> R::Move {
+        let agg = self.aggregated_root_children();
+        assert!(
+            !agg.is_empty(),
+            "AlphaZeroPlayer root has no legal moves to choose from"
+        );
+
+        self.move_count += 1;
+        let chosen_idx = if self.move_count <= self.config.opening_moves {
+            let total_visits: u64 = agg.iter().map(|c| c.visits).sum();
+            if total_visits == 0 {
+                self.rng.random_range(0..agg.len())
+            } else {
+                let mut target = self.rng.random_range(0..total_visits);
+                let mut picked = agg.len() - 1;
+                for (idx, child) in agg.iter().enumerate() {
+                    if target < child.visits {
+                        picked = idx;
+                        break;
+                    }
+                    target -= child.visits;
+                }
+                picked
+            }
+        } else {
+            agg.iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.visits
+                        .cmp(&b.visits)
+                        .then_with(|| a.q_value().total_cmp(&b.q_value()))
+                })
+                .map(|(idx, _)| idx)
+                .unwrap()
+        };
+
+        let chosen_mv = agg[chosen_idx].mv;
+        for slot in &mut self.trees {
+            slot.search.advance(chosen_mv);
+            slot.root_noise_applied = false;
+        }
+        chosen_mv
+    }
+}
+
+impl<R, E, const G: usize, const P: usize, const N: usize> Player<R, N>
+    for AlphaZeroPlayer<'_, R, E, G, P, N>
+where
+    R: AlphaZeroGame<G, P, N>,
+    E: BatchEvaluator<G, P, N> + 'static,
+{
+    fn poll_choose_move(&mut self) -> Poll<R::Move> {
+        if !self.search_started {
+            self.search_started = true;
+            self.in_flight = 0;
+            self.unnotified = 0;
+            for (tree_idx, slot) in self.trees.iter_mut().enumerate() {
+                slot.sims_done = 0;
+                if Self::step_tree(tree_idx, slot, &self.client, &self.config) {
+                    self.in_flight += 1;
+                    self.unnotified += 1;
+                }
+            }
+        }
+
+        while let Some(resp) = self.client.try_pop() {
+            self.in_flight -= 1;
+            let tree_idx = resp.tag;
+            let slot = &mut self.trees[tree_idx];
+            let (leaf_id, actor) = slot.pending_leaf;
+            let abs_payoffs = relative_to_absolute_values(actor, &resp.value);
+
+            {
+                let children = slot.search.tree_mut().active_mut().children_mut(leaf_id);
+                assign_masked_softmax_priors(children, |mv| {
+                    resp.policy_logits[R::move_to_policy_index(mv)]
+                });
+            }
+
+            if leaf_id == NodeId::ROOT
+                && !slot.root_noise_applied
+                && self.config.dirichlet_epsilon > 0.0
+            {
+                let (tree, slot_rng) = slot.search.tree_and_rng_mut();
+                apply_root_dirichlet_noise(
+                    tree.active_mut(),
+                    self.config.dirichlet_alpha,
+                    self.config.dirichlet_epsilon,
+                    slot_rng,
+                );
+                slot.root_noise_applied = true;
+            }
+
+            slot.search.backpropagate(abs_payoffs);
+            slot.sims_done += 1;
+
+            if Self::step_tree(tree_idx, slot, &self.client, &self.config) {
+                self.in_flight += 1;
+                self.unnotified += 1;
+            }
+        }
+
+        if self.in_flight > 0 {
+            Poll::Pending
+        } else {
+            self.search_started = false;
+            Poll::Ready(self.finalize_move_choice())
+        }
+    }
+
+    #[inline]
+    fn notify_pending(&mut self) {
+        if self.unnotified > 0 {
+            self.client.notify_service();
+            self.unnotified = 0;
+        }
+    }
+
+    fn choose_move(&mut self) -> R::Move {
+        loop {
+            if let Poll::Ready(mv) = self.poll_choose_move() {
+                return mv;
+            }
+            self.notify_pending();
+            self.client.wait_for_response();
+        }
+    }
+
+    fn apply_external_move(&mut self, mv: R::Move) {
+        self.move_count += 1;
+        self.search_started = false;
+        self.in_flight = 0;
+        self.unnotified = 0;
+        for slot in &mut self.trees {
+            slot.search.advance(mv);
+            slot.root_noise_applied = false;
+        }
     }
 }
 
@@ -265,11 +600,9 @@ pub struct TrainingPosition<const G: usize, const P: usize, const N: usize> {
 pub struct SelfPlayConfig {
     /// Total self-play games to complete across all worker threads.
     pub total_games: usize,
-    /// Number of CPU self-play worker threads feeding the [`InferenceService`].
+    /// Number of CPU self-play worker threads feeding the [`InferenceService`]
+    /// (`0` automatically uses `std::thread::available_parallelism()`).
     pub num_workers: usize,
-    /// Number of independent single-threaded games multiplexed concurrently per worker thread.
-    /// Higher values (`16..128`) increase GPU inference batch sizes without any virtual loss!
-    pub concurrent_games_per_worker: usize,
     /// Number of PUCT simulations executed per move in each game.
     pub simulations_per_move: usize,
     /// Number of initial moves per game sampled proportionally to root visit counts `N(s, a)`.
@@ -292,8 +625,7 @@ impl SelfPlayConfig {
     pub const fn new(total_games: usize, simulations_per_move: usize, seed: u64) -> Self {
         Self {
             total_games,
-            num_workers: 1,
-            concurrent_games_per_worker: 32,
+            num_workers: 0,
             simulations_per_move,
             opening_moves: 4,
             c_base: 19_652.0,
@@ -305,13 +637,8 @@ impl SelfPlayConfig {
         }
     }
 
-    pub const fn with_workers(
-        mut self,
-        num_workers: usize,
-        concurrent_games_per_worker: usize,
-    ) -> Self {
+    pub const fn with_workers(mut self, num_workers: usize) -> Self {
         self.num_workers = num_workers;
-        self.concurrent_games_per_worker = concurrent_games_per_worker;
         self
     }
 
@@ -412,8 +739,23 @@ where
         config.simulations_per_move > 0,
         "simulations_per_move must be > 0"
     );
-    let num_workers = config.num_workers.max(1);
-    let concurrent_per_worker = config.concurrent_games_per_worker.max(1);
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let num_workers = if config.num_workers > 0 {
+        config.num_workers
+    } else {
+        default_threads
+    }
+    .min(config.total_games.max(1));
+
+    // Derive the per-worker concurrent game cap directly from the InferenceService's pipeline
+    // capacity (`2 * max_batch_size * num_inference_workers`), eliminating any ad-hoc magic
+    // `concurrent_games_per_worker` parameter while bounding memory in the opening phase.
+    let total_pipeline_cap = (service.max_batch_size() * service.num_workers() * 2)
+        .min(config.total_games)
+        .max(num_workers);
+    let max_slots_per_worker = total_pipeline_cap.div_ceil(num_workers);
     let next_game_id = AtomicUsize::new(0);
 
     let shared_result = Mutex::new(SelfPlayResult {
@@ -436,7 +778,7 @@ where
             scope.spawn(move || {
                 run_self_play_worker::<R, E, F, G, P, N>(
                     worker_id,
-                    concurrent_per_worker,
+                    max_slots_per_worker,
                     svc,
                     &cfg,
                     init_ref,
@@ -455,7 +797,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>(
     worker_id: usize,
-    concurrent_games: usize,
+    max_slots: usize,
     service: &InferenceService<E, G, P, N>,
     config: &SelfPlayConfig,
     init_game: &F,
@@ -474,36 +816,8 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
             .wrapping_add((worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
     );
 
-    // Initialize up to `concurrent_games` active game slots for this worker.
-    let mut slots: Vec<SelfPlaySlot<R, G, P, N>> = Vec::with_capacity(concurrent_games);
-    for slot_idx in 0..concurrent_games {
-        let game_idx = next_game_id.fetch_add(1, Ordering::Relaxed);
-        if game_idx >= config.total_games {
-            break;
-        }
-        let mut game = init_game(game_idx, &mut worker_rng);
-        // Guard against a curriculum scramble that happened to start already terminal/solved.
-        while !game.status().is_ongoing() {
-            game = init_game(game_idx, &mut worker_rng);
-        }
-        let slot_seed = config
-            .seed
-            .wrapping_add(((worker_id * 4096 + slot_idx) as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        slots.push(SelfPlaySlot {
-            search: MctsSearch::new(game, R::SENTINEL_MOVE, puct, arena_cap, slot_seed),
-            sims_done: 0,
-            move_count: 0,
-            root_noise_applied: false,
-            pending_leaf: (NodeId::ROOT, PlayerIndex::new(0)),
-            pending_turns: Vec::with_capacity(64),
-        });
-    }
-
-    if slots.is_empty() {
-        return;
-    }
-
-    let client = service.client(slots.len());
+    let client = service.client(max_slots);
+    let mut slots: Vec<SelfPlaySlot<R, G, P, N>> = Vec::with_capacity(max_slots);
     let mut local_positions: Vec<TrainingPosition<G, P, N>> = Vec::new();
     let mut local_wins = [0usize; N];
     let mut local_draws = 0usize;
@@ -513,7 +827,10 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
 
     // Helper closure that steps `slots[slot_idx]` until it either enqueues a leaf request into
     // `InferenceService` (returning `true`) or exhausts all games in the pool (returning `false`).
-    let mut step_slot = |slot_idx: usize, slot: &mut SelfPlaySlot<R, G, P, N>| -> bool {
+    let mut step_slot = |slot_idx: usize,
+                         slot: &mut SelfPlaySlot<R, G, P, N>,
+                         rng: &mut SmallRng|
+     -> bool {
         loop {
             while slot.sims_done < config.simulations_per_move {
                 if !slot.root_noise_applied
@@ -521,12 +838,12 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                     && slot.search.tree().root().payload.visits > 0
                     && !slot.search.tree().active().children(NodeId::ROOT).is_empty()
                 {
-                    let (tree, rng) = slot.search.tree_and_rng_mut();
+                    let (tree, slot_rng) = slot.search.tree_and_rng_mut();
                     apply_root_dirichlet_noise(
                         tree.active_mut(),
                         config.dirichlet_alpha,
                         config.dirichlet_epsilon,
-                        rng,
+                        slot_rng,
                     );
                     slot.root_noise_applied = true;
                 }
@@ -599,9 +916,9 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                 // Pull next game from the shared pool or retire this slot.
                 let next_idx = next_game_id.fetch_add(1, Ordering::Relaxed);
                 if next_idx < config.total_games {
-                    let mut new_game = init_game(next_idx, &mut worker_rng);
+                    let mut new_game = init_game(next_idx, rng);
                     while !new_game.status().is_ongoing() {
-                        new_game = init_game(next_idx, &mut worker_rng);
+                        new_game = init_game(next_idx, rng);
                     }
                     slot.search.reset(new_game, R::SENTINEL_MOVE);
                     slot.move_count = 0;
@@ -612,21 +929,12 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
         }
     };
 
-    // Kick off initial leaf requests across all slots.
     let mut in_flight = 0usize;
-    for (slot_idx, slot) in slots.iter_mut().enumerate() {
-        if step_slot(slot_idx, slot) {
-            in_flight += 1;
-        }
-    }
-    if in_flight > 0 {
-        client.notify_service();
-    }
+    let mut unnotified = 0usize;
+    let mut pool_exhausted = false;
 
-    // Single-stage asynchronous event loop: drain ready responses from `InferenceService`,
-    // backpropagate, and immediately enqueue the next leaf request for each slot.
-    while in_flight > 0 {
-        let mut pushed_new = false;
+    loop {
+        // 1. Always prioritize draining and backpropagating completed NN responses first.
         while let Some(resp) = client.try_pop() {
             in_flight -= 1;
             let slot_idx = resp.tag;
@@ -645,12 +953,12 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
                 && !slot.root_noise_applied
                 && config.dirichlet_epsilon > 0.0
             {
-                let (tree, rng) = slot.search.tree_and_rng_mut();
+                let (tree, slot_rng) = slot.search.tree_and_rng_mut();
                 apply_root_dirichlet_noise(
                     tree.active_mut(),
                     config.dirichlet_alpha,
                     config.dirichlet_epsilon,
-                    rng,
+                    slot_rng,
                 );
                 slot.root_noise_applied = true;
             }
@@ -658,18 +966,54 @@ fn run_self_play_worker<R, E, F, const G: usize, const P: usize, const N: usize>
             slot.search.backpropagate(abs_payoffs);
             slot.sims_done += 1;
 
-            if step_slot(slot_idx, slot) {
+            if step_slot(slot_idx, slot, &mut worker_rng) {
                 in_flight += 1;
-                pushed_new = true;
+                unnotified += 1;
             }
         }
 
-        if pushed_new {
+        // 2. If no responses are ready yet and we would otherwise have to wait on the NN,
+        //    dynamically start a new game from the pool (capped at `max_slots` so opening
+        //    simulations cannot spawn unbounded trees before the GPU finishes its first batch).
+        if slots.len() < max_slots && !pool_exhausted {
+            let game_idx = next_game_id.fetch_add(1, Ordering::Relaxed);
+            if game_idx < config.total_games {
+                let mut game = init_game(game_idx, &mut worker_rng);
+                while !game.status().is_ongoing() {
+                    game = init_game(game_idx, &mut worker_rng);
+                }
+                let slot_idx = slots.len();
+                let slot_seed = config.seed.wrapping_add(
+                    ((worker_id * 4096 + slot_idx) as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                );
+                slots.push(SelfPlaySlot {
+                    search: MctsSearch::new(game, R::SENTINEL_MOVE, puct, arena_cap, slot_seed),
+                    sims_done: 0,
+                    move_count: 0,
+                    root_noise_applied: false,
+                    pending_leaf: (NodeId::ROOT, PlayerIndex::new(0)),
+                    pending_turns: Vec::with_capacity(64),
+                });
+                if step_slot(slot_idx, &mut slots[slot_idx], &mut worker_rng) {
+                    in_flight += 1;
+                    unnotified += 1;
+                }
+                continue;
+            } else {
+                pool_exhausted = true;
+            }
+        }
+
+        // 3. No more CPU work can proceed until the NN finishes a batch: wake the service
+        //    if we enqueued new requests and sleep until a response arrives.
+        if unnotified > 0 {
             client.notify_service();
+            unnotified = 0;
         }
-        if in_flight > 0 {
-            client.wait_for_response();
+        if in_flight == 0 {
+            break;
         }
+        client.wait_for_response();
     }
 
     let mut guard = shared_result
@@ -730,7 +1074,7 @@ mod tests {
 
         // Run a single game with 32 simulations per move and epsilon = 0.25.
         let cfg = SelfPlayConfig::new(1, 32, 42)
-            .with_workers(1, 1)
+            .with_workers(1)
             .with_dirichlet(0.3, 0.25);
         let res = run_self_play(&game, &service, &cfg);
         assert_eq!(res.total_games, 1);
@@ -768,8 +1112,12 @@ mod tests {
             "expected Dirichlet noise to perturb uniform priors, got {priors_after_sim1:?}"
         );
 
-        let mut leaf_eval = InferenceLeafEvaluator::new(&service);
-        search.simulate_once(&mut leaf_eval);
+        if let LeafStep::NeedsEvaluation { leaf_id, .. } = search.select_to_leaf() {
+            assert_ne!(leaf_id, NodeId::ROOT);
+            let children = search.tree_mut().active_mut().children_mut(leaf_id);
+            assign_masked_softmax_priors(children, |_mv| 0.0);
+            search.backpropagate([0.0, 0.0]);
+        }
         let priors_after_sim2: Vec<f32> = search
             .tree()
             .active()
@@ -778,6 +1126,22 @@ mod tests {
             .map(|c| c.payload.prior)
             .collect();
         assert_eq!(priors_after_sim1, priors_after_sim2);
+
+        // Also verify single-game Root-Parallel `AlphaZeroPlayer` batches across its `K` trees
+        // without needing single-state evaluation.
+        service.reset_stats();
+        let mut az_player = AlphaZeroPlayer::new(
+            game,
+            &service,
+            AlphaZeroConfig::new(16, 10, 123),
+        );
+        let mv = az_player.choose_move();
+        assert!((0..9).contains(&mv));
+        assert!(
+            service.batch_size_stats().mean() >= 8.0,
+            "expected single-game AlphaZeroPlayer to batch across 16 root trees, got {}",
+            service.batch_size_stats()
+        );
     }
 
     #[test]
@@ -799,7 +1163,7 @@ mod tests {
         let service = InferenceService::new(evaluator, 64, 1);
         let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
         let cfg = SelfPlayConfig::new(64, 24, 2026)
-            .with_workers(2, 32)
+            .with_workers(2)
             .with_opening_moves(2);
 
         let result = run_self_play(&game, &service, &cfg);
@@ -856,7 +1220,7 @@ mod tests {
         let service = InferenceService::new(cube_eval, 32, 1);
         // 16 curriculum games at scramble depth 2 with step budget 2 and 200 simulations/move.
         let cfg = SelfPlayConfig::new(16, 200, 777)
-            .with_workers(2, 8)
+            .with_workers(2)
             .with_opening_moves(0)
             .with_dirichlet(0.3, 0.0);
 

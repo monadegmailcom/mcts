@@ -16,9 +16,9 @@
 //!   and `value_sum` across all `T` roots in `O(T * B)` time, chooses the move with highest
 //!   combined visits (or samples proportionally in the opening), and calls `advance(chosen_mv)`
 //!   on all `T` workers so **every thread retains its surviving subtree across turns**.
-//! - When paired with [`crate::alphazero::InferenceLeafEvaluator`], the `T` threads concurrently
-//!   submit leaf states to the lock-free [`crate::inference::InferenceService`], automatically
-//!   batching up to `T` neural network evaluations per wave even in a single game!
+//! - For neural-network-backed single-game play, [`crate::alphazero::AlphaZeroPlayer`] applies
+//!   this same Root Parallelism over the non-blocking [`crate::inference::InferenceService`] event
+//!   loop, multiplexing `K` root trees in batches without blocking on single-state evaluations.
 
 use std::time::{Duration, Instant};
 
@@ -321,12 +321,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alphazero::InferenceLeafEvaluator;
+    use crate::alphazero::{AlphaZeroConfig, AlphaZeroPlayer};
     use crate::game::PlayerIndex;
     use crate::games::tic_tac_toe::{EMPTY_STATE, NO_MOVE, TicTacToe, TttGame, TttHeuristic};
     use crate::inference::{FnBatchEvaluator, InferenceService};
     use crate::matchup::run_multi_match;
-    use crate::mcts::{PlayoutEvaluator, Puct, Uct};
+    use crate::mcts::{PlayoutEvaluator, Uct};
     use crate::minimax::MinimaxPlayer;
 
     #[test]
@@ -374,7 +374,7 @@ mod tests {
         assert!((0..9).contains(&mv));
         assert!(timed_player.last_total_simulations() >= 4);
 
-        // Test 2: Root-Parallel AlphaZero with 4 threads sharing an InferenceService.
+        // Test 2: Root-Parallel `AlphaZeroPlayer` with 16 parallel root trees sharing an InferenceService.
         let uniform_eval = FnBatchEvaluator(
             |_states: &[[f32; 27]], policies: &mut [[f32; 9]], values: &mut [[f32; 2]]| {
                 for p in policies.iter_mut() {
@@ -386,16 +386,13 @@ mod tests {
             },
         );
         let service = InferenceService::new(uniform_eval, 16, 1);
-        let mut az_root_par = RootParallelPlayer::new(
+        let mut az_root_par = AlphaZeroPlayer::new(
             game,
-            NO_MOVE,
-            Puct::default(),
-            4,
-            RootParallelConfig::new(RootParallelBudget::SimulationsPerThread(50), 999),
-            |_t, _seed| InferenceLeafEvaluator::new(&service),
+            &service,
+            AlphaZeroConfig::new(16, 20, 999),
         );
         let az_mv = az_root_par.choose_move();
         assert!((0..9).contains(&az_mv));
-        assert_eq!(az_root_par.last_total_simulations(), 200);
+        assert!(service.batch_size_stats().mean() >= 8.0);
     }
 }

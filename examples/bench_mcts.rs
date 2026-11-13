@@ -354,7 +354,7 @@ fn main() {
     );
     let uttt_service = InferenceService::new(uttt_nn, 64, 1);
     let sp_cfg = SelfPlayConfig::new(64, 100, 2026)
-        .with_workers(4, 16)
+        .with_workers(4)
         .with_opening_moves(6);
     let start_sp = Instant::now();
     let sp_res = run_self_play(&uttt_root, &uttt_service, &sp_cfg);

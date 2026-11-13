@@ -18,6 +18,7 @@
 //!   thread-local summaries by value on join—zero `Mutex` needed!
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use rand::prelude::{IndexedRandom, SeedableRng, SmallRng};
@@ -264,12 +265,28 @@ impl<const N: usize> MultiMatchSummary<N> {
     }
 }
 
+struct MatchSlot<'a, R: GameRules<N>, const N: usize> {
+    round_idx: usize,
+    game: Game<R, N>,
+    seats: [Box<dyn Player<R, N> + 'a>; N],
+    moves_played: usize,
+    seat_durations: [Duration; N],
+    choose_time_us: [Statistics; N],
+    turn_accum_duration: Duration,
+}
+
 /// Runs `rounds` games across `num_threads` OS threads with cyclic seat rotation
 /// (port & `N`-player generalization of C++ `MultiMatch`).
 ///
-/// On round `r`, participant `p` (`0..N`) is assigned to seat `(p + r) % N`.
-/// Because seeding is derived deterministically from `(base_seed, r, p)`, total win/draw/payoff
-/// counts are **100% deterministic and identical** regardless of `num_threads` (`1` vs `8`)!
+/// - On round `r`, participant `p` (`0..N`) is assigned to seat `(p + r) % N`.
+/// - When one or more participants return [`Poll::Pending`] from [`Player::poll_choose_move`]
+///   (such as [`crate::alphazero::AlphaZeroPlayer`] waiting on a neural network evaluation),
+///   each worker thread automatically multiplexes up to `64` concurrent games on demand so
+///   their neural network evaluations are batched together!
+/// - When all participants are synchronous CPU players, `poll_choose_move` always returns
+///   [`Poll::Ready`], so each worker thread allocates only `1` slot and runs games sequentially.
+/// - Because seeding is derived deterministically from `(base_seed, r, p)`, total win/draw/payoff
+///   counts are **100% deterministic and identical** regardless of `num_threads` (`1` vs `8`)!
 pub fn run_multi_match<'a, R, const N: usize>(
     initial_game: &Game<R, N>,
     factories: [BoxedPlayerFactory<'a, R, N>; N],
@@ -288,25 +305,119 @@ where
     }
 
     let worker_count = num_threads.max(1).min(rounds);
+    let max_slots_per_worker = rounds.div_ceil(worker_count).clamp(1, 64);
     let next_round = AtomicUsize::new(0);
+
+    let make_slot = |r: usize| -> MatchSlot<'a, R, N> {
+        let seats: [Box<dyn Player<R, N> + 'a>; N] = std::array::from_fn(|seat| {
+            let participant = (seat + N - (r % N)) % N;
+            let seed = mix_round_seed(base_seed, r as u64, participant as u64);
+            factories[participant](initial_game, seed)
+        });
+        MatchSlot {
+            round_idx: r,
+            game: initial_game.clone(),
+            seats,
+            moves_played: 0,
+            seat_durations: [Duration::ZERO; N],
+            choose_time_us: [Statistics::new(); N],
+            turn_accum_duration: Duration::ZERO,
+        }
+    };
+
+    // Advances `slot` until an asynchronous player returns `Poll::Pending` (`true`) or the round
+    // pool is exhausted (`false`).
+    let step_slot = |slot: &mut MatchSlot<'a, R, N>,
+                     local_summary: &mut MultiMatchSummary<N>|
+     -> bool {
+        loop {
+            if let GameStatus::Terminal(payoffs) = slot.game.status() {
+                let outcome = MatchOutcome {
+                    payoffs,
+                    moves_played: slot.moves_played,
+                    seat_durations: slot.seat_durations,
+                    choose_time_us: slot.choose_time_us,
+                };
+                local_summary.record_round(slot.round_idx, &outcome);
+
+                let r = next_round.fetch_add(1, Ordering::Relaxed);
+                if r < rounds {
+                    *slot = make_slot(r);
+                    continue;
+                } else {
+                    return false;
+                }
+            }
+
+            let actor_idx = slot.game.current_player().index();
+            let start = Instant::now();
+            match slot.seats[actor_idx].poll_choose_move() {
+                Poll::Pending => {
+                    slot.turn_accum_duration += start.elapsed();
+                    return true;
+                }
+                Poll::Ready(mv) => {
+                    let choose_elapsed = slot.turn_accum_duration + start.elapsed();
+                    slot.turn_accum_duration = Duration::ZERO;
+                    slot.seat_durations[actor_idx] += choose_elapsed;
+                    slot.choose_time_us[actor_idx]
+                        .update((choose_elapsed.as_secs_f64() * 1_000_000.0) as f32);
+
+                    slot.game = slot.game.apply(mv);
+                    for (seat, player) in slot.seats.iter_mut().enumerate() {
+                        if seat != actor_idx {
+                            let notify_start = Instant::now();
+                            player.apply_external_move(mv);
+                            slot.seat_durations[seat] += notify_start.elapsed();
+                        }
+                    }
+                    slot.moves_played += 1;
+                }
+            }
+        }
+    };
 
     let run_worker = || {
         let mut local_summary = MultiMatchSummary::<N>::empty();
+        let mut slots: Vec<MatchSlot<'a, R, N>> = Vec::new();
+        let mut pool_exhausted = false;
+
         loop {
-            let r = next_round.fetch_add(1, Ordering::Relaxed);
-            if r >= rounds {
+            // 1. Step all currently active slots that have received responses.
+            let mut i = 0;
+            while i < slots.len() {
+                if step_slot(&mut slots[i], &mut local_summary) {
+                    i += 1;
+                } else {
+                    slots.swap_remove(i);
+                }
+            }
+
+            // 2. If all existing slots are waiting on an async evaluation (or none exist yet),
+            //    dynamically start a new round on demand up to `max_slots_per_worker`.
+            if slots.len() < max_slots_per_worker && !pool_exhausted {
+                let r = next_round.fetch_add(1, Ordering::Relaxed);
+                if r < rounds {
+                    let mut slot = make_slot(r);
+                    if step_slot(&mut slot, &mut local_summary) {
+                        slots.push(slot);
+                    }
+                    continue;
+                } else {
+                    pool_exhausted = true;
+                }
+            }
+
+            if slots.is_empty() {
                 break;
             }
 
-            // Build `seats[0..N]` where `seat = (p + r) % N`, i.e., `p = (seat + N - r % N) % N`.
-            let mut seats: [Box<dyn Player<R, N> + 'a>; N] = std::array::from_fn(|seat| {
-                let participant = (seat + N - (r % N)) % N;
-                let seed = mix_round_seed(base_seed, r as u64, participant as u64);
-                factories[participant](initial_game, seed)
-            });
-
-            let outcome = play_match(initial_game.clone(), &mut seats);
-            local_summary.record_round(r, &outcome);
+            // 3. All active slots are waiting on async evaluations: flush notifications and park.
+            for slot in &mut slots {
+                let actor_idx = slot.game.current_player().index();
+                slot.seats[actor_idx].notify_pending();
+            }
+            std::thread::park();
         }
         local_summary
     };
@@ -374,7 +485,10 @@ fn all_payoffs_equal<const N: usize>(payoffs: &[f32; N]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::games::tic_tac_toe::{EMPTY_STATE, TicTacToe, TttGame};
+    use crate::alphazero::{AlphaZeroConfig, AlphaZeroPlayer};
+    use crate::games::tic_tac_toe::{EMPTY_STATE, TicTacToe, TttGame, TttHeuristic};
+    use crate::inference::{FnBatchEvaluator, InferenceService};
+    use crate::minimax::MinimaxPlayer;
 
     #[test]
     fn multithreaded_multi_match_is_bit_exact_deterministic_across_thread_counts() {
@@ -394,5 +508,47 @@ mod tests {
         assert_eq!(single.draws, multi.draws);
         assert!((single.payoff_sums[0] - multi.payoff_sums[0]).abs() < 1e-9);
         assert!((single.payoff_sums[1] - multi.payoff_sums[1]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn multi_match_multiplexes_single_tree_alphazero_games_into_nn_batches() {
+        let evaluator = FnBatchEvaluator(
+            |states: &[[f32; 27]], policies: &mut [[f32; 9]], values: &mut [[f32; 2]]| {
+                for ((s, p), v) in states.iter().zip(policies.iter_mut()).zip(values.iter_mut()) {
+                    *p = [0.2, 0.0, 0.2, 0.0, 0.5, 0.0, 0.2, 0.0, 0.2];
+                    let my_pieces: f32 = s[0..9].iter().sum();
+                    let opp_pieces: f32 = s[9..18].iter().sum();
+                    let adv = ((my_pieces - opp_pieces) * 0.1).clamp(-0.9, 0.9);
+                    *v = [adv, -adv];
+                }
+            },
+        );
+        let service = InferenceService::new(evaluator, 32, 1);
+        let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+
+        // `num_trees = 1` (single MCTS tree per game, zero root parallelism!):
+        // `run_multi_match` automatically interleaves the 32 games via `poll_choose_move`.
+        let f_az = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+            Box::new(AlphaZeroPlayer::new(
+                *g,
+                &service,
+                AlphaZeroConfig::new(1, 24, seed).with_dirichlet(0.3, 0.0),
+            ))
+        };
+        let f_mm = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+            Box::new(MinimaxPlayer::new(*g, TttHeuristic, 2, seed))
+        };
+
+        let summary_1t = run_multi_match(&game, [&f_az, &f_mm], 32, 1, 2026);
+        let batch_stats = service.batch_size_stats();
+        assert_eq!(summary_1t.rounds, 32);
+        assert!(
+            batch_stats.mean() >= 8.0,
+            "expected MultiMatch to batch single-tree AlphaZero evaluations across concurrent games, got {batch_stats}"
+        );
+
+        let summary_2t = run_multi_match(&game, [&f_az, &f_mm], 32, 2, 2026);
+        assert_eq!(summary_1t.wins, summary_2t.wins);
+        assert_eq!(summary_1t.draws, summary_2t.draws);
     }
 }

@@ -151,6 +151,11 @@ where
     }
 
     #[inline]
+    pub fn num_workers(&self) -> usize {
+        self.workers.len()
+    }
+
+    #[inline]
     pub fn evaluator(&self) -> &E {
         &self.shared.evaluator
     }
@@ -204,14 +209,19 @@ where
         }
     }
 
-    /// Walks the worker list, tests each worker's atomic idle flag, wakes the first parked
-    /// worker found, and returns immediately (zero mutex locks, zero syscalls if all are busy).
+    /// Walks the worker list, tests each worker's atomic idle flag, and wakes enough parked
+    /// workers to cover the currently queued batches (zero mutex locks, zero syscalls if busy).
     #[inline]
     fn wake_one_worker(&self) {
+        let q_len = self.shared.request_queue.len();
+        let mut needed = q_len.div_ceil(self.shared.max_batch_size).max(1);
         for (parked, handle) in self.shared.worker_parked.iter().zip(self.workers.iter()) {
             if parked.swap(false, Ordering::SeqCst) {
                 handle.thread().unpark();
-                return;
+                needed -= 1;
+                if needed == 0 {
+                    return;
+                }
             }
         }
     }
@@ -397,58 +407,6 @@ where
             thread::park();
         }
     }
-
-    /// Convenience helper that submits a slice of `states` and blocks until all responses return.
-    pub fn evaluate_batch(
-        &mut self,
-        states: &[[f32; G]],
-        out_policies: &mut [[f32; P]],
-        out_values: &mut [[f32; N]],
-    ) {
-        let count = states.len();
-        if count == 0 {
-            return;
-        }
-        assert!(out_policies.len() >= count && out_values.len() >= count);
-
-        let mut submitted = 0usize;
-        let mut received = 0usize;
-
-        while received < count {
-            let mut pushed_any = false;
-            while submitted < count && (submitted - received) < self.reply_queue.capacity() {
-                self.submit(submitted, states[submitted]);
-                submitted += 1;
-                pushed_any = true;
-            }
-            if pushed_any {
-                self.notify_service();
-            }
-
-            while let Some(resp) = self.try_pop() {
-                out_policies[resp.tag] = resp.policy_logits;
-                out_values[resp.tag] = resp.value;
-                received += 1;
-            }
-
-            if received < count && submitted == count {
-                self.wait_for_response();
-            }
-        }
-    }
-
-    /// Convenience helper evaluating a single state `[f32; G]` through the batched service.
-    #[inline]
-    pub fn evaluate_one(&mut self, state: &[f32; G]) -> ([f32; P], [f32; N]) {
-        self.submit(0, *state);
-        self.notify_service();
-        loop {
-            if let Some(resp) = self.try_pop() {
-                return (resp.policy_logits, resp.value);
-            }
-            thread::park();
-        }
-    }
 }
 
 #[cfg(test)]
@@ -470,28 +428,33 @@ mod tests {
 
         let service = InferenceService::new(evaluator, 32, 1);
 
-        // Spawn 4 client threads, each submitting 25 batches of 8 states = 800 total evaluations.
+        // Spawn 4 client threads, each submitting 25 waves of 8 states = 800 total evaluations.
         std::thread::scope(|s| {
             for t in 0..4 {
                 let svc = &service;
                 s.spawn(move || {
-                    let mut client = svc.client(16);
-                    let mut states = [[0.0f32; 4]; 8];
-                    let mut policies = [[0.0f32; 3]; 8];
-                    let mut values = [[0.0f32; 2]; 8];
+                    let client = svc.client(16);
 
                     for step in 0..25 {
-                        for (i, st) in states.iter_mut().enumerate() {
-                            let v = ((t * 100 + step) * 8 + i) as f32;
-                            *st = [v, 1.0, 2.0, 3.0];
-                        }
-                        client.evaluate_batch(&states, &mut policies, &mut values);
                         for i in 0..8 {
                             let v = ((t * 100 + step) * 8 + i) as f32;
-                            let expected_sum = v + 6.0;
-                            assert!((policies[i][0] - expected_sum).abs() < 1e-5);
-                            assert!((values[i][0] - v).abs() < 1e-5);
-                            assert!((values[i][1] + v).abs() < 1e-5);
+                            client.submit(i, [v, 1.0, 2.0, 3.0]);
+                        }
+                        client.notify_service();
+
+                        let mut received = 0usize;
+                        while received < 8 {
+                            while let Some(resp) = client.try_pop() {
+                                let v = ((t * 100 + step) * 8 + resp.tag) as f32;
+                                let expected_sum = v + 6.0;
+                                assert!((resp.policy_logits[0] - expected_sum).abs() < 1e-5);
+                                assert!((resp.value[0] - v).abs() < 1e-5);
+                                assert!((resp.value[1] + v).abs() < 1e-5);
+                                received += 1;
+                            }
+                            if received < 8 {
+                                client.wait_for_response();
+                            }
                         }
                     }
                 });
