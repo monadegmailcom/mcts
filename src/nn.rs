@@ -416,6 +416,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroNet<G, P, N> {
     }
 }
 
+#[derive(Clone)]
 struct WorkerReplica<const G: usize, const P: usize, const N: usize> {
     varmap: VarMap,
     net: AlphaZeroNet<G, P, N>,
@@ -427,6 +428,7 @@ struct WorkerReplica<const G: usize, const P: usize, const N: usize> {
 /// - Worker `0` shares `master_varmap` directly with [`crate::training::AlphaZeroTrainer`].
 /// - Additional workers (`worker_id >= 1`, e.g., secondary CUDA GPUs on a multi-GPU RunPod machine)
 ///   hold device-local [`VarMap`] replicas that are synchronized via [`Self::sync_workers`].
+#[derive(Clone)]
 pub struct CandleBatchEvaluator<const G: usize, const P: usize, const N: usize> {
     replicas: Box<[WorkerReplica<G, P, N>]>,
 }
@@ -466,6 +468,23 @@ impl<const G: usize, const P: usize, const N: usize> CandleBatchEvaluator<G, P, 
         };
         eval.sync_workers()?;
         Ok(eval)
+    }
+
+    /// Creates a standalone [`CandleBatchEvaluator`] initialized on `devices`, optionally loading
+    /// weights from a `.safetensors` file at `checkpoint_path`.
+    pub fn standalone<Pth: AsRef<Path>>(
+        config: &AlphaZeroNetConfig,
+        devices: &[Device],
+        checkpoint_path: Option<Pth>,
+    ) -> Result<Self> {
+        assert!(!devices.is_empty(), "devices slice must not be empty");
+        let mut master_varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&master_varmap, DType::F32, &devices[0]);
+        let master_net = AlphaZeroNet::new(vb, config)?;
+        if let Some(path) = checkpoint_path {
+            master_varmap.load(path)?;
+        }
+        Self::new(&master_varmap, &master_net, config, devices)
     }
 
     #[inline]

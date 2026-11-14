@@ -16,5 +16,6 @@ pub mod nn;
 pub mod player;
 pub mod root_parallel;
 pub mod statistics;
+pub mod telemetry;
 pub mod training;
 pub mod tree;

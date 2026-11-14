@@ -77,7 +77,39 @@ struct InferenceRequest<const G: usize, const P: usize, const N: usize> {
 #[derive(Clone, Copy, Default)]
 struct WorkerStats {
     batch_size: Statistics,
+    unique_batch_size: Statistics,
     inference_time_us: Statistics,
+    total_requests: u64,
+    unique_evaluations: u64,
+}
+
+#[inline]
+fn canonical_bits(x: f32) -> u32 {
+    if x == 0.0 {
+        0
+    } else {
+        x.to_bits()
+    }
+}
+
+#[inline]
+fn hash_state<const G: usize>(state: &[f32; G]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in state {
+        h ^= canonical_bits(x) as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+#[inline]
+fn states_equal<const G: usize>(a: &[f32; G], b: &[f32; G]) -> bool {
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        if canonical_bits(x) != canonical_bits(y) {
+            return false;
+        }
+    }
+    true
 }
 
 struct ServiceShared<E, const G: usize, const P: usize, const N: usize> {
@@ -155,6 +187,18 @@ where
         self.workers.len()
     }
 
+    /// Current number of pending state evaluation requests waiting in the shared lock-free queue.
+    #[inline]
+    pub fn queue_len(&self) -> usize {
+        self.shared.request_queue.len()
+    }
+
+    /// Maximum capacity of the shared lock-free request queue.
+    #[inline]
+    pub fn queue_capacity(&self) -> usize {
+        self.shared.request_queue.capacity()
+    }
+
     #[inline]
     pub fn evaluator(&self) -> &E {
         &self.shared.evaluator
@@ -180,7 +224,7 @@ where
         self.wake_workers();
     }
 
-    /// Aggregated batch-size distribution across all inference worker threads.
+    /// Aggregated logical batch-size distribution (total requests served per batch) across workers.
     pub fn batch_size_stats(&self) -> Statistics {
         let mut total = Statistics::new();
         for w in &self.shared.worker_stats {
@@ -188,6 +232,38 @@ where
             total.join(&guard.batch_size);
         }
         total
+    }
+
+    /// Aggregated unique state batch-size distribution (after intra-batch deduplication) across workers.
+    pub fn unique_batch_size_stats(&self) -> Statistics {
+        let mut total = Statistics::new();
+        for w in &self.shared.worker_stats {
+            let guard = w.lock().expect("worker_stats mutex poisoned");
+            total.join(&guard.unique_batch_size);
+        }
+        total
+    }
+
+    /// Returns `(total_requests, unique_evaluations)` accumulated across all workers.
+    pub fn dedup_counts(&self) -> (u64, u64) {
+        let mut total_reqs = 0u64;
+        let mut unique_evals = 0u64;
+        for w in &self.shared.worker_stats {
+            let guard = w.lock().expect("worker_stats mutex poisoned");
+            total_reqs += guard.total_requests;
+            unique_evals += guard.unique_evaluations;
+        }
+        (total_reqs, unique_evals)
+    }
+
+    /// Fraction `[0.0, 1.0]` of logical evaluation requests eliminated by intra-batch deduplication.
+    pub fn dedup_savings_ratio(&self) -> f32 {
+        let (total, unique) = self.dedup_counts();
+        if total == 0 || unique >= total {
+            0.0
+        } else {
+            1.0 - (unique as f32) / (total as f32)
+        }
     }
 
     /// Aggregated per-sample inference latency distribution (in microseconds) across workers.
@@ -200,12 +276,15 @@ where
         total
     }
 
-    /// Resets accumulated batch-size and inference-time statistics on all workers.
+    /// Resets accumulated batch-size, deduplication, and inference-time statistics on all workers.
     pub fn reset_stats(&self) {
         for w in &self.shared.worker_stats {
             let mut guard = w.lock().expect("worker_stats mutex poisoned");
             guard.batch_size.reset();
+            guard.unique_batch_size.reset();
             guard.inference_time_us.reset();
+            guard.total_requests = 0;
+            guard.unique_evaluations = 0;
         }
     }
 
@@ -236,15 +315,20 @@ where
 
     fn worker_loop(worker_id: usize, shared: Arc<ServiceShared<E, G, P, N>>) {
         let max_batch_size = shared.max_batch_size;
-        let mut req_batch: Vec<InferenceRequest<G, P, N>> = Vec::with_capacity(max_batch_size);
+        let max_logical_requests = max_batch_size * 4;
+        let mut req_batch: Vec<InferenceRequest<G, P, N>> =
+            Vec::with_capacity(max_logical_requests);
+        let mut req_to_unique: Vec<usize> = Vec::with_capacity(max_logical_requests);
         let mut state_batch: Vec<[f32; G]> = Vec::with_capacity(max_batch_size);
+        let mut state_hashes: Vec<u64> = Vec::with_capacity(max_batch_size);
         let mut policy_batch: Vec<[f32; P]> = vec![[0.0; P]; max_batch_size];
         let mut value_batch: Vec<[f32; N]> = vec![[0.0; N]; max_batch_size];
         let mut postponed: Vec<(
             Arc<ArrayQueue<InferenceResponse<P, N>>>,
             Thread,
             InferenceResponse<P, N>,
-        )> = Vec::with_capacity(max_batch_size);
+        )> = Vec::with_capacity(max_logical_requests);
+        let mut callers_to_wake: Vec<Thread> = Vec::with_capacity(max_logical_requests);
 
         while !shared.stop.load(Ordering::Acquire) {
             while shared.paused.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
@@ -254,10 +338,29 @@ where
                 break;
             }
 
-            // Drain up to `max_batch_size` pending requests from the lock-free queue.
-            while req_batch.len() < max_batch_size {
+            // Drain pending requests from the lock-free queue, deduplicating identical encoded
+            // board states `[f32; G]` within the batch so the neural network evaluates each
+            // unique state at most once per batch!
+            while state_batch.len() < max_batch_size && req_batch.len() < max_logical_requests {
                 if let Some(req) = shared.request_queue.pop() {
-                    state_batch.push(req.state);
+                    let h = hash_state(&req.state);
+                    let mut existing = None;
+                    for (idx, &cand_h) in state_hashes.iter().enumerate() {
+                        if cand_h == h && states_equal(&state_batch[idx], &req.state) {
+                            existing = Some(idx);
+                            break;
+                        }
+                    }
+                    let unique_idx = match existing {
+                        Some(idx) => idx,
+                        None => {
+                            let idx = state_batch.len();
+                            state_batch.push(req.state);
+                            state_hashes.push(h);
+                            idx
+                        }
+                    };
+                    req_to_unique.push(unique_idx);
                     req_batch.push(req);
                 } else {
                     break;
@@ -279,12 +382,13 @@ where
                 continue;
             }
 
+            let u = state_batch.len();
             let start = Instant::now();
             shared.evaluator.evaluate_batch(
                 worker_id,
-                &state_batch[..b],
-                &mut policy_batch[..b],
-                &mut value_batch[..b],
+                &state_batch[..u],
+                &mut policy_batch[..u],
+                &mut value_batch[..u],
             );
             let elapsed_us_per_item = (start.elapsed().as_secs_f64() * 1_000_000.0) / (b as f64);
 
@@ -293,29 +397,36 @@ where
                     .lock()
                     .expect("worker_stats mutex poisoned");
                 st.batch_size.update(b as f32);
+                st.unique_batch_size.update(u as f32);
                 st.inference_time_us.update(elapsed_us_per_item as f32);
+                st.total_requests += b as u64;
+                st.unique_evaluations += u as u64;
             }
 
-            // Deliver responses to each caller's lock-free reply queue without head-of-line
-            // blocking: if one caller's reply queue is full, wake that caller and postpone only
-            // its item so other callers in the same batch receive their responses immediately.
-            for ((req, &policy_logits), &value) in req_batch
-                .drain(..)
-                .zip(policy_batch[..b].iter())
-                .zip(value_batch[..b].iter())
-            {
+            // Deliver all `b` responses into their lock-free reply queues FIRST, fanning out
+            // each unique state's `(policy_logits, value)` to every matching request, and only
+            // unpark caller threads once the entire batch of responses is visible in their queues!
+            for (req, unique_idx) in req_batch.drain(..).zip(req_to_unique.drain(..)) {
                 let resp = InferenceResponse {
                     tag: req.tag,
-                    policy_logits,
-                    value,
+                    policy_logits: policy_batch[unique_idx],
+                    value: value_batch[unique_idx],
                 };
                 match req.reply_queue.push(resp) {
-                    Ok(()) => req.caller.unpark(),
+                    Ok(()) => {
+                        if !callers_to_wake.iter().any(|t| t.id() == req.caller.id()) {
+                            callers_to_wake.push(req.caller);
+                        }
+                    }
                     Err(returned) => {
                         req.caller.unpark();
                         postponed.push((req.reply_queue, req.caller, returned));
                     }
                 }
+            }
+
+            for caller in callers_to_wake.drain(..) {
+                caller.unpark();
             }
 
             let push_backoff = Backoff::new();
@@ -336,6 +447,7 @@ where
             }
             postponed.clear();
             state_batch.clear();
+            state_hashes.clear();
         }
     }
 }
@@ -463,5 +575,54 @@ mod tests {
 
         let batch_stats = service.batch_size_stats();
         assert!(batch_stats.mean() >= 8.0, "expected batched execution, got {batch_stats}");
+    }
+
+    #[test]
+    fn intra_batch_deduplication_evaluates_unique_states_once_and_broadcasts_results() {
+        use std::sync::atomic::AtomicUsize;
+
+        let evaluated_states_count = Arc::new(AtomicUsize::new(0));
+        let count_ref = Arc::clone(&evaluated_states_count);
+
+        let evaluator = FnBatchEvaluator(
+            move |states: &[[f32; 4]], policies: &mut [[f32; 3]], values: &mut [[f32; 2]]| {
+                count_ref.fetch_add(states.len(), Ordering::Relaxed);
+                for ((s, p), v) in states.iter().zip(policies.iter_mut()).zip(values.iter_mut()) {
+                    let sum: f32 = s.iter().sum();
+                    *p = [sum, sum + 1.0, sum + 2.0];
+                    *v = [s[0], -s[0]];
+                }
+            },
+        );
+
+        let service = InferenceService::new(evaluator, 32, 1);
+        service.pause_inference();
+
+        // Submit 16 requests covering only 2 distinct states before resuming the worker.
+        let client = service.client(16);
+        for i in 0..16 {
+            let first = if i % 2 == 0 { 10.0 } else { 20.0 };
+            client.submit(i, [first, 1.0, 2.0, 3.0]);
+        }
+
+        service.resume_inference();
+
+        let mut received = 0usize;
+        while received < 16 {
+            while let Some(resp) = client.try_pop() {
+                let expected_first = if resp.tag % 2 == 0 { 10.0 } else { 20.0 };
+                assert!((resp.value[0] - expected_first).abs() < 1e-5);
+                assert!((resp.policy_logits[0] - (expected_first + 6.0)).abs() < 1e-5);
+                received += 1;
+            }
+            if received < 16 {
+                client.wait_for_response();
+            }
+        }
+
+        // Only 2 unique states should have been evaluated by the NN backend!
+        assert_eq!(evaluated_states_count.load(Ordering::Relaxed), 2);
+        assert_eq!(service.dedup_counts(), (16, 2));
+        assert!((service.dedup_savings_ratio() - 0.875).abs() < 1e-5);
     }
 }

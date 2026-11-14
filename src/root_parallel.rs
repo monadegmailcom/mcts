@@ -310,6 +310,48 @@ where
         }
         chosen_mv
     }
+
+    /// Runs the configured simulation budget across all `T` root-parallel workers without
+    /// advancing the root node, returning the aggregated `(mv, visits, value_sum)` statistics
+    /// for each legal root move (used by the interactive Browser Lab position inspector).
+    pub fn evaluate_root(&mut self) -> Vec<AggregatedRootChild<R::Move>> {
+        if E::IS_ASYNC || self.workers.len() == 1 {
+            let num_threads = self.workers.len();
+            let budget = self.budget;
+            loop {
+                let mut all_done = true;
+                for (t, worker) in self.workers.iter_mut().enumerate() {
+                    if !worker.done {
+                        let my_sims = Self::worker_target_simulations(budget, t, num_threads);
+                        if worker
+                            .search
+                            .poll_simulations(my_sims, &mut worker.evaluator)
+                            .is_ready()
+                        {
+                            worker.done = true;
+                        } else {
+                            all_done = false;
+                        }
+                    }
+                }
+                if all_done {
+                    break;
+                }
+                for worker in &mut self.workers {
+                    if !worker.done {
+                        worker.evaluator.notify_pending();
+                    }
+                }
+                std::thread::park();
+            }
+            for worker in &mut self.workers {
+                worker.done = false;
+            }
+        } else {
+            self.last_total_simulations = self.run_parallel_search();
+        }
+        self.aggregated_root_children()
+    }
 }
 
 impl<R, const N: usize, S, E> Player<R, N> for RootParallelPlayer<R, N, S, E>

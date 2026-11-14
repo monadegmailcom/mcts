@@ -480,6 +480,13 @@ where
     pub fn aggregated_root_children(&self) -> Vec<AggregatedRootChild<R::Move>> {
         self.inner.aggregated_root_children()
     }
+
+    /// Runs the configured simulation budget across all `K` trees without advancing the root,
+    /// returning the aggregated `(mv, visits, value_sum)` statistics for each legal move.
+    #[inline]
+    pub fn evaluate_root(&mut self) -> Vec<AggregatedRootChild<R::Move>> {
+        self.inner.evaluate_root()
+    }
 }
 
 impl<R, E, const G: usize, const P: usize, const N: usize> Player<R, N>

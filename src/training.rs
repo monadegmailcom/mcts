@@ -99,6 +99,10 @@ impl<const G: usize, const P: usize, const N: usize> ReplayBuffer<G, P, N> {
 pub struct TrainMetrics {
     pub total_loss: f32,
     pub policy_loss: f32,
+    /// Kullback-Leibler divergence `KL(pi_MCTS || p_NN) = policy_loss - H(pi_MCTS)`.
+    /// Unlike raw cross-entropy `policy_loss` (whose theoretical minimum is `H(pi_MCTS)`),
+    /// `policy_kl` has a true floor of `0.0` when the network perfectly matches the MCTS policy.
+    pub policy_kl: f32,
     pub value_loss: f32,
 }
 
@@ -208,10 +212,24 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
 
         self.optimizer.backward_step(&total_loss)?;
 
+        let total_loss_val = total_loss.to_scalar::<f32>()?;
+        let policy_loss_val = policy_loss.to_scalar::<f32>()?;
+        let value_loss_val = value_loss.to_scalar::<f32>()?;
+
+        let mut target_entropy_sum = 0.0f32;
+        for &p in policies_flat {
+            if p > 1e-8 {
+                target_entropy_sum -= p * p.ln();
+            }
+        }
+        let target_entropy = target_entropy_sum / (batch_size as f32);
+        let policy_kl = (policy_loss_val - target_entropy).max(0.0);
+
         Ok(TrainMetrics {
-            total_loss: total_loss.to_scalar::<f32>()?,
-            policy_loss: policy_loss.to_scalar::<f32>()?,
-            value_loss: value_loss.to_scalar::<f32>()?,
+            total_loss: total_loss_val,
+            policy_loss: policy_loss_val,
+            policy_kl,
+            value_loss: value_loss_val,
         })
     }
 
@@ -230,6 +248,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
 
         let mut sum_total = 0.0f32;
         let mut sum_policy = 0.0f32;
+        let mut sum_kl = 0.0f32;
         let mut sum_value = 0.0f32;
 
         for _ in 0..steps {
@@ -247,6 +266,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
             let metrics = res?;
             sum_total += metrics.total_loss;
             sum_policy += metrics.policy_loss;
+            sum_kl += metrics.policy_kl;
             sum_value += metrics.value_loss;
         }
 
@@ -257,6 +277,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
         Ok(TrainMetrics {
             total_loss: sum_total * inv,
             policy_loss: sum_policy * inv,
+            policy_kl: sum_kl * inv,
             value_loss: sum_value * inv,
         })
     }
