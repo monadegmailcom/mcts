@@ -137,10 +137,10 @@ impl<const N: usize> GameStatus<N> {
 /// Implementors are typically zero-sized marker types (e.g., `pub struct TicTacToe;`).
 pub trait GameRules<const N: usize>: Sized {
     /// Action/move representation (small `Copy` value, e.g. `u8` or compact struct).
-    type Move: Copy + Eq + Debug;
+    type Move: Copy + Eq + Debug + Send + Sync;
 
     /// Board/environment state representation.
-    type State: Clone + Debug;
+    type State: Clone + Debug + Send + Sync;
 
     /// Zero-allocation lazy iterator over valid moves (Rust GAT: Generic Associated Type).
     type MoveIter<'a>: Iterator<Item = Self::Move>

@@ -22,11 +22,14 @@
 //!   and call `backpropagate`—achieving full GPU saturation with **zero virtual loss** and 100%
 //!   informed PUCT selections.
 
-use rand::prelude::{IndexedRandom, RngExt, SeedableRng, SliceRandom, SmallRng};
+use std::task::Poll;
+
+use rand::prelude::{IndexedRandom, Rng, RngExt, SeedableRng, SliceRandom, SmallRng};
+use rand_distr::{Distribution, Gamma};
 
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::player::Player;
-use crate::tree::{GenerationalTree, Node, NodeId};
+use crate::tree::{GenerationalTree, Node, NodeId, TreeArena};
 
 /// Per-node statistics stored inside [`Node<M, MctsPayload>`].
 ///
@@ -150,7 +153,12 @@ impl SelectionPolicy for Puct {
 
 /// Pluggable leaf evaluation strategy unifying playout MCTS and AlphaZero neural evaluation.
 pub trait LeafEvaluator<R: GameRules<N>, const N: usize> {
-    /// Evaluates a newly expanded non-terminal `game` position.
+    /// Whether `poll_evaluate` submits work to an external asynchronous batch service (`true` for
+    /// [`crate::alphazero::NnEvaluator`]) rather than computing synchronously on the calling CPU
+    /// thread (`false` for [`PlayoutEvaluator`]).
+    const IS_ASYNC: bool = false;
+
+    /// Synchronously evaluates a newly expanded non-terminal `game` position.
     ///
     /// `children` holds the newly allocated child nodes for all valid moves from `game`,
     /// pre-initialized with uniform priors `1.0 / children.len()`.
@@ -162,6 +170,21 @@ pub trait LeafEvaluator<R: GameRules<N>, const N: usize> {
         game: &Game<R, N>,
         children: &mut [Node<R::Move, MctsPayload>],
     ) -> [f32; N];
+
+    /// Non-blocking evaluation step enabling [`MctsSearch::poll_simulations`] to multiplex
+    /// asynchronous neural network requests across parallel trees or games.
+    #[inline]
+    fn poll_evaluate(
+        &mut self,
+        game: &Game<R, N>,
+        children: &mut [Node<R::Move, MctsPayload>],
+    ) -> Poll<[f32; N]> {
+        Poll::Ready(self.evaluate(game, children))
+    }
+
+    /// Wakes any background evaluation service before the caller parks waiting for responses.
+    #[inline]
+    fn notify_pending(&mut self) {}
 }
 
 /// Classical uniform random rollout evaluator (port of `montecarlo::Player::playout`).
@@ -246,6 +269,11 @@ pub struct MctsSearch<R: GameRules<N>, const N: usize, S: SelectionPolicy> {
     tree: GenerationalTree<R::Move, MctsPayload>,
     selector: S,
     rng: SmallRng,
+    dirichlet_alpha: f32,
+    dirichlet_epsilon: f32,
+    root_noise_applied: bool,
+    sims_done: usize,
+    pending_leaf: Option<(NodeId, Game<R, N>)>,
     /// Reusable root-to-leaf `(child_id, acting_player_who_chose_child)` stack.
     path_buf: Vec<(NodeId, PlayerIndex<N>)>,
     /// Reusable buffer for bulk move generation during leaf expansion.
@@ -268,9 +296,23 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
             tree: GenerationalTree::new(arena_capacity, dummy_move, MctsPayload::default()),
             selector,
             rng: SmallRng::seed_from_u64(seed),
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.0,
+            root_noise_applied: false,
+            sims_done: 0,
+            pending_leaf: None,
             path_buf: Vec::with_capacity(64),
             move_buf: Vec::with_capacity(32),
         }
+    }
+
+    /// Configures root Dirichlet exploration noise `(alpha, epsilon)` mixed into root priors
+    /// once the root node's children have been evaluated.
+    #[inline]
+    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
+        self.dirichlet_alpha = alpha;
+        self.dirichlet_epsilon = epsilon;
+        self
     }
 
     #[inline]
@@ -378,6 +420,78 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
         }
     }
 
+    /// Non-blocking simulation driver that steps this tree toward `target_simulations` using
+    /// `evaluator.poll_evaluate(...)`.
+    ///
+    /// - For synchronous evaluators ([`PlayoutEvaluator`]), completes all `target_simulations`
+    ///   in a single call and returns `Poll::Ready(())`.
+    /// - For asynchronous evaluators ([`crate::alphazero::NnEvaluator`]), pauses and returns
+    ///   `Poll::Pending` whenever a leaf is waiting on a neural network batch response, resuming
+    ///   from that exact leaf on the next poll!
+    pub fn poll_simulations<E: LeafEvaluator<R, N>>(
+        &mut self,
+        target_simulations: usize,
+        evaluator: &mut E,
+    ) -> Poll<()> {
+        while self.sims_done < target_simulations {
+            if self.pending_leaf.is_none() {
+                if !self.root_noise_applied
+                    && self.dirichlet_epsilon > 0.0
+                    && self.tree.root().payload.visits > 0
+                    && !self.tree.active().children(NodeId::ROOT).is_empty()
+                {
+                    apply_root_dirichlet_noise(
+                        self.tree.active_mut(),
+                        self.dirichlet_alpha,
+                        self.dirichlet_epsilon,
+                        &mut self.rng,
+                    );
+                    self.root_noise_applied = true;
+                }
+
+                match self.select_to_leaf() {
+                    LeafStep::Terminal(payoffs) => {
+                        self.backpropagate(payoffs);
+                        self.sims_done += 1;
+                        continue;
+                    }
+                    LeafStep::NeedsEvaluation { leaf_id, leaf_game } => {
+                        self.pending_leaf = Some((leaf_id, leaf_game));
+                    }
+                }
+            }
+
+            let (leaf_id, leaf_game) = self
+                .pending_leaf
+                .as_ref()
+                .expect("pending_leaf must be present");
+            let leaf_id = *leaf_id;
+            let children = self.tree.active_mut().children_mut(leaf_id);
+            match evaluator.poll_evaluate(leaf_game, children) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(payoffs) => {
+                    self.pending_leaf = None;
+                    if leaf_id == NodeId::ROOT
+                        && !self.root_noise_applied
+                        && self.dirichlet_epsilon > 0.0
+                    {
+                        apply_root_dirichlet_noise(
+                            self.tree.active_mut(),
+                            self.dirichlet_alpha,
+                            self.dirichlet_epsilon,
+                            &mut self.rng,
+                        );
+                        self.root_noise_applied = true;
+                    }
+                    self.backpropagate(payoffs);
+                    self.sims_done += 1;
+                }
+            }
+        }
+        self.sims_done = 0;
+        Poll::Ready(())
+    }
+
     /// Executes a single complete MCTS simulation (Select -> Expand -> Evaluate -> Backpropagate).
     #[inline]
     pub fn simulate_once<E: LeafEvaluator<R, N>>(&mut self, evaluator: &mut E) {
@@ -397,8 +511,12 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
         simulations: usize,
         evaluator: &mut E,
     ) {
-        for _ in 0..simulations {
-            self.simulate_once(evaluator);
+        loop {
+            if self.poll_simulations(simulations, evaluator).is_ready() {
+                return;
+            }
+            evaluator.notify_pending();
+            std::thread::park();
         }
     }
 
@@ -450,6 +568,9 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     /// reusing the surviving subtree if `mv` was already expanded.
     pub fn advance(&mut self, mv: R::Move) -> bool {
         self.root_game = self.root_game.apply(mv);
+        self.sims_done = 0;
+        self.root_noise_applied = false;
+        self.pending_leaf = None;
         self.tree.advance_or_reset(mv)
     }
 
@@ -457,6 +578,9 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     #[inline]
     pub fn advance_to_child(&mut self, child_id: NodeId, mv: R::Move) {
         self.root_game = self.root_game.apply(mv);
+        self.sims_done = 0;
+        self.root_noise_applied = false;
+        self.pending_leaf = None;
         self.tree.advance_to(child_id);
     }
 
@@ -465,6 +589,9 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     #[inline]
     pub fn reset(&mut self, root_game: Game<R, N>, dummy_move: R::Move) {
         self.root_game = root_game;
+        self.sims_done = 0;
+        self.root_noise_applied = false;
+        self.pending_leaf = None;
         self.tree.reset_root(dummy_move, MctsPayload::default());
         self.path_buf.clear();
         self.move_buf.clear();
@@ -533,6 +660,8 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
 pub struct MctsConfig {
     pub simulations: usize,
     pub opening_moves: usize,
+    pub dirichlet_alpha: f32,
+    pub dirichlet_epsilon: f32,
     pub arena_capacity: usize,
     pub seed: u64,
 }
@@ -542,6 +671,8 @@ impl MctsConfig {
         Self {
             simulations,
             opening_moves: 0,
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.0,
             arena_capacity: simulations * 16,
             seed,
         }
@@ -549,6 +680,12 @@ impl MctsConfig {
 
     pub const fn with_opening_moves(mut self, opening_moves: usize) -> Self {
         self.opening_moves = opening_moves;
+        self
+    }
+
+    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
+        self.dirichlet_alpha = alpha;
+        self.dirichlet_epsilon = epsilon;
         self
     }
 
@@ -561,7 +698,7 @@ impl MctsConfig {
 /// Ready-to-play MCTS [`Player`] pairing [`MctsSearch`] with any [`LeafEvaluator`].
 ///
 /// - With `S = Uct` and `E = PlayoutEvaluator<R::Move>`, this is classical playout MCTS.
-/// - With `S = Puct` and `E = NnEvaluator`, this is single-threaded AlphaZero.
+/// - With `S = Puct` and `E = NnEvaluator`, this is single-tree AlphaZero.
 pub struct MctsPlayer<R: GameRules<N>, const N: usize, S: SelectionPolicy, E: LeafEvaluator<R, N>> {
     search: MctsSearch<R, N, S>,
     evaluator: E,
@@ -594,7 +731,8 @@ where
                 selector,
                 config.arena_capacity,
                 config.seed,
-            ),
+            )
+            .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon),
             evaluator,
             simulations: config.simulations,
             opening_moves: config.opening_moves,
@@ -619,9 +757,14 @@ where
     S: SelectionPolicy,
     E: LeafEvaluator<R, N>,
 {
-    fn choose_move(&mut self) -> R::Move {
-        self.search
-            .run_simulations(self.simulations, &mut self.evaluator);
+    fn poll_choose_move(&mut self) -> Poll<R::Move> {
+        if self
+            .search
+            .poll_simulations(self.simulations, &mut self.evaluator)
+            .is_pending()
+        {
+            return Poll::Pending;
+        }
 
         self.move_count += 1;
         let (chosen_id, chosen_mv) = if self.move_count <= self.opening_moves {
@@ -630,14 +773,67 @@ where
             self.search.best_root_child()
         };
 
-        self.search.root_game = self.search.root_game.apply(chosen_mv);
-        self.search.tree.advance_to(chosen_id);
-        chosen_mv
+        self.search.advance_to_child(chosen_id, chosen_mv);
+        Poll::Ready(chosen_mv)
+    }
+
+    #[inline]
+    fn notify_pending(&mut self) {
+        self.evaluator.notify_pending();
+    }
+
+    fn choose_move(&mut self) -> R::Move {
+        loop {
+            if let Poll::Ready(mv) = self.poll_choose_move() {
+                return mv;
+            }
+            self.notify_pending();
+            std::thread::park();
+        }
     }
 
     fn apply_external_move(&mut self, mv: R::Move) {
         self.move_count += 1;
         self.search.advance(mv);
+    }
+}
+
+/// Blends symmetric `Dirichlet(alpha)` exploration noise into the root node's child priors:
+/// `P'(s_root, a) = (1 - epsilon) * P(s_root, a) + epsilon * noise_a`.
+///
+/// Must be called *after* the root's children have been expanded and assigned their neural network
+/// softmax priors `P(s_root, a)`.
+pub fn apply_root_dirichlet_noise<M: Copy>(
+    arena: &mut TreeArena<M, MctsPayload>,
+    alpha: f32,
+    epsilon: f32,
+    rng: &mut impl Rng,
+) {
+    if epsilon <= 0.0 || alpha <= 0.0 {
+        return;
+    }
+    let children = arena.children_mut(NodeId::ROOT);
+    if children.len() <= 1 {
+        return;
+    }
+
+    let gamma = Gamma::new(alpha as f64, 1.0).expect("Dirichlet alpha must be > 0 and finite");
+    let mut samples = Vec::with_capacity(children.len());
+    let mut sum = 0.0f64;
+    for _ in 0..children.len() {
+        let s = gamma.sample(rng);
+        samples.push(s);
+        sum += s;
+    }
+
+    if sum <= f64::EPSILON {
+        return;
+    }
+
+    let inv_sum = 1.0 / sum;
+    for (child, &sample) in children.iter_mut().zip(samples.iter()) {
+        let noise = (sample * inv_sum) as f32;
+        child.payload.prior = (1.0 - epsilon) * child.payload.prior + epsilon * noise;
     }
 }
 

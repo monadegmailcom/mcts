@@ -265,8 +265,150 @@ impl<const N: usize> MultiMatchSummary<N> {
     }
 }
 
+/// A single game slot that can be stepped non-blockingly by [`run_parallel_games`].
+///
+/// Implementing this trait on a named struct (such as `MatchSlot` in [`crate::matchup`] or
+/// `SelfPlaySlot` in [`crate::alphazero`]) replaces large stateful `step_slot` closures with
+/// clean, self-contained struct methods.
+pub trait PollableSlot {
+    /// Per-game output produced when the slot's game reaches a terminal state.
+    type Output;
+
+    /// Advances the game slot until it either blocks on an asynchronous evaluation
+    /// ([`Poll::Pending`]) or completes the current game ([`Poll::Ready`]).
+    fn poll_step(&mut self) -> Poll<Self::Output>;
+
+    /// Flushes any pending evaluation notifications before the worker thread parks.
+    fn notify_pending(&mut self);
+}
+
+/// Shared dynamic game-parallel multiplexer used by both [`run_multi_match`] and
+/// [`crate::alphazero::run_self_play_with_initializer`].
+///
+/// Runs `total_games` across `num_workers` OS threads, dynamically scaling the number of
+/// concurrent [`PollableSlot`]s per worker from `1` up to `max_slots_per_worker` whenever
+/// existing slots return [`Poll::Pending`]:
+/// - When all participants/evaluators are synchronous CPU agents, `poll_step()` always returns
+///   [`Poll::Ready`], so each worker allocates only `1` slot and runs games sequentially.
+/// - When an agent/evaluator returns [`Poll::Pending`] (waiting on [`crate::inference::InferenceService`]),
+///   each worker automatically scales up active game slots on demand up to `max_slots_per_worker`
+///   so an entire wave of games submits neural network requests into the same GPU batch before
+///   calling `notify_pending()` and parking.
+pub fn run_parallel_games<S, W, InitWorker, MakeSlot, ResetSlot, RecordOutput>(
+    total_games: usize,
+    num_workers: usize,
+    max_slots_per_worker: usize,
+    init_worker: InitWorker,
+    make_slot: MakeSlot,
+    reset_slot: ResetSlot,
+    record_output: RecordOutput,
+) -> Vec<W>
+where
+    S: PollableSlot,
+    W: Send,
+    InitWorker: Fn(usize) -> W + Sync,
+    MakeSlot: Fn(&mut W, usize, usize) -> S + Sync,
+    ResetSlot: Fn(&mut W, &mut S, usize) + Sync,
+    RecordOutput: Fn(&mut W, usize, S::Output) + Sync,
+{
+    if total_games == 0 {
+        return Vec::new();
+    }
+
+    let worker_count = num_workers.max(1).min(total_games);
+    let slot_cap = max_slots_per_worker.max(1);
+    let next_game_id = AtomicUsize::new(0);
+
+    // Advances `(game_idx, slot)` until it returns `Poll::Pending` (`true`) or the shared
+    // game pool is exhausted (`false`).
+    let advance_slot = |entry: &mut (usize, S),
+                        worker_state: &mut W,
+                        pool_exhausted: &mut bool|
+     -> bool {
+        loop {
+            match entry.1.poll_step() {
+                Poll::Pending => return true,
+                Poll::Ready(output) => {
+                    record_output(worker_state, entry.0, output);
+                    let next_idx = next_game_id.fetch_add(1, Ordering::Relaxed);
+                    if next_idx < total_games {
+                        entry.0 = next_idx;
+                        reset_slot(worker_state, &mut entry.1, next_idx);
+                    } else {
+                        *pool_exhausted = true;
+                        return false;
+                    }
+                }
+            }
+        }
+    };
+
+    let run_worker = |worker_id: usize| -> W {
+        let mut worker_state = init_worker(worker_id);
+        let mut slots: Vec<(usize, S)> = Vec::with_capacity(slot_cap);
+        let mut pool_exhausted = false;
+
+        loop {
+            // 1. Step all currently active slots that may have received async responses.
+            let mut i = 0;
+            while i < slots.len() {
+                if advance_slot(&mut slots[i], &mut worker_state, &mut pool_exhausted) {
+                    i += 1;
+                } else {
+                    slots.swap_remove(i);
+                }
+            }
+
+            // 2. While we have capacity for more concurrent games and the pool is not exhausted,
+            //    dynamically scale up active slots on demand so an entire wave of games submits
+            //    requests before we notify the inference service and park.
+            while slots.len() < slot_cap && !pool_exhausted {
+                let game_idx = next_game_id.fetch_add(1, Ordering::Relaxed);
+                if game_idx < total_games {
+                    let slot_idx = slots.len();
+                    let slot = make_slot(&mut worker_state, slot_idx, game_idx);
+                    let mut entry = (game_idx, slot);
+                    if advance_slot(&mut entry, &mut worker_state, &mut pool_exhausted) {
+                        slots.push(entry);
+                    }
+                } else {
+                    pool_exhausted = true;
+                }
+            }
+
+            if slots.is_empty() {
+                break;
+            }
+
+            // 3. All active slots are `Poll::Pending`: flush notifications and park until woken.
+            for (_, slot) in &mut slots {
+                slot.notify_pending();
+            }
+            std::thread::park();
+        }
+
+        worker_state
+    };
+
+    // Fast single-threaded path avoids OS thread spawn overhead altogether.
+    if worker_count == 1 {
+        return vec![run_worker(0)];
+    }
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            handles.push(scope.spawn(move || run_worker(worker_id)));
+        }
+
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("parallel game worker thread panicked"))
+            .collect()
+    })
+}
+
 struct MatchSlot<'a, R: GameRules<N>, const N: usize> {
-    round_idx: usize,
     game: Game<R, N>,
     seats: [Box<dyn Player<R, N> + 'a>; N],
     moves_played: usize,
@@ -275,14 +417,63 @@ struct MatchSlot<'a, R: GameRules<N>, const N: usize> {
     turn_accum_duration: Duration,
 }
 
+impl<R: GameRules<N>, const N: usize> PollableSlot for MatchSlot<'_, R, N> {
+    type Output = MatchOutcome<N>;
+
+    fn poll_step(&mut self) -> Poll<Self::Output> {
+        loop {
+            if let GameStatus::Terminal(payoffs) = self.game.status() {
+                return Poll::Ready(MatchOutcome {
+                    payoffs,
+                    moves_played: self.moves_played,
+                    seat_durations: self.seat_durations,
+                    choose_time_us: self.choose_time_us,
+                });
+            }
+
+            let actor_idx = self.game.current_player().index();
+            let start = Instant::now();
+            match self.seats[actor_idx].poll_choose_move() {
+                Poll::Pending => {
+                    self.turn_accum_duration += start.elapsed();
+                    return Poll::Pending;
+                }
+                Poll::Ready(mv) => {
+                    let choose_elapsed = self.turn_accum_duration + start.elapsed();
+                    self.turn_accum_duration = Duration::ZERO;
+                    self.seat_durations[actor_idx] += choose_elapsed;
+                    self.choose_time_us[actor_idx]
+                        .update((choose_elapsed.as_secs_f64() * 1_000_000.0) as f32);
+
+                    self.game = self.game.apply(mv);
+                    for (seat, player) in self.seats.iter_mut().enumerate() {
+                        if seat != actor_idx {
+                            let notify_start = Instant::now();
+                            player.apply_external_move(mv);
+                            self.seat_durations[seat] += notify_start.elapsed();
+                        }
+                    }
+                    self.moves_played += 1;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn notify_pending(&mut self) {
+        let actor_idx = self.game.current_player().index();
+        self.seats[actor_idx].notify_pending();
+    }
+}
+
 /// Runs `rounds` games across `num_threads` OS threads with cyclic seat rotation
 /// (port & `N`-player generalization of C++ `MultiMatch`).
 ///
 /// - On round `r`, participant `p` (`0..N`) is assigned to seat `(p + r) % N`.
-/// - When one or more participants return [`Poll::Pending`] from [`Player::poll_choose_move`]
-///   (such as [`crate::alphazero::AlphaZeroPlayer`] waiting on a neural network evaluation),
-///   each worker thread automatically multiplexes up to `64` concurrent games on demand so
-///   their neural network evaluations are batched together!
+/// - Powered by [`run_parallel_games`]: when one or more participants return [`Poll::Pending`]
+///   from [`Player::poll_choose_move`] (such as [`crate::alphazero::AlphaZeroPlayer`] waiting on
+///   a neural network evaluation), each worker thread automatically scales up to `64` concurrent
+///   games on demand so their neural network evaluations are batched together!
 /// - When all participants are synchronous CPU players, `poll_choose_move` always returns
 ///   [`Poll::Ready`], so each worker thread allocates only `1` slot and runs games sequentially.
 /// - Because seeding is derived deterministically from `(base_seed, r, p)`, total win/draw/payoff
@@ -306,16 +497,14 @@ where
 
     let worker_count = num_threads.max(1).min(rounds);
     let max_slots_per_worker = rounds.div_ceil(worker_count).clamp(1, 64);
-    let next_round = AtomicUsize::new(0);
 
-    let make_slot = |r: usize| -> MatchSlot<'a, R, N> {
+    let build_slot = |r: usize| -> MatchSlot<'a, R, N> {
         let seats: [Box<dyn Player<R, N> + 'a>; N] = std::array::from_fn(|seat| {
             let participant = (seat + N - (r % N)) % N;
             let seed = mix_round_seed(base_seed, r as u64, participant as u64);
             factories[participant](initial_game, seed)
         });
         MatchSlot {
-            round_idx: r,
             game: initial_game.clone(),
             seats,
             moves_played: 0,
@@ -325,121 +514,21 @@ where
         }
     };
 
-    // Advances `slot` until an asynchronous player returns `Poll::Pending` (`true`) or the round
-    // pool is exhausted (`false`).
-    let step_slot = |slot: &mut MatchSlot<'a, R, N>,
-                     local_summary: &mut MultiMatchSummary<N>|
-     -> bool {
-        loop {
-            if let GameStatus::Terminal(payoffs) = slot.game.status() {
-                let outcome = MatchOutcome {
-                    payoffs,
-                    moves_played: slot.moves_played,
-                    seat_durations: slot.seat_durations,
-                    choose_time_us: slot.choose_time_us,
-                };
-                local_summary.record_round(slot.round_idx, &outcome);
+    let worker_summaries = run_parallel_games(
+        rounds,
+        worker_count,
+        max_slots_per_worker,
+        |_worker_id| MultiMatchSummary::<N>::empty(),
+        |_summary, _slot_idx, round_idx| build_slot(round_idx),
+        |_summary, slot, round_idx| *slot = build_slot(round_idx),
+        |summary, round_idx, outcome| summary.record_round(round_idx, &outcome),
+    );
 
-                let r = next_round.fetch_add(1, Ordering::Relaxed);
-                if r < rounds {
-                    *slot = make_slot(r);
-                    continue;
-                } else {
-                    return false;
-                }
-            }
-
-            let actor_idx = slot.game.current_player().index();
-            let start = Instant::now();
-            match slot.seats[actor_idx].poll_choose_move() {
-                Poll::Pending => {
-                    slot.turn_accum_duration += start.elapsed();
-                    return true;
-                }
-                Poll::Ready(mv) => {
-                    let choose_elapsed = slot.turn_accum_duration + start.elapsed();
-                    slot.turn_accum_duration = Duration::ZERO;
-                    slot.seat_durations[actor_idx] += choose_elapsed;
-                    slot.choose_time_us[actor_idx]
-                        .update((choose_elapsed.as_secs_f64() * 1_000_000.0) as f32);
-
-                    slot.game = slot.game.apply(mv);
-                    for (seat, player) in slot.seats.iter_mut().enumerate() {
-                        if seat != actor_idx {
-                            let notify_start = Instant::now();
-                            player.apply_external_move(mv);
-                            slot.seat_durations[seat] += notify_start.elapsed();
-                        }
-                    }
-                    slot.moves_played += 1;
-                }
-            }
-        }
-    };
-
-    let run_worker = || {
-        let mut local_summary = MultiMatchSummary::<N>::empty();
-        let mut slots: Vec<MatchSlot<'a, R, N>> = Vec::new();
-        let mut pool_exhausted = false;
-
-        loop {
-            // 1. Step all currently active slots that have received responses.
-            let mut i = 0;
-            while i < slots.len() {
-                if step_slot(&mut slots[i], &mut local_summary) {
-                    i += 1;
-                } else {
-                    slots.swap_remove(i);
-                }
-            }
-
-            // 2. If all existing slots are waiting on an async evaluation (or none exist yet),
-            //    dynamically start a new round on demand up to `max_slots_per_worker`.
-            if slots.len() < max_slots_per_worker && !pool_exhausted {
-                let r = next_round.fetch_add(1, Ordering::Relaxed);
-                if r < rounds {
-                    let mut slot = make_slot(r);
-                    if step_slot(&mut slot, &mut local_summary) {
-                        slots.push(slot);
-                    }
-                    continue;
-                } else {
-                    pool_exhausted = true;
-                }
-            }
-
-            if slots.is_empty() {
-                break;
-            }
-
-            // 3. All active slots are waiting on async evaluations: flush notifications and park.
-            for slot in &mut slots {
-                let actor_idx = slot.game.current_player().index();
-                slot.seats[actor_idx].notify_pending();
-            }
-            std::thread::park();
-        }
-        local_summary
-    };
-
-    // Fast single-threaded path avoids OS thread spawn overhead altogether.
-    if worker_count == 1 {
-        return run_worker();
+    let mut total = MultiMatchSummary::<N>::empty();
+    for summary in &worker_summaries {
+        total.merge(summary);
     }
-
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            handles.push(scope.spawn(run_worker));
-        }
-
-        let mut total = MultiMatchSummary::<N>::empty();
-        for handle in handles {
-            let worker_summary = handle.join().expect("MultiMatch worker thread panicked");
-            total.merge(&worker_summary);
-        }
-        total
-    })
+    total
 }
 
 /// SplitMix64-based bijection mapping `(base_seed, round, participant)` to an independent `u64` seed.

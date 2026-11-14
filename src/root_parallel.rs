@@ -20,6 +20,7 @@
 //!   this same Root Parallelism over the non-blocking [`crate::inference::InferenceService`] event
 //!   loop, multiplexing `K` root trees in batches without blocking on single-state evaluations.
 
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use rand::prelude::{RngExt, SeedableRng, SmallRng};
@@ -45,6 +46,8 @@ pub enum RootParallelBudget {
 pub struct RootParallelConfig {
     pub budget: RootParallelBudget,
     pub opening_moves: usize,
+    pub dirichlet_alpha: f32,
+    pub dirichlet_epsilon: f32,
     pub arena_capacity_per_thread: usize,
     pub seed: u64,
 }
@@ -65,6 +68,8 @@ impl RootParallelConfig {
         Self {
             budget,
             opening_moves: 0,
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.0,
             arena_capacity_per_thread: default_cap,
             seed,
         }
@@ -72,6 +77,12 @@ impl RootParallelConfig {
 
     pub const fn with_opening_moves(mut self, opening_moves: usize) -> Self {
         self.opening_moves = opening_moves;
+        self
+    }
+
+    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
+        self.dirichlet_alpha = alpha;
+        self.dirichlet_epsilon = epsilon;
         self
     }
 
@@ -84,6 +95,7 @@ impl RootParallelConfig {
 struct RootWorker<R: GameRules<N>, const N: usize, S: SelectionPolicy, E: LeafEvaluator<R, N>> {
     search: MctsSearch<R, N, S>,
     evaluator: E,
+    done: bool,
 }
 
 /// Aggregated statistics for a single legal root move across all `T` root-parallel threads.
@@ -152,8 +164,10 @@ where
                         selector,
                         config.arena_capacity_per_thread,
                         thread_seed,
-                    ),
+                    )
+                    .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon),
                     evaluator: make_evaluator(t, eval_seed),
+                    done: false,
                 }
             })
             .collect::<Box<[_]>>();
@@ -210,6 +224,19 @@ where
         agg
     }
 
+    #[inline]
+    fn worker_target_simulations(budget: RootParallelBudget, t: usize, num_threads: usize) -> usize {
+        match budget {
+            RootParallelBudget::TotalSimulations(total) => {
+                let base = total / num_threads;
+                let rem = usize::from(t < (total % num_threads));
+                (base + rem).max(1)
+            }
+            RootParallelBudget::SimulationsPerThread(sims) => sims.max(1),
+            RootParallelBudget::MaxDuration(_) => 1,
+        }
+    }
+
     fn run_parallel_search(&mut self) -> usize {
         let num_threads = self.workers.len();
         let budget = self.budget;
@@ -224,15 +251,9 @@ where
             {
                 scope.spawn(move || {
                     match budget {
-                        RootParallelBudget::TotalSimulations(total) => {
-                            let base = total / num_threads;
-                            let rem = usize::from(t < (total % num_threads));
-                            let my_sims = (base + rem).max(1);
-                            worker.search.run_simulations(my_sims, &mut worker.evaluator);
-                            *out_sims = my_sims;
-                        }
-                        RootParallelBudget::SimulationsPerThread(sims) => {
-                            let my_sims = sims.max(1);
+                        RootParallelBudget::TotalSimulations(_)
+                        | RootParallelBudget::SimulationsPerThread(_) => {
+                            let my_sims = Self::worker_target_simulations(budget, t, num_threads);
                             worker.search.run_simulations(my_sims, &mut worker.evaluator);
                             *out_sims = my_sims;
                         }
@@ -256,18 +277,8 @@ where
 
         sims_per_worker.into_iter().sum()
     }
-}
 
-impl<R, const N: usize, S, E> Player<R, N> for RootParallelPlayer<R, N, S, E>
-where
-    R: GameRules<N>,
-    R::Move: Send + Sync,
-    R::State: Send + Sync,
-    S: SelectionPolicy + Copy + Send + Sync,
-    E: LeafEvaluator<R, N> + Send,
-{
-    fn choose_move(&mut self) -> R::Move {
-        self.last_total_simulations = self.run_parallel_search();
+    fn finalize_move_choice(&mut self) -> R::Move {
         let agg = self.aggregated_root_children();
         assert!(
             !agg.is_empty(),
@@ -306,14 +317,84 @@ where
         let chosen_mv = agg[chosen_idx].mv;
         for worker in &mut self.workers {
             worker.search.advance(chosen_mv);
+            worker.done = false;
         }
         chosen_mv
+    }
+}
+
+impl<R, const N: usize, S, E> Player<R, N> for RootParallelPlayer<R, N, S, E>
+where
+    R: GameRules<N>,
+    R::Move: Send + Sync,
+    R::State: Send + Sync,
+    S: SelectionPolicy + Copy + Send + Sync,
+    E: LeafEvaluator<R, N> + Send,
+{
+    fn poll_choose_move(&mut self) -> Poll<R::Move> {
+        if matches!(self.budget, RootParallelBudget::MaxDuration(_)) {
+            self.last_total_simulations = self.run_parallel_search();
+            return Poll::Ready(self.finalize_move_choice());
+        }
+
+        let num_threads = self.workers.len();
+        let budget = self.budget;
+        let mut all_done = true;
+
+        for (t, worker) in self.workers.iter_mut().enumerate() {
+            if !worker.done {
+                let my_sims = Self::worker_target_simulations(budget, t, num_threads);
+                if worker
+                    .search
+                    .poll_simulations(my_sims, &mut worker.evaluator)
+                    .is_ready()
+                {
+                    worker.done = true;
+                } else {
+                    all_done = false;
+                }
+            }
+        }
+
+        if !all_done {
+            return Poll::Pending;
+        }
+
+        self.last_total_simulations = (0..num_threads)
+            .map(|t| Self::worker_target_simulations(budget, t, num_threads))
+            .sum();
+        Poll::Ready(self.finalize_move_choice())
+    }
+
+    #[inline]
+    fn notify_pending(&mut self) {
+        for worker in &mut self.workers {
+            if !worker.done {
+                worker.evaluator.notify_pending();
+            }
+        }
+    }
+
+    fn choose_move(&mut self) -> R::Move {
+        if E::IS_ASYNC || self.workers.len() == 1 {
+            loop {
+                if let Poll::Ready(mv) = self.poll_choose_move() {
+                    return mv;
+                }
+                self.notify_pending();
+                std::thread::park();
+            }
+        } else {
+            self.last_total_simulations = self.run_parallel_search();
+            self.finalize_move_choice()
+        }
     }
 
     fn apply_external_move(&mut self, mv: R::Move) {
         self.move_count += 1;
         for worker in &mut self.workers {
             worker.search.advance(mv);
+            worker.done = false;
         }
     }
 }

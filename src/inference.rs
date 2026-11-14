@@ -162,7 +162,7 @@ where
 
     /// Creates a reusable client handle with its own pre-allocated lock-free reply queue.
     pub fn client(&self, max_in_flight: usize) -> InferenceClient<'_, E, G, P, N> {
-        let cap = max_in_flight.max(self.shared.max_batch_size).max(16);
+        let cap = max_in_flight.max(1);
         InferenceClient {
             service: self,
             reply_queue: Arc::new(ArrayQueue::new(cap)),
