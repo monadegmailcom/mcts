@@ -51,4 +51,4 @@ if [[ "${MCTS_OPEN_BROWSER:-0}" == "1" ]] && command -v open >/dev/null 2>&1; th
     (sleep 1.5 && open "http://${BIND_ADDR}") &
 fi
 
-exec cargo run --release --offline "${CARGO_FEATURES[@]}" --example train_alphazero -- "${APP_ARGS[@]}"
+exec cargo run --release --offline ${CARGO_FEATURES[@]+"${CARGO_FEATURES[@]}"} --example train_alphazero -- "${APP_ARGS[@]}"
