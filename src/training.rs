@@ -62,6 +62,12 @@ impl<const G: usize, const P: usize, const N: usize> ReplayBuffer<G, P, N> {
         }
     }
 
+    /// Clears all stored self-play positions and resets the ring cursor.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.write_pos = 0;
+    }
+
     /// Uniformly samples `batch_size` positions into contiguous flat buffers
     /// `(states [B * G], policies [B * P], values [B * N])`.
     pub fn sample_flat_batch(
@@ -291,6 +297,29 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
     pub fn load_checkpoint<Pth: AsRef<Path>>(&mut self, path: Pth) -> Result<()> {
         self.varmap.load(path)
     }
+
+    /// Re-initializes the network weights to fresh random values, resets the AdamW optimizer
+    /// state, and synchronizes all replicas of `service`.
+    pub fn reset(
+        &mut self,
+        service: &InferenceService<CandleBatchEvaluator<G, P, N>, G, P, N>,
+        lr: f64,
+        weight_decay: f64,
+    ) -> Result<()> {
+        service.pause_inference();
+        let res = (|| -> Result<()> {
+            service.evaluator().reset_random_weights(&self.net_config)?;
+            let params = ParamsAdamW {
+                lr,
+                weight_decay,
+                ..Default::default()
+            };
+            self.optimizer = AdamW::new(self.varmap.all_vars(), params)?;
+            Ok(())
+        })();
+        service.resume_inference();
+        res
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +415,13 @@ mod tests {
 
     #[test]
     fn pure_rust_alphazero_training_loop_reduces_loss_and_learns_tic_tac_toe() {
+        let train_dev = crate::nn::default_device();
+        let infer_devs = crate::nn::discover_devices(8);
+        assert!(
+            train_dev.same_device(&infer_devs[0]),
+            "default_device() and discover_devices()[0] must share the exact same DeviceId"
+        );
+
         let dev = Device::Cpu;
         let mut trainer = AlphaZeroTrainer::<27, 9, 2>::new(
             AlphaZeroNetConfig::tic_tac_toe_mlp(),

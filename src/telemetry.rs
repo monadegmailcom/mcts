@@ -1,16 +1,23 @@
-//! Pure-Rust Live Training Telemetry Hub, NN Checkpoint Manager, Multi-Engine Match Arena,
-//! Interactive Position Inspector, and Embedded Browser Lab.
+//! Pure-Rust Live Training Telemetry Hub, Multi-Game Controller (`Tic-Tac-Toe` & `Ultimate Tic-Tac-Toe`),
+//! NN Checkpoint Manager, Compute-Calibrated Multi-Engine Match Arena, and Embedded Browser Lab.
 //!
 //! Replaces external Python TensorBoard dependencies with a zero-dependency pure-Rust HTTP + JSON
 //! server (`std::net::TcpListener`) that serves:
 //! - `GET /`: The interactive **AlphaZero Browser Lab, Multi-Engine Arena & Play Inspector**.
-//! - `GET /api/state`: Live JSON snapshot of training iterations, system/queue/dedup telemetry,
-//!   tunable hyperparameter knobs, registered neural network models, and multi-match history.
-//! - `POST /api/knobs`: Updates live training hyperparameter knobs.
-//! - `POST /api/models`: Saves the live NN to `<name>.safetensors`, loads a `.safetensors`
-//!   checkpoint into the live model, or deletes a saved checkpoint.
-//! - `POST /api/match`: Runs a parallel role-swapped Tic-Tac-Toe multi-match between any two
-//!   configurable engines (`alphazero`, `mcts`, `tree-minimax`, `minimax`, `random`).
+//! - `GET /api/state`: Live JSON snapshot of the active game (`"ttt"` or `"uttt"`), training
+//!   lifecycle status (`paused`, `phase`, `current_iteration`), per-game training history,
+//!   tunable hyperparameter knobs, registered `.safetensors` models, hardware calibration report,
+//!   and multi-match history.
+//! - `POST /api/train_control`: Interactive training lifecycle control (`start`, `pause`, `step`,
+//!   `reset`, `set_game`, `set_targets`).
+//! - `POST /api/knobs`: Updates live training hyperparameter knobs for the active game.
+//! - `POST /api/models`: Saves the live NN to `<game>_<name>.safetensors`, takes a 1-click
+//!   iteration snapshot, loads a `.safetensors` checkpoint into the live model, or deletes a checkpoint.
+//! - `POST /api/calibrate`: Benchmarks actual per-move thinking times (`µs/sim`, `µs/eval`, and
+//!   per-depth Minimax `µs/move`) on the current hardware for fair equal-compute matches.
+//! - `POST /api/match`: Runs a parallel role-swapped multi-match (`ttt` or `uttt`) between any two
+//!   configurable engines (`alphazero`, `mcts`, `tree-minimax`, `minimax`, `random`) and reports
+//!   both W/D/L and actual measured thinking time (`µs/move`) per engine.
 //! - `GET /api/inspect_ttt`: Evaluates any Tic-Tac-Toe board position using any registered NN
 //!   model, returning raw NN policy priors `P(s, a)`, value `V(s)`, MCTS root visits `N(s, a)`,
 //!   action values `Q(s, a)`, and intra-batch deduplication statistics.
@@ -27,6 +34,9 @@ use candle_core::Device;
 use crate::alphazero::{AlphaZeroConfig, AlphaZeroGame, AlphaZeroPlayer};
 use crate::game::{GameStatus, PlayerIndex};
 use crate::games::tic_tac_toe::{self, EMPTY_STATE, Symbol, TicTacToe, TttGame, TttHeuristic};
+use crate::games::ultimate_ttt::{
+    self, EMPTY_STATE as UTTT_EMPTY_STATE, UltimateTicTacToe, UtttGame, UtttHeuristic,
+};
 use crate::inference::{BatchEvaluator, InferenceService};
 use crate::matchup::{RandomPlayer, run_multi_match};
 use crate::mcts::{MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
@@ -34,6 +44,61 @@ use crate::minimax::{MinimaxBudget, MinimaxPlayer, TreeMinimaxPlayer};
 use crate::nn::{AlphaZeroNetConfig, CandleBatchEvaluator};
 use crate::player::Player;
 use crate::root_parallel::{RootParallelBudget, RootParallelConfig, RootParallelPlayer};
+
+/// Selectable game environment in the Browser Lab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabGame {
+    /// Standard 3x3 Tic-Tac-Toe (`G = 27, P = 9, N = 2`).
+    Ttt,
+    /// 9x9 Ultimate Tic-Tac-Toe (`G = 324, P = 81, N = 2`).
+    Uttt,
+}
+
+impl LabGame {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ttt => "ttt",
+            Self::Uttt => "uttt",
+        }
+    }
+
+    #[inline]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Ttt => "Tic-Tac-Toe (3x3)",
+            Self::Uttt => "Ultimate Tic-Tac-Toe (9x9)",
+        }
+    }
+
+    #[inline]
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Self::Ttt => "ttt_",
+            Self::Uttt => "uttt_",
+        }
+    }
+
+    #[inline]
+    pub fn from_str_lossy(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("uttt") {
+            Self::Uttt
+        } else {
+            Self::Ttt
+        }
+    }
+}
+
+/// Action returned to the background training worker loop by [`TelemetryHub::poll_training_command`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingCommand {
+    /// Training is currently paused; sleep briefly and poll again.
+    Idle,
+    /// Reset the trainer, live inference weights, replay buffer, and telemetry history for `LabGame`.
+    Reset(LabGame),
+    /// Execute one training iteration (`iteration` 1-based) for `LabGame`.
+    RunIteration { game: LabGame, iteration: usize },
+}
 
 /// Per-iteration training, search, arena, and system pipeline telemetry record.
 #[derive(Clone, Debug)]
@@ -47,11 +112,11 @@ pub struct IterationTelemetry {
     pub game_moves_mean: f32,
     pub self_play_wins: [usize; 2],
     pub self_play_draws: usize,
-    /// `[wins, draws, losses]` against `RandomPlayer`.
+    /// `[wins, draws, losses]` against baseline Opponent 1 (`RandomPlayer`).
     pub vs_random: [usize; 3],
-    /// `[wins, draws, losses]` against `Minimax(depth=2)`.
+    /// `[wins, draws, losses]` against baseline Opponent 2 (`Minimax(d=2)` for TTT, `Minimax(d=1)` for UTTT).
     pub vs_mm2: [usize; 3],
-    /// `[wins, draws, losses]` against `Minimax(depth=5)` (optimal Tic-Tac-Toe oracle).
+    /// `[wins, draws, losses]` against baseline Opponent 3 (`Minimax(d=5)` for TTT, `Minimax(d=2)` for UTTT).
     pub vs_mm5: [usize; 3],
     pub buffer_len: usize,
     pub buffer_capacity: usize,
@@ -151,20 +216,37 @@ pub struct LiveKnobs {
 
 impl Default for LiveKnobs {
     fn default() -> Self {
-        Self {
-            paused: false,
-            games_per_iteration: 128,
-            simulations_per_move: 64,
-            train_steps: 60,
-            batch_size: 64,
-            learning_rate: 2e-3,
-            dirichlet_epsilon: 0.25,
-            c_init: 1.25,
-        }
+        Self::default_ttt()
     }
 }
 
 impl LiveKnobs {
+    pub const fn default_ttt() -> Self {
+        Self {
+            paused: true,
+            games_per_iteration: 128,
+            simulations_per_move: 80,
+            train_steps: 28,
+            batch_size: 64,
+            learning_rate: 1.5e-3,
+            dirichlet_epsilon: 0.25,
+            c_init: 1.25,
+        }
+    }
+
+    pub const fn default_uttt() -> Self {
+        Self {
+            paused: true,
+            games_per_iteration: 16,
+            simulations_per_move: 40,
+            train_steps: 32,
+            batch_size: 64,
+            learning_rate: 2.0e-3,
+            dirichlet_epsilon: 0.25,
+            c_init: 1.25,
+        }
+    }
+
     fn to_json(self) -> String {
         format!(
             concat!(
@@ -196,6 +278,7 @@ impl LiveKnobs {
 pub struct ModelInfo {
     pub id: String,
     pub kind: &'static str,
+    pub game: &'static str,
     pub size_bytes: u64,
     pub description: String,
 }
@@ -203,23 +286,86 @@ pub struct ModelInfo {
 impl ModelInfo {
     fn to_json(&self) -> String {
         format!(
-            "{{\"id\":\"{}\",\"kind\":\"{}\",\"size_bytes\":{},\"description\":\"{}\"}}",
+            "{{\"id\":\"{}\",\"kind\":\"{}\",\"game\":\"{}\",\"size_bytes\":{},\"description\":\"{}\"}}",
             escape_json(&self.id),
             self.kind,
+            self.game,
             self.size_bytes,
             escape_json(&self.description),
         )
     }
 }
 
-/// Configuration for one side of a Tic-Tac-Toe Multi-Match in the Browser Lab.
+/// Measured per-move latency (`µs/move`) for a specific recursive Minimax depth.
+#[derive(Clone, Copy, Debug)]
+pub struct MinimaxDepthTiming {
+    pub depth: u32,
+    pub us_per_move: f32,
+}
+
+impl MinimaxDepthTiming {
+    fn to_json(self) -> String {
+        format!(
+            "{{\"depth\":{},\"us_per_move\":{:.2}}}",
+            self.depth,
+            finite_or_zero(self.us_per_move)
+        )
+    }
+}
+
+/// Empirical hardware timing calibration report for a game (`ttt` or `uttt`), mapping search
+/// parameters (`sims`, `evals`, `depth`) to estimated per-move thinking time (`µs/move`).
+#[derive(Clone, Debug)]
+pub struct CalibrationReport {
+    pub game: &'static str,
+    pub alphazero_us_per_sim_1tree: f32,
+    pub alphazero_us_per_sim_4tree: f32,
+    pub mcts_us_per_sim_1tree: f32,
+    pub mcts_us_per_sim_4tree: f32,
+    pub tree_minimax_us_per_eval: f32,
+    pub minimax_depths: Vec<MinimaxDepthTiming>,
+}
+
+impl CalibrationReport {
+    fn to_json(&self) -> String {
+        let depths_json = self
+            .minimax_depths
+            .iter()
+            .copied()
+            .map(MinimaxDepthTiming::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            concat!(
+                "{{",
+                "\"game\":\"{}\",",
+                "\"alphazero_us_per_sim_1tree\":{:.3},",
+                "\"alphazero_us_per_sim_4tree\":{:.3},",
+                "\"mcts_us_per_sim_1tree\":{:.3},",
+                "\"mcts_us_per_sim_4tree\":{:.3},",
+                "\"tree_minimax_us_per_eval\":{:.3},",
+                "\"minimax_depths\":[{}]",
+                "}}"
+            ),
+            self.game,
+            finite_or_zero(self.alphazero_us_per_sim_1tree),
+            finite_or_zero(self.alphazero_us_per_sim_4tree),
+            finite_or_zero(self.mcts_us_per_sim_1tree),
+            finite_or_zero(self.mcts_us_per_sim_4tree),
+            finite_or_zero(self.tree_minimax_us_per_eval),
+            depths_json,
+        )
+    }
+}
+
+/// Configuration for one side of a Multi-Match in the Browser Lab (`ttt` or `uttt`).
 #[derive(Clone, Debug)]
 pub struct TttEngineConfig {
     /// `"alphazero"`, `"mcts"`, `"tree-minimax"`, `"minimax"`, or `"random"`.
     pub engine: String,
     /// Minimax search depth (`0..=9`).
     pub depth: u32,
-    /// Whether Minimax / TreeMinimax uses `TttHeuristic` (`true`) or `ZeroHeuristic` (`false`).
+    /// Whether Minimax / TreeMinimax uses the game's heuristic (`true`) or `ZeroHeuristic` (`false`).
     pub use_heuristic: bool,
     /// TreeMinimax budget mode: `"depth"`, `"evals"`, or `"ms"`.
     pub budget_kind: String,
@@ -253,9 +399,9 @@ impl Default for TttEngineConfig {
             engine: "alphazero".to_string(),
             depth: 2,
             use_heuristic: true,
-            budget_kind: "depth".to_string(),
-            budget_val: 4,
-            arena_cap: 4096,
+            budget_kind: "evals".to_string(),
+            budget_val: 200,
+            arena_cap: 16_384,
             sims: 80,
             num_trees: 1,
             c_uct: 1.414,
@@ -307,6 +453,7 @@ impl TttEngineConfig {
 #[derive(Clone, Debug)]
 pub struct TttMatchRecord {
     pub match_id: usize,
+    pub game: &'static str,
     pub engine_a: String,
     pub engine_b: String,
     pub num_games: usize,
@@ -318,6 +465,10 @@ pub struct TttMatchRecord {
     pub avg_moves: f32,
     pub duration_ms: f32,
     pub games_per_sec: f32,
+    /// Total compute time per move (`µs/move`, including MCTS tree walk + amortized NN forward pass) for Engine A.
+    pub a_us_per_move: f32,
+    /// Total compute time per move (`µs/move`, including MCTS tree walk + amortized NN forward pass) for Engine B.
+    pub b_us_per_move: f32,
     pub nn_logical_batch: f32,
     pub nn_unique_batch: f32,
     pub nn_dedup_saved_pct: f32,
@@ -330,6 +481,7 @@ impl TttMatchRecord {
             concat!(
                 "{{",
                 "\"match_id\":{},",
+                "\"game\":\"{}\",",
                 "\"engine_a\":\"{}\",",
                 "\"engine_b\":\"{}\",",
                 "\"num_games\":{},",
@@ -341,6 +493,8 @@ impl TttMatchRecord {
                 "\"avg_moves\":{:.2},",
                 "\"duration_ms\":{:.2},",
                 "\"games_per_sec\":{:.1},",
+                "\"a_us_per_move\":{:.2},",
+                "\"b_us_per_move\":{:.2},",
                 "\"nn_logical_batch\":{:.2},",
                 "\"nn_unique_batch\":{:.2},",
                 "\"nn_dedup_saved_pct\":{:.2},",
@@ -348,6 +502,7 @@ impl TttMatchRecord {
                 "}}"
             ),
             self.match_id,
+            self.game,
             escape_json(&self.engine_a),
             escape_json(&self.engine_b),
             self.num_games,
@@ -359,6 +514,8 @@ impl TttMatchRecord {
             finite_or_zero(self.avg_moves),
             finite_or_zero(self.duration_ms),
             finite_or_zero(self.games_per_sec),
+            finite_or_zero(self.a_us_per_move),
+            finite_or_zero(self.b_us_per_move),
             finite_or_zero(self.nn_logical_batch),
             finite_or_zero(self.nn_unique_batch),
             finite_or_zero(self.nn_dedup_saved_pct),
@@ -477,7 +634,6 @@ pub fn inspect_ttt_position_configured<E: BatchEvaluator<27, 9, 2> + 'static>(
 
     let (reqs_before, uniq_before) = service.dedup_counts();
 
-    // 1. Direct single-state evaluation on the service's client for raw NN priors & value.
     let mut encoded = [0.0f32; 27];
     TicTacToe::encode_state(game, &mut encoded);
     let client = service.client(1);
@@ -525,7 +681,6 @@ pub fn inspect_ttt_position_configured<E: BatchEvaluator<27, 9, 2> + 'static>(
         };
     }
 
-    // 2. Run Root-Parallel AlphaZero search (`num_trees`) for `total_simulations` without advancing.
     let trees = num_trees.clamp(1, 64);
     let sims_per_tree = total_simulations.div_ceil(trees).max(2);
     let mut player = AlphaZeroPlayer::new(
@@ -568,14 +723,14 @@ pub fn inspect_ttt_position_configured<E: BatchEvaluator<27, 9, 2> + 'static>(
 type TttInspectorFn = Box<dyn Fn(&TttGame, usize) -> TttPositionInspection + Send + Sync>;
 
 #[derive(Clone)]
-struct TttModelContext {
-    live_service: Arc<InferenceService<CandleBatchEvaluator<27, 9, 2>, 27, 9, 2>>,
+struct ModelContext<const G: usize, const P: usize, const N: usize> {
+    live_service: Arc<InferenceService<CandleBatchEvaluator<G, P, N>, G, P, N>>,
     net_config: AlphaZeroNetConfig,
     devices: Vec<Device>,
 }
 
-impl TttModelContext {
-    fn resolve_evaluator(&self, model_id: &str) -> Result<CandleBatchEvaluator<27, 9, 2>, String> {
+impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
+    fn resolve_evaluator(&self, model_id: &str) -> Result<CandleBatchEvaluator<G, P, N>, String> {
         let id = model_id.trim();
         if id.is_empty() || id == "live" {
             return Ok(self.live_service.evaluator().clone());
@@ -590,24 +745,79 @@ impl TttModelContext {
             return Err(format!("Checkpoint file '{safe_name}' does not exist"));
         }
         CandleBatchEvaluator::standalone(&self.net_config, &self.devices, Some(&safe_name))
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("Failed to load '{safe_name}': {e}"))
+    }
+}
+
+struct GameLabState {
+    phase: String,
+    current_iteration: usize,
+    total_iterations: usize,
+    step_requests: usize,
+    pause_after_iteration: bool,
+    reset_requested: bool,
+    auto_save_every: usize,
+    knobs: LiveKnobs,
+    history: Vec<IterationTelemetry>,
+    matches: Vec<TttMatchRecord>,
+    calibration: Option<CalibrationReport>,
+}
+
+impl GameLabState {
+    fn new(total_iterations: usize, knobs: LiveKnobs, auto_save_every: usize) -> Self {
+        let initial_phase = if knobs.paused {
+            "Idle — Ready (Click ▶ Start Training or ⏭ Step +1)".to_string()
+        } else {
+            "Initializing".to_string()
+        };
+        Self {
+            phase: initial_phase,
+            current_iteration: 0,
+            total_iterations,
+            step_requests: 0,
+            pause_after_iteration: false,
+            reset_requested: false,
+            auto_save_every,
+            knobs,
+            history: Vec::with_capacity(total_iterations.max(64)),
+            matches: Vec::new(),
+            calibration: None,
+        }
     }
 }
 
 struct HubInner {
     device_name: String,
-    phase: String,
-    current_iteration: usize,
-    total_iterations: usize,
-    knobs: LiveKnobs,
-    history: Vec<IterationTelemetry>,
-    matches: Vec<TttMatchRecord>,
+    active_game: LabGame,
+    ttt_state: GameLabState,
+    uttt_state: GameLabState,
     inspector: Option<Arc<TttInspectorFn>>,
-    ttt_context: Option<TttModelContext>,
+    ttt_context: Option<ModelContext<27, 9, 2>>,
+    uttt_context: Option<ModelContext<324, 81, 2>>,
 }
 
-/// Thread-safe telemetry, model registry, multi-match arena, and live control hub shared between
-/// the training loop and the embedded HTTP Browser Lab server.
+impl HubInner {
+    fn state_for(&self, game: LabGame) -> &GameLabState {
+        match game {
+            LabGame::Ttt => &self.ttt_state,
+            LabGame::Uttt => &self.uttt_state,
+        }
+    }
+
+    fn state_for_mut(&mut self, game: LabGame) -> &mut GameLabState {
+        match game {
+            LabGame::Ttt => &mut self.ttt_state,
+            LabGame::Uttt => &mut self.uttt_state,
+        }
+    }
+
+    fn active_state(&self) -> &GameLabState {
+        self.state_for(self.active_game)
+    }
+}
+
+/// Thread-safe telemetry, model registry, multi-match arena, compute calibrator, and live control
+/// hub shared between the training loop and the embedded HTTP Browser Lab server.
 #[derive(Clone)]
 pub struct TelemetryHub {
     inner: Arc<Mutex<HubInner>>,
@@ -615,18 +825,37 @@ pub struct TelemetryHub {
 
 impl TelemetryHub {
     pub fn new(device_name: impl Into<String>, total_iterations: usize, knobs: LiveKnobs) -> Self {
+        let mut uttt_knobs = LiveKnobs::default_uttt();
+        uttt_knobs.paused = knobs.paused;
         Self {
             inner: Arc::new(Mutex::new(HubInner {
                 device_name: device_name.into(),
-                phase: "Initializing".to_string(),
-                current_iteration: 0,
-                total_iterations,
-                knobs,
-                history: Vec::with_capacity(total_iterations.max(64)),
-                matches: Vec::new(),
+                active_game: LabGame::Ttt,
+                ttt_state: GameLabState::new(total_iterations, knobs, 5),
+                uttt_state: GameLabState::new(30, uttt_knobs, 5),
                 inspector: None,
                 ttt_context: None,
+                uttt_context: None,
             })),
+        }
+    }
+
+    #[inline]
+    pub fn active_game(&self) -> LabGame {
+        self.inner
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .active_game
+    }
+
+    pub fn set_active_game(&self, game: LabGame) {
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        if guard.active_game != game {
+            let prev = guard.active_game;
+            guard.state_for_mut(prev).knobs.paused = true;
+            guard.state_for_mut(prev).step_requests = 0;
+            guard.state_for_mut(prev).pause_after_iteration = false;
+            guard.active_game = game;
         }
     }
 
@@ -638,9 +867,7 @@ impl TelemetryHub {
         guard.inspector = Some(Arc::new(Box::new(f)));
     }
 
-    /// Attaches the live Tic-Tac-Toe [`InferenceService`] and [`AlphaZeroNetConfig`] so the
-    /// Browser Lab can manage `.safetensors` models, inspect any model, and run multi-matches
-    /// with [`AlphaZeroPlayer`].
+    /// Attaches the live Tic-Tac-Toe (`G=27, P=9, N=2`) [`InferenceService`] and [`AlphaZeroNetConfig`].
     pub fn attach_ttt_service(
         &self,
         live_service: Arc<InferenceService<CandleBatchEvaluator<27, 9, 2>, 27, 9, 2>>,
@@ -652,7 +879,22 @@ impl TelemetryHub {
         guard.inspector = Some(Arc::new(Box::new(move |game, sims| {
             inspect_ttt_position(game, &svc_for_inspector, sims)
         })));
-        guard.ttt_context = Some(TttModelContext {
+        guard.ttt_context = Some(ModelContext {
+            live_service,
+            net_config,
+            devices,
+        });
+    }
+
+    /// Attaches the live Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`) [`InferenceService`] and [`AlphaZeroNetConfig`].
+    pub fn attach_uttt_service(
+        &self,
+        live_service: Arc<InferenceService<CandleBatchEvaluator<324, 81, 2>, 324, 81, 2>>,
+        net_config: AlphaZeroNetConfig,
+        devices: Vec<Device>,
+    ) {
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        guard.uttt_context = Some(ModelContext {
             live_service,
             net_config,
             devices,
@@ -660,44 +902,187 @@ impl TelemetryHub {
     }
 
     pub fn set_phase(&self, iteration: usize, phase: impl Into<String>) {
+        let game = self.active_game();
+        self.set_phase_for(game, iteration, phase);
+    }
+
+    pub fn set_phase_for(&self, game: LabGame, iteration: usize, phase: impl Into<String>) {
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
-        guard.current_iteration = iteration;
-        guard.phase = phase.into();
+        let st = guard.state_for_mut(game);
+        st.current_iteration = iteration;
+        st.phase = phase.into();
     }
 
     pub fn record_iteration(&self, record: IterationTelemetry) {
+        let game = self.active_game();
+        self.record_iteration_for(game, record);
+    }
+
+    pub fn record_iteration_for(&self, game: LabGame, record: IterationTelemetry) {
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
-        guard.current_iteration = record.iteration;
-        guard.history.push(record);
+        let st = guard.state_for_mut(game);
+        st.current_iteration = record.iteration;
+        if st.pause_after_iteration {
+            st.pause_after_iteration = false;
+            if st.step_requests == 0 {
+                st.knobs.paused = true;
+            }
+        }
+        st.history.push(record);
     }
 
     pub fn knobs(&self) -> LiveKnobs {
-        self.inner.lock().expect("telemetry mutex poisoned").knobs
+        self.inner
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .active_state()
+            .knobs
     }
 
-    /// Blocks while `knobs.paused` is `true`, polling every `100ms` so the user can pause/resume
-    /// training from the Browser Lab.
+    pub fn knobs_for(&self, game: LabGame) -> LiveKnobs {
+        self.inner
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .state_for(game)
+            .knobs
+    }
+
+    pub fn auto_save_every_for(&self, game: LabGame) -> usize {
+        self.inner
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .state_for(game)
+            .auto_save_every
+    }
+
+    /// Blocks while `knobs.paused` is `true`, polling every `100ms`.
     pub fn wait_if_paused(&self) {
         while self.knobs().paused {
             thread::sleep(Duration::from_millis(100));
         }
     }
 
-    pub fn discover_models(&self) -> Vec<ModelInfo> {
-        let has_live = self
-            .inner
-            .lock()
-            .expect("telemetry mutex poisoned")
-            .ttt_context
-            .is_some();
-        discover_ttt_models(has_live)
+    /// Polls the next training lifecycle command for the background training worker loop.
+    pub fn poll_training_command(&self) -> TrainingCommand {
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        for game in [LabGame::Ttt, LabGame::Uttt] {
+            let st = guard.state_for_mut(game);
+            if st.reset_requested {
+                st.reset_requested = false;
+                st.current_iteration = 0;
+                st.step_requests = 0;
+                st.pause_after_iteration = false;
+                st.knobs.paused = true;
+                st.history.clear();
+                st.phase = "Reset Complete — Fresh Untrained Weights (Iter 0)".to_string();
+                return TrainingCommand::Reset(game);
+            }
+        }
+
+        let game = guard.active_game;
+        let st = guard.state_for_mut(game);
+        if st.step_requests > 0 {
+            st.step_requests -= 1;
+            st.knobs.paused = false;
+            if st.step_requests == 0 {
+                st.pause_after_iteration = true;
+            }
+            let next_iter = st.current_iteration + 1;
+            if next_iter > st.total_iterations {
+                st.total_iterations = next_iter;
+            }
+            return TrainingCommand::RunIteration {
+                game,
+                iteration: next_iter,
+            };
+        }
+
+        if !st.knobs.paused {
+            let next_iter = st.current_iteration + 1;
+            if next_iter <= st.total_iterations {
+                return TrainingCommand::RunIteration {
+                    game,
+                    iteration: next_iter,
+                };
+            } else {
+                st.knobs.paused = true;
+                st.phase = format!(
+                    "Completed {} Iterations — Click ▶ Start/Resume or ⏭ Step (+1) for more",
+                    st.current_iteration
+                );
+            }
+        }
+
+        TrainingCommand::Idle
     }
 
-    /// Executes a configured Tic-Tac-Toe Multi-Match between `cfg_a` and `cfg_b` across
-    /// `num_games` role-swapped games on `num_workers` threads, recording and returning the
-    /// resulting [`TttMatchRecord`].
+    pub fn discover_models(&self) -> Vec<ModelInfo> {
+        let guard = self.inner.lock().expect("telemetry mutex poisoned");
+        let game = guard.active_game;
+        let has_live = match game {
+            LabGame::Ttt => guard.ttt_context.is_some(),
+            LabGame::Uttt => guard.uttt_context.is_some(),
+        };
+        let iter = guard.state_for(game).current_iteration;
+        discover_game_models(game, has_live, iter)
+    }
+
+    /// Runs a fast empirical timing calibration for `game` (`Tic-Tac-Toe` or `Ultimate Tic-Tac-Toe`),
+    /// caching and returning the resulting [`CalibrationReport`].
+    pub fn calibrate_game(&self, game: LabGame) -> Result<CalibrationReport, String> {
+        let report = match game {
+            LabGame::Ttt => {
+                let ttt_ctx = self
+                    .inner
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .ttt_context
+                    .clone();
+                calibrate_ttt(ttt_ctx.as_ref())?
+            }
+            LabGame::Uttt => {
+                let uttt_ctx = self
+                    .inner
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .uttt_context
+                    .clone();
+                calibrate_uttt(uttt_ctx.as_ref())?
+            }
+        };
+
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        guard.state_for_mut(game).calibration = Some(report.clone());
+        Ok(report)
+    }
+
+    /// Executes a configured Tic-Tac-Toe Multi-Match between `cfg_a` and `cfg_b`.
     pub fn run_ttt_match(
         &self,
+        cfg_a: &TttEngineConfig,
+        cfg_b: &TttEngineConfig,
+        num_games: usize,
+        num_workers: usize,
+        max_batch_size: usize,
+        seed: u64,
+    ) -> Result<TttMatchRecord, String> {
+        self.run_match_for_game(
+            LabGame::Ttt,
+            cfg_a,
+            cfg_b,
+            num_games,
+            num_workers,
+            max_batch_size,
+            seed,
+        )
+    }
+
+    /// Executes a configured Multi-Match for `game` (`LabGame::Ttt` or `LabGame::Uttt`) between
+    /// `cfg_a` and `cfg_b` across `num_games` role-swapped games on `num_workers` threads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_match_for_game(
+        &self,
+        game: LabGame,
         cfg_a: &TttEngineConfig,
         cfg_b: &TttEngineConfig,
         num_games: usize,
@@ -709,165 +1094,196 @@ impl TelemetryHub {
         let workers = num_workers.clamp(1, 32);
         let batch_cap = max_batch_size.clamp(1, 512);
 
-        let ttt_ctx = self
-            .inner
-            .lock()
-            .expect("telemetry mutex poisoned")
-            .ttt_context
-            .clone();
-
         let a_is_az = cfg_a.engine == "alphazero";
         let b_is_az = cfg_b.engine == "alphazero";
 
-        let mut svc_a: Option<Arc<InferenceService<CandleBatchEvaluator<27, 9, 2>, 27, 9, 2>>> =
-            None;
-        let mut svc_b: Option<Arc<InferenceService<CandleBatchEvaluator<27, 9, 2>, 27, 9, 2>>> =
-            None;
+        let record = match game {
+            LabGame::Ttt => {
+                let ctx_opt = self
+                    .inner
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .ttt_context
+                    .clone();
 
-        if a_is_az || b_is_az {
-            let ctx = ttt_ctx.ok_or_else(|| {
-                "AlphaZero model context is not attached to TelemetryHub".to_string()
-            })?;
-            if a_is_az && b_is_az && cfg_a.model == cfg_b.model {
-                let eval = ctx.resolve_evaluator(&cfg_a.model)?;
-                let n_rep = eval.num_replicas();
-                let shared_svc = Arc::new(InferenceService::new(eval, batch_cap, n_rep));
-                svc_a = Some(Arc::clone(&shared_svc));
-                svc_b = Some(shared_svc);
-            } else {
-                if a_is_az {
-                    let eval = ctx.resolve_evaluator(&cfg_a.model)?;
-                    let n_rep = eval.num_replicas();
-                    svc_a = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
+                let mut svc_a = None;
+                let mut svc_b = None;
+                if a_is_az || b_is_az {
+                    let ctx = ctx_opt.ok_or_else(|| {
+                        "Tic-Tac-Toe AlphaZero model context is not attached".to_string()
+                    })?;
+                    if a_is_az {
+                        let eval = ctx.resolve_evaluator(&cfg_a.model)?;
+                        let n_rep = eval.num_replicas();
+                        svc_a = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
+                    }
+                    if b_is_az {
+                        let eval = ctx.resolve_evaluator(&cfg_b.model)?;
+                        let n_rep = eval.num_replicas();
+                        svc_b = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
+                    }
                 }
-                if b_is_az {
-                    let eval = ctx.resolve_evaluator(&cfg_b.model)?;
-                    let n_rep = eval.num_replicas();
-                    svc_b = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
+
+                let svc_a_ref = svc_a.as_deref();
+                let svc_b_ref = svc_b.as_deref();
+                let factory_a = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+                    build_ttt_player(cfg_a, svc_a_ref, g, s)
+                };
+                let factory_b = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+                    build_ttt_player(cfg_b, svc_b_ref, g, s)
+                };
+
+                let root_game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+                let start = Instant::now();
+                let outcome =
+                    run_multi_match(&root_game, [&factory_a, &factory_b], games, workers, seed);
+                let duration_ms = (start.elapsed().as_secs_f64() * 1000.0) as f32;
+                summarize_match_outcome(
+                    LabGame::Ttt,
+                    cfg_a,
+                    cfg_b,
+                    games,
+                    workers,
+                    duration_ms,
+                    &outcome,
+                    svc_a.as_deref(),
+                    svc_b.as_deref(),
+                )
+            }
+            LabGame::Uttt => {
+                let ctx_opt = self
+                    .inner
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .uttt_context
+                    .clone();
+
+                let mut svc_a = None;
+                let mut svc_b = None;
+                if a_is_az || b_is_az {
+                    let ctx = ctx_opt.ok_or_else(|| {
+                        "Ultimate Tic-Tac-Toe AlphaZero model context is not attached".to_string()
+                    })?;
+                    if a_is_az {
+                        let eval = ctx.resolve_evaluator(&cfg_a.model)?;
+                        let n_rep = eval.num_replicas();
+                        svc_a = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
+                    }
+                    if b_is_az {
+                        let eval = ctx.resolve_evaluator(&cfg_b.model)?;
+                        let n_rep = eval.num_replicas();
+                        svc_b = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
+                    }
                 }
+
+                let svc_a_ref = svc_a.as_deref();
+                let svc_b_ref = svc_b.as_deref();
+                let factory_a =
+                    |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+                        build_uttt_player(cfg_a, svc_a_ref, g, s)
+                    };
+                let factory_b =
+                    |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+                        build_uttt_player(cfg_b, svc_b_ref, g, s)
+                    };
+
+                let root_game = UtttGame::new(PlayerIndex::PLAYER1, UTTT_EMPTY_STATE);
+                let start = Instant::now();
+                let outcome =
+                    run_multi_match(&root_game, [&factory_a, &factory_b], games, workers, seed);
+                let duration_ms = (start.elapsed().as_secs_f64() * 1000.0) as f32;
+                summarize_match_outcome(
+                    LabGame::Uttt,
+                    cfg_a,
+                    cfg_b,
+                    games,
+                    workers,
+                    duration_ms,
+                    &outcome,
+                    svc_a.as_deref(),
+                    svc_b.as_deref(),
+                )
             }
-        }
-
-        let svc_a_ref = svc_a.as_deref();
-        let svc_b_ref = svc_b.as_deref();
-        let factory_a =
-            |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> { build_ttt_player(cfg_a, svc_a_ref, g, s) };
-        let factory_b =
-            |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> { build_ttt_player(cfg_b, svc_b_ref, g, s) };
-
-        let root_game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
-        let start = Instant::now();
-        let outcome = run_multi_match(&root_game, [&factory_a, &factory_b], games, workers, seed);
-        let duration_ms = (start.elapsed().as_secs_f64() * 1000.0) as f32;
-        let games_per_sec = (games as f32) / (duration_ms / 1000.0).max(1e-6);
-
-        // Aggregate NN inference statistics if AlphaZero participated.
-        let mut logical_batch = 0.0f32;
-        let mut unique_batch = 0.0f32;
-        let mut dedup_saved_pct = 0.0f32;
-        let mut us_per_state = 0.0f32;
-
-        if let Some(ref sa) = svc_a {
-            let mut b_stat = sa.batch_size_stats();
-            let mut u_stat = sa.unique_batch_size_stats();
-            let mut t_stat = sa.inference_time_stats();
-            let (mut tot_req, mut uniq_ev) = sa.dedup_counts();
-
-            if let Some(ref sb) = svc_b
-                && !Arc::ptr_eq(sa, sb)
-            {
-                b_stat.join(&sb.batch_size_stats());
-                u_stat.join(&sb.unique_batch_size_stats());
-                t_stat.join(&sb.inference_time_stats());
-                let (r2, u2) = sb.dedup_counts();
-                tot_req += r2;
-                uniq_ev += u2;
-            }
-            logical_batch = b_stat.mean();
-            unique_batch = u_stat.mean();
-            us_per_state = t_stat.mean();
-            if tot_req > 0 && uniq_ev < tot_req {
-                dedup_saved_pct = (1.0 - (uniq_ev as f32) / (tot_req as f32)) * 100.0;
-            }
-        } else if let Some(ref sb) = svc_b {
-            logical_batch = sb.batch_size_stats().mean();
-            unique_batch = sb.unique_batch_size_stats().mean();
-            us_per_state = sb.inference_time_stats().mean();
-            dedup_saved_pct = sb.dedup_savings_ratio() * 100.0;
-        }
-
-        let wins_a = outcome.wins[0];
-        let wins_b = outcome.wins[1];
-        let draws = outcome.draws;
-        let score_a_pct =
-            (((wins_a as f32) + 0.5 * (draws as f32)) / (games as f32).max(1.0)) * 100.0;
-        let total_moves =
-            outcome.choose_time_us[0].count() + outcome.choose_time_us[1].count();
-        let avg_moves = (total_moves as f32) / (games as f32).max(1.0);
+        };
 
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
-        let match_id = guard.matches.len() + 1;
-        let record = TttMatchRecord {
-            match_id,
-            engine_a: cfg_a.summary_label(),
-            engine_b: cfg_b.summary_label(),
-            num_games: games,
-            num_workers: workers,
-            wins_a,
-            draws,
-            wins_b,
-            score_a_pct,
-            avg_moves,
-            duration_ms,
-            games_per_sec,
-            nn_logical_batch: logical_batch,
-            nn_unique_batch: unique_batch,
-            nn_dedup_saved_pct: dedup_saved_pct,
-            nn_us_per_state: us_per_state,
-        };
-        guard.matches.push(record.clone());
-        Ok(record)
+        let st = guard.state_for_mut(game);
+        let match_id = st.matches.len() + 1;
+        let mut final_rec = record;
+        final_rec.match_id = match_id;
+        st.matches.push(final_rec.clone());
+        Ok(final_rec)
     }
 
     pub fn to_json(&self) -> String {
         let guard = self.inner.lock().expect("telemetry mutex poisoned");
-        let models = discover_ttt_models(guard.ttt_context.is_some());
+        let game = guard.active_game;
+        let st = guard.state_for(game);
+        let has_live = match game {
+            LabGame::Ttt => guard.ttt_context.is_some(),
+            LabGame::Uttt => guard.uttt_context.is_some(),
+        };
+        let models = discover_game_models(game, has_live, st.current_iteration);
         let models_json = models
             .iter()
             .map(ModelInfo::to_json)
             .collect::<Vec<_>>()
             .join(",");
-        let history_json = guard
+        let ttt_models = discover_game_models(
+            LabGame::Ttt,
+            guard.ttt_context.is_some(),
+            guard.ttt_state.current_iteration,
+        );
+        let ttt_models_json = ttt_models
+            .iter()
+            .map(ModelInfo::to_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        let history_json = st
             .history
             .iter()
             .map(IterationTelemetry::to_json)
             .collect::<Vec<_>>()
             .join(",");
-        let matches_json = guard
+        let matches_json = st
             .matches
             .iter()
             .map(TttMatchRecord::to_json)
             .collect::<Vec<_>>()
             .join(",");
+        let cal_json = match &st.calibration {
+            Some(c) => c.to_json(),
+            None => "null".to_string(),
+        };
         format!(
             concat!(
                 "{{",
                 "\"device_name\":\"{}\",",
+                "\"active_game\":\"{}\",",
+                "\"active_game_title\":\"{}\",",
                 "\"phase\":\"{}\",",
                 "\"current_iteration\":{},",
                 "\"total_iterations\":{},",
+                "\"auto_save_every\":{},",
                 "\"knobs\":{},",
                 "\"models\":[{}],",
+                "\"ttt_models\":[{}],",
+                "\"calibration\":{},",
                 "\"history\":[{}],",
                 "\"matches\":[{}]",
                 "}}"
             ),
             escape_json(&guard.device_name),
-            escape_json(&guard.phase),
-            guard.current_iteration,
-            guard.total_iterations,
-            guard.knobs.to_json(),
+            game.as_str(),
+            escape_json(game.title()),
+            escape_json(&st.phase),
+            st.current_iteration,
+            st.total_iterations,
+            st.auto_save_every,
+            st.knobs.to_json(),
             models_json,
+            ttt_models_json,
+            cal_json,
             history_json,
             matches_json,
         )
@@ -891,6 +1307,335 @@ impl TelemetryHub {
 
         Ok(bound_addr)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn summarize_match_outcome<const G: usize, const P: usize>(
+    game: LabGame,
+    cfg_a: &TttEngineConfig,
+    cfg_b: &TttEngineConfig,
+    games: usize,
+    workers: usize,
+    duration_ms: f32,
+    outcome: &crate::matchup::MultiMatchSummary<2>,
+    svc_a: Option<&InferenceService<CandleBatchEvaluator<G, P, 2>, G, P, 2>>,
+    svc_b: Option<&InferenceService<CandleBatchEvaluator<G, P, 2>, G, P, 2>>,
+) -> TttMatchRecord {
+    let games_per_sec = (games as f32) / (duration_ms / 1000.0).max(1e-6);
+
+    let moves_a = outcome.choose_time_us[0].count().max(1) as f32;
+    let moves_b = outcome.choose_time_us[1].count().max(1) as f32;
+    let mut a_us_per_move = outcome.choose_time_us[0].mean();
+    let mut b_us_per_move = outcome.choose_time_us[1].mean();
+
+    let mut logical_batch = 0.0f32;
+    let mut unique_batch = 0.0f32;
+    let mut dedup_saved_pct = 0.0f32;
+    let mut us_per_state = 0.0f32;
+
+    if let Some(sa) = svc_a {
+        let t_stat = sa.inference_time_stats();
+        let (_, uniq_a) = sa.dedup_counts();
+        a_us_per_move += ((uniq_a as f32) * t_stat.mean()) / moves_a;
+    }
+    if let Some(sb) = svc_b {
+        let t_stat = sb.inference_time_stats();
+        let (_, uniq_b) = sb.dedup_counts();
+        b_us_per_move += ((uniq_b as f32) * t_stat.mean()) / moves_b;
+    }
+
+    if let Some(sa) = svc_a {
+        let mut b_stat = sa.batch_size_stats();
+        let mut u_stat = sa.unique_batch_size_stats();
+        let mut t_stat = sa.inference_time_stats();
+        let (mut tot_req, mut uniq_ev) = sa.dedup_counts();
+
+        if let Some(sb) = svc_b {
+            b_stat.join(&sb.batch_size_stats());
+            u_stat.join(&sb.unique_batch_size_stats());
+            t_stat.join(&sb.inference_time_stats());
+            let (r2, u2) = sb.dedup_counts();
+            tot_req += r2;
+            uniq_ev += u2;
+        }
+        logical_batch = b_stat.mean();
+        unique_batch = u_stat.mean();
+        us_per_state = t_stat.mean();
+        if tot_req > 0 && uniq_ev < tot_req {
+            dedup_saved_pct = (1.0 - (uniq_ev as f32) / (tot_req as f32)) * 100.0;
+        }
+    } else if let Some(sb) = svc_b {
+        logical_batch = sb.batch_size_stats().mean();
+        unique_batch = sb.unique_batch_size_stats().mean();
+        us_per_state = sb.inference_time_stats().mean();
+        dedup_saved_pct = sb.dedup_savings_ratio() * 100.0;
+    }
+
+    let wins_a = outcome.wins[0];
+    let wins_b = outcome.wins[1];
+    let draws = outcome.draws;
+    let score_a_pct = (((wins_a as f32) + 0.5 * (draws as f32)) / (games as f32).max(1.0)) * 100.0;
+    let total_moves = outcome.choose_time_us[0].count() + outcome.choose_time_us[1].count();
+    let avg_moves = (total_moves as f32) / (games as f32).max(1.0);
+
+    TttMatchRecord {
+        match_id: 0,
+        game: game.as_str(),
+        engine_a: cfg_a.summary_label(),
+        engine_b: cfg_b.summary_label(),
+        num_games: games,
+        num_workers: workers,
+        wins_a,
+        draws,
+        wins_b,
+        score_a_pct,
+        avg_moves,
+        duration_ms,
+        games_per_sec,
+        a_us_per_move,
+        b_us_per_move,
+        nn_logical_batch: logical_batch,
+        nn_unique_batch: unique_batch,
+        nn_dedup_saved_pct: dedup_saved_pct,
+        nn_us_per_state: us_per_state,
+    }
+}
+
+fn rand_ttt<'a>(g: &TttGame, s: u64) -> Box<dyn Player<TicTacToe, 2> + 'a> {
+    Box::new(RandomPlayer::new(*g, s))
+}
+
+fn rand_uttt<'a>(g: &UtttGame, s: u64) -> Box<dyn Player<UltimateTicTacToe, 2> + 'a> {
+    Box::new(RandomPlayer::new(*g, s))
+}
+
+fn calibrate_ttt(ctx: Option<&ModelContext<27, 9, 2>>) -> Result<CalibrationReport, String> {
+    let root = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+
+    let mut minimax_depths = Vec::with_capacity(6);
+    for depth in 1..=6u32 {
+        let f_mm = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+            Box::new(MinimaxPlayer::new(*g, TttHeuristic, depth, s))
+        };
+        let f_r = |g: &TttGame, s: u64| rand_ttt(g, s);
+        let res = run_multi_match(&root, [&f_mm, &f_r], 6, 1, 900 + depth as u64);
+        minimax_depths.push(MinimaxDepthTiming {
+            depth,
+            us_per_move: res.choose_time_us[0].mean().max(0.5),
+        });
+    }
+
+    let eval_budget = 200usize;
+    let f_tm = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+        Box::new(TreeMinimaxPlayer::new(
+            *g,
+            tic_tac_toe::NO_MOVE,
+            TttHeuristic,
+            MinimaxBudget::MaxEvaluations(eval_budget),
+            s,
+            8192,
+        ))
+    };
+    let f_r1 = |g: &TttGame, s: u64| rand_ttt(g, s);
+    let tm_res = run_multi_match(&root, [&f_tm, &f_r1], 6, 1, 950);
+    let tree_minimax_us_per_eval = (tm_res.choose_time_us[0].mean() / (eval_budget as f32)).max(0.05);
+
+    let mcts_sims = 200usize;
+    let f_mcts_1 = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+        Box::new(MctsPlayer::new(
+            *g,
+            tic_tac_toe::NO_MOVE,
+            Uct::new(1.414),
+            PlayoutEvaluator::new(s ^ 0x55),
+            MctsConfig::new(mcts_sims, s).with_arena_capacity(4096),
+        ))
+    };
+    let f_r2 = |g: &TttGame, s: u64| rand_ttt(g, s);
+    let m1_res = run_multi_match(&root, [&f_mcts_1, &f_r2], 6, 1, 960);
+    let mcts_us_per_sim_1tree = (m1_res.choose_time_us[0].mean() / (mcts_sims as f32)).max(0.05);
+
+    let f_mcts_4 = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+        Box::new(RootParallelPlayer::new(
+            *g,
+            tic_tac_toe::NO_MOVE,
+            Uct::new(1.414),
+            4,
+            RootParallelConfig::new(RootParallelBudget::SimulationsPerThread(50), s)
+                .with_arena_capacity_per_thread(2048),
+            |_t, es| PlayoutEvaluator::new(es),
+        ))
+    };
+    let f_r3 = |g: &TttGame, s: u64| rand_ttt(g, s);
+    let m4_res = run_multi_match(&root, [&f_mcts_4, &f_r3], 6, 1, 970);
+    let mcts_us_per_sim_4tree = (m4_res.choose_time_us[0].mean() / 200.0).max(0.05);
+
+    let (az_1, az_4) = if let Some(c) = ctx {
+        let eval = c.resolve_evaluator("live")?;
+        let svc = InferenceService::new(eval, 32, 1);
+        let svc_ref = &svc;
+        let az_sims = 64usize;
+        let f_az1 = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+            Box::new(AlphaZeroPlayer::new(
+                *g,
+                svc_ref,
+                AlphaZeroConfig::new(1, az_sims, s),
+            ))
+        };
+        let f_r4 = |g: &TttGame, s: u64| rand_ttt(g, s);
+        let r1 = run_multi_match(&root, [&f_az1, &f_r4], 8, 2, 980);
+        let (_, uniq1) = svc.dedup_counts();
+        let moves1 = r1.choose_time_us[0].count().max(1) as f32;
+        let total_us_1 = r1.choose_time_us[0].mean()
+            + ((uniq1 as f32) * svc.inference_time_stats().mean()) / moves1;
+
+        svc.reset_stats();
+        let f_az4 = |g: &TttGame, s: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
+            Box::new(AlphaZeroPlayer::new(
+                *g,
+                svc_ref,
+                AlphaZeroConfig::new(4, 24, s),
+            ))
+        };
+        let f_r5 = |g: &TttGame, s: u64| rand_ttt(g, s);
+        let r4 = run_multi_match(&root, [&f_az4, &f_r5], 8, 2, 990);
+        let (_, uniq4) = svc.dedup_counts();
+        let moves4 = r4.choose_time_us[0].count().max(1) as f32;
+        let total_us_4 = r4.choose_time_us[0].mean()
+            + ((uniq4 as f32) * svc.inference_time_stats().mean()) / moves4;
+
+        (
+            (total_us_1 / (az_sims as f32)).max(0.5),
+            (total_us_4 / 96.0).max(0.5),
+        )
+    } else {
+        (5.0, 3.5)
+    };
+
+    Ok(CalibrationReport {
+        game: "ttt",
+        alphazero_us_per_sim_1tree: az_1,
+        alphazero_us_per_sim_4tree: az_4,
+        mcts_us_per_sim_1tree,
+        mcts_us_per_sim_4tree,
+        tree_minimax_us_per_eval,
+        minimax_depths,
+    })
+}
+
+fn calibrate_uttt(ctx: Option<&ModelContext<324, 81, 2>>) -> Result<CalibrationReport, String> {
+    let root = UtttGame::new(PlayerIndex::PLAYER1, UTTT_EMPTY_STATE);
+    let h = UtttHeuristic::default();
+
+    let mut minimax_depths = Vec::with_capacity(4);
+    for depth in 1..=4u32 {
+        let f_mm = |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+            Box::new(MinimaxPlayer::new(*g, h, depth, s))
+        };
+        let f_r = |g: &UtttGame, s: u64| rand_uttt(g, s);
+        let games = if depth >= 4 { 2 } else { 4 };
+        let res = run_multi_match(&root, [&f_mm, &f_r], games, 2, 1900 + depth as u64);
+        minimax_depths.push(MinimaxDepthTiming {
+            depth,
+            us_per_move: res.choose_time_us[0].mean().max(1.0),
+        });
+    }
+
+    let eval_budget = 250usize;
+    let f_tm = |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+        Box::new(TreeMinimaxPlayer::new(
+            *g,
+            ultimate_ttt::NO_MOVE,
+            h,
+            MinimaxBudget::MaxEvaluations(eval_budget),
+            s,
+            16_384,
+        ))
+    };
+    let f_r1 = |g: &UtttGame, s: u64| rand_uttt(g, s);
+    let tm_res = run_multi_match(&root, [&f_tm, &f_r1], 4, 2, 1950);
+    let tree_minimax_us_per_eval =
+        (tm_res.choose_time_us[0].mean() / (eval_budget as f32)).max(0.1);
+
+    let mcts_sims = 120usize;
+    let f_mcts_1 = |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+        Box::new(MctsPlayer::new(
+            *g,
+            ultimate_ttt::NO_MOVE,
+            Uct::new(1.414),
+            PlayoutEvaluator::new(s ^ 0x55),
+            MctsConfig::new(mcts_sims, s).with_arena_capacity(8192),
+        ))
+    };
+    let f_r2 = |g: &UtttGame, s: u64| rand_uttt(g, s);
+    let m1_res = run_multi_match(&root, [&f_mcts_1, &f_r2], 4, 2, 1960);
+    let mcts_us_per_sim_1tree = (m1_res.choose_time_us[0].mean() / (mcts_sims as f32)).max(0.1);
+
+    let f_mcts_4 = |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+        Box::new(RootParallelPlayer::new(
+            *g,
+            ultimate_ttt::NO_MOVE,
+            Uct::new(1.414),
+            4,
+            RootParallelConfig::new(RootParallelBudget::SimulationsPerThread(30), s)
+                .with_arena_capacity_per_thread(4096),
+            |_t, es| PlayoutEvaluator::new(es),
+        ))
+    };
+    let f_r3 = |g: &UtttGame, s: u64| rand_uttt(g, s);
+    let m4_res = run_multi_match(&root, [&f_mcts_4, &f_r3], 4, 2, 1970);
+    let mcts_us_per_sim_4tree = (m4_res.choose_time_us[0].mean() / 120.0).max(0.1);
+
+    let (az_1, az_4) = if let Some(c) = ctx {
+        let eval = c.resolve_evaluator("live")?;
+        let svc = InferenceService::new(eval, 32, 1);
+        let svc_ref = &svc;
+        let az_sims = 32usize;
+        let f_az1 = |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+            Box::new(AlphaZeroPlayer::new(
+                *g,
+                svc_ref,
+                AlphaZeroConfig::new(1, az_sims, s),
+            ))
+        };
+        let f_r4 = |g: &UtttGame, s: u64| rand_uttt(g, s);
+        let r1 = run_multi_match(&root, [&f_az1, &f_r4], 4, 2, 1980);
+        let (_, uniq1) = svc.dedup_counts();
+        let moves1 = r1.choose_time_us[0].count().max(1) as f32;
+        let total_us_1 = r1.choose_time_us[0].mean()
+            + ((uniq1 as f32) * svc.inference_time_stats().mean()) / moves1;
+
+        svc.reset_stats();
+        let f_az4 = |g: &UtttGame, s: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
+            Box::new(AlphaZeroPlayer::new(
+                *g,
+                svc_ref,
+                AlphaZeroConfig::new(4, 12, s),
+            ))
+        };
+        let f_r5 = |g: &UtttGame, s: u64| rand_uttt(g, s);
+        let r4 = run_multi_match(&root, [&f_az4, &f_r5], 4, 2, 1990);
+        let (_, uniq4) = svc.dedup_counts();
+        let moves4 = r4.choose_time_us[0].count().max(1) as f32;
+        let total_us_4 = r4.choose_time_us[0].mean()
+            + ((uniq4 as f32) * svc.inference_time_stats().mean()) / moves4;
+
+        (
+            (total_us_1 / (az_sims as f32)).max(1.0),
+            (total_us_4 / 48.0).max(1.0),
+        )
+    } else {
+        (12.0, 9.0)
+    };
+
+    Ok(CalibrationReport {
+        game: "uttt",
+        alphazero_us_per_sim_1tree: az_1,
+        alphazero_us_per_sim_4tree: az_4,
+        mcts_us_per_sim_1tree,
+        mcts_us_per_sim_4tree,
+        tree_minimax_us_per_eval,
+        minimax_depths,
+    })
 }
 
 fn build_ttt_player<'a>(
@@ -979,21 +1724,115 @@ fn build_ttt_player<'a>(
     }
 }
 
-fn discover_ttt_models(has_live: bool) -> Vec<ModelInfo> {
+fn build_uttt_player<'a>(
+    cfg: &'a TttEngineConfig,
+    service: Option<&'a InferenceService<CandleBatchEvaluator<324, 81, 2>, 324, 81, 2>>,
+    game: &UtttGame,
+    seed: u64,
+) -> Box<dyn Player<UltimateTicTacToe, 2> + 'a> {
+    let h = UtttHeuristic::default();
+    match cfg.engine.as_str() {
+        "minimax" => {
+            if cfg.use_heuristic {
+                Box::new(MinimaxPlayer::new(*game, h, cfg.depth, seed))
+            } else {
+                Box::new(MinimaxPlayer::zero(*game, cfg.depth, seed))
+            }
+        }
+        "tree-minimax" => {
+            let budget = match cfg.budget_kind.as_str() {
+                "evals" => MinimaxBudget::MaxEvaluations(cfg.budget_val.max(1)),
+                "ms" => {
+                    MinimaxBudget::MaxDuration(Duration::from_millis(cfg.budget_val.max(1) as u64))
+                }
+                _ => MinimaxBudget::FixedDepth(cfg.budget_val as u32),
+            };
+            let cap = cfg.arena_cap.max(256);
+            if cfg.use_heuristic {
+                Box::new(TreeMinimaxPlayer::new(
+                    *game,
+                    ultimate_ttt::NO_MOVE,
+                    h,
+                    budget,
+                    seed,
+                    cap,
+                ))
+            } else {
+                Box::new(TreeMinimaxPlayer::zero(
+                    *game,
+                    ultimate_ttt::NO_MOVE,
+                    budget,
+                    seed,
+                    cap,
+                ))
+            }
+        }
+        "mcts" => {
+            let sims = cfg.sims.max(1);
+            let trees = cfg.num_trees.max(1);
+            let cap = (sims * 32).max(1024);
+            if trees == 1 {
+                let m_cfg = MctsConfig::new(sims, seed)
+                    .with_opening_moves(cfg.opening_moves)
+                    .with_arena_capacity(cap);
+                Box::new(MctsPlayer::new(
+                    *game,
+                    ultimate_ttt::NO_MOVE,
+                    Uct::new(cfg.c_uct),
+                    PlayoutEvaluator::new(seed.wrapping_add(1)),
+                    m_cfg,
+                ))
+            } else {
+                let rp_cfg = RootParallelConfig::new(
+                    RootParallelBudget::SimulationsPerThread(sims),
+                    seed,
+                )
+                .with_opening_moves(cfg.opening_moves)
+                .with_arena_capacity_per_thread(cap);
+                Box::new(RootParallelPlayer::new(
+                    *game,
+                    ultimate_ttt::NO_MOVE,
+                    Uct::new(cfg.c_uct),
+                    trees,
+                    rp_cfg,
+                    |_t, eval_seed| PlayoutEvaluator::new(eval_seed),
+                ))
+            }
+        }
+        "alphazero" => {
+            let svc = service.expect("AlphaZero engine requires an active InferenceService");
+            let az_cfg = AlphaZeroConfig::new(cfg.num_trees.max(1), cfg.sims.max(1), seed)
+                .with_puct(cfg.c_base, cfg.c_init)
+                .with_dirichlet(cfg.dir_alpha, cfg.dir_eps)
+                .with_opening_moves(cfg.opening_moves);
+            Box::new(AlphaZeroPlayer::new(*game, svc, az_cfg))
+        }
+        _ => Box::new(RandomPlayer::new(*game, seed)),
+    }
+}
+
+fn discover_game_models(game: LabGame, has_live: bool, current_iter: usize) -> Vec<ModelInfo> {
     let mut list = Vec::new();
+    let g_str = game.as_str();
     if has_live {
         list.push(ModelInfo {
             id: "live".to_string(),
             kind: "live",
+            game: g_str,
             size_bytes: 0,
-            description: "Active Live Model (shared with training loop)".to_string(),
+            description: format!(
+                "Active Live {} Model (currently at Iter #{})",
+                game.title(),
+                current_iter
+            ),
         });
     }
     list.push(ModelInfo {
         id: "untrained".to_string(),
         kind: "builtin",
+        game: g_str,
         size_bytes: 0,
-        description: "Untrained Random Weights (baseline)".to_string(),
+        description: format!("Untrained Random {} Weights (Iter 0 Baseline)", game.title()),
     });
 
     if let Ok(entries) = std::fs::read_dir(".") {
@@ -1001,7 +1840,15 @@ fn discover_ttt_models(has_live: bool) -> Vec<ModelInfo> {
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
-                if name.ends_with(".safetensors") {
+                if !name.ends_with(".safetensors") {
+                    return None;
+                }
+                let belongs_to_uttt = name.starts_with("uttt_");
+                let matches_game = match game {
+                    LabGame::Uttt => belongs_to_uttt,
+                    LabGame::Ttt => !belongs_to_uttt,
+                };
+                if matches_game {
                     let sz = e.metadata().ok().map(|m| m.len()).unwrap_or(0);
                     Some((name, sz))
                 } else {
@@ -1014,8 +1861,9 @@ fn discover_ttt_models(has_live: bool) -> Vec<ModelInfo> {
             list.push(ModelInfo {
                 id: name,
                 kind: "disk",
+                game: g_str,
                 size_bytes: sz,
-                description: "Saved .safetensors checkpoint on disk".to_string(),
+                description: format!("Saved {} checkpoint on disk", game.title()),
             });
         }
     }
@@ -1041,18 +1889,116 @@ fn sanitize_safetensors_filename(raw: &str) -> Option<String> {
     }
 }
 
+fn ensure_game_prefixed_filename(game: LabGame, raw: &str) -> Option<String> {
+    let base = sanitize_safetensors_filename(raw)?;
+    let prefix = game.prefix();
+    if base.starts_with("ttt_") || base.starts_with("uttt_") {
+        Some(base)
+    } else {
+        Some(format!("{prefix}{base}"))
+    }
+}
+
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len() {
+        if i + 4 <= buf.len() && &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some((i, i + 4));
+        }
+        if i + 2 <= buf.len() && &buf[i..i + 2] == b"\n\n" {
+            return Some((i, i + 2));
+        }
+    }
+    None
+}
+
+fn read_http_request<R: Read>(reader: &mut R) -> std::io::Result<(String, String, String)> {
+    let mut data = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let mut header_end = None;
+    let mut content_length = 0usize;
+
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        data.extend_from_slice(&chunk[..n]);
+
+        if header_end.is_none()
+            && let Some((hdr_end_idx, body_start_idx)) = find_header_end(&data)
+        {
+            header_end = Some(body_start_idx);
+            let header_str = String::from_utf8_lossy(&data[..hdr_end_idx]);
+            for line in header_str.lines() {
+                if let Some((k, v)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("content-length")
+                    && let Ok(len) = v.trim().parse::<usize>()
+                {
+                    content_length = len;
+                }
+            }
+        }
+
+        if let Some(body_start) = header_end
+            && data.len() >= body_start + content_length
+        {
+            break;
+        }
+
+        if data.len() >= 65_536 {
+            break;
+        }
+    }
+
+    if data.is_empty() {
+        return Ok((String::new(), String::new(), String::new()));
+    }
+
+    let (hdr_slice, body_slice) = match header_end {
+        Some(body_start) => {
+            let end = (body_start + content_length).min(data.len());
+            (&data[..body_start], &data[body_start..end])
+        }
+        None => (&data[..], &[][..]),
+    };
+
+    let header_text = String::from_utf8_lossy(hdr_slice);
+    let first_line = header_text.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET").to_string();
+    let raw_path = parts.next().unwrap_or("/").to_string();
+    let body = String::from_utf8_lossy(body_slice).into_owned();
+    Ok((method, raw_path, body))
+}
+
+fn extract_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next().unwrap_or("");
+        let v = kv.next().unwrap_or("");
+        if k == key && !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
 fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut buf = [0u8; 16384];
-    let n = stream.read(&mut buf)?;
-    if n == 0 {
+    let (method, raw_path, body) = read_http_request(&mut stream)?;
+    if method.is_empty() {
         return Ok(());
     }
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let first_line = req.lines().next().unwrap_or("");
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET");
-    let raw_path = parts.next().unwrap_or("/");
+    let method = method.as_str();
+    let raw_path = raw_path.as_str();
+    let body = body.as_str();
 
     if method == "OPTIONS" {
         return write_http_response(&mut stream, "204 No Content", "text/plain", "");
@@ -1068,43 +2014,180 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
     }
 
     if method == "GET" && raw_path.starts_with("/api/state") {
-        let body = hub.to_json();
-        return write_http_response(&mut stream, "200 OK", "application/json", &body);
+        let state_json = hub.to_json();
+        return write_http_response(&mut stream, "200 OK", "application/json", &state_json);
+    }
+
+    if (method == "POST" || method == "GET") && raw_path.starts_with("/api/train_control") {
+        let query = raw_path.split('?').nth(1).unwrap_or("");
+        let action = extract_json_str(body, "action")
+            .or_else(|| extract_query_param(query, "action").map(str::to_string))
+            .unwrap_or_default();
+        let game_opt = extract_json_str(body, "game")
+            .or_else(|| extract_query_param(query, "game").map(str::to_string));
+        let total_iters_opt = extract_json_f64(body, "total_iterations").or_else(|| {
+            extract_query_param(query, "total_iterations").and_then(|s| s.parse::<f64>().ok())
+        });
+        let auto_save_opt = extract_json_f64(body, "auto_save_every").or_else(|| {
+            extract_query_param(query, "auto_save_every").and_then(|s| s.parse::<f64>().ok())
+        });
+
+        {
+            let mut guard = hub.inner.lock().expect("telemetry mutex poisoned");
+            if let Some(g_str) = game_opt {
+                let new_game = LabGame::from_str_lossy(&g_str);
+                if guard.active_game != new_game {
+                    let prev = guard.active_game;
+                    guard.state_for_mut(prev).knobs.paused = true;
+                    guard.state_for_mut(prev).step_requests = 0;
+                    guard.state_for_mut(prev).pause_after_iteration = false;
+                    guard.active_game = new_game;
+                    println!(
+                        "🎮 [Browser Lab] Switched active game: {} -> {}",
+                        prev.title(),
+                        new_game.title()
+                    );
+                }
+            }
+
+            let active_game = guard.active_game;
+            let st = guard.state_for_mut(active_game);
+            apply_knob_updates(&mut st.knobs, body);
+            if let Some(v) = total_iters_opt {
+                st.total_iterations = (v as usize).clamp(1, 10_000);
+            }
+            if let Some(v) = auto_save_opt {
+                st.auto_save_every = (v as usize).clamp(0, 1000);
+            }
+
+            match action.as_str() {
+                "start" | "resume" => {
+                    if st.current_iteration >= st.total_iterations {
+                        st.total_iterations = st.current_iteration + 15;
+                    }
+                    st.knobs.paused = false;
+                    st.pause_after_iteration = false;
+                    st.phase = format!(
+                        "Starting {} Iter #{} / {}...",
+                        active_game.title(),
+                        st.current_iteration + 1,
+                        st.total_iterations
+                    );
+                    println!(
+                        "▶️  [Browser Lab] Start/Resume {} training (Iter #{}..#{}, {} games/iter, {} sims/move)",
+                        active_game.title(),
+                        st.current_iteration + 1,
+                        st.total_iterations,
+                        st.knobs.games_per_iteration,
+                        st.knobs.simulations_per_move
+                    );
+                }
+                "pause" => {
+                    st.knobs.paused = true;
+                    st.step_requests = 0;
+                    st.pause_after_iteration = false;
+                    st.phase = format!("Paused (Iter #{})", st.current_iteration);
+                    println!(
+                        "⏸️  [Browser Lab] Paused {} training (at Iter #{})",
+                        active_game.title(),
+                        st.current_iteration
+                    );
+                }
+                "step" => {
+                    st.step_requests += 1;
+                    st.knobs.paused = false;
+                    if st.current_iteration >= st.total_iterations {
+                        st.total_iterations = st.current_iteration + 1;
+                    }
+                    st.phase = format!(
+                        "Stepping {} Iter #{}...",
+                        active_game.title(),
+                        st.current_iteration + 1
+                    );
+                    println!(
+                        "⏭️  [Browser Lab] Stepping +1 iteration for {} (Iter #{})",
+                        active_game.title(),
+                        st.current_iteration + 1
+                    );
+                }
+                "reset" => {
+                    st.reset_requested = true;
+                    st.knobs.paused = true;
+                    st.step_requests = 0;
+                    st.pause_after_iteration = false;
+                    st.phase = "Resetting Model & Replay Buffer...".to_string();
+                    println!(
+                        "🔄 [Browser Lab] Requested reset for {} model & replay buffer",
+                        active_game.title()
+                    );
+                }
+                _ => {}
+            }
+        }
+        let updated = hub.to_json();
+        return write_http_response(&mut stream, "200 OK", "application/json", &updated);
     }
 
     if method == "POST" && raw_path.starts_with("/api/knobs") {
-        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
         {
             let mut guard = hub.inner.lock().expect("telemetry mutex poisoned");
-            apply_knob_updates(&mut guard.knobs, body);
+            let active_game = guard.active_game;
+            let st = guard.state_for_mut(active_game);
+            let was_paused = st.knobs.paused;
+            apply_knob_updates(&mut st.knobs, body);
+            if was_paused && !st.knobs.paused && st.current_iteration >= st.total_iterations {
+                st.total_iterations = st.current_iteration + 15;
+            }
+            if !was_paused && st.knobs.paused {
+                st.step_requests = 0;
+                st.pause_after_iteration = false;
+                st.phase = format!("Paused (Iter #{})", st.current_iteration);
+            }
+            println!(
+                "🎛️  [Browser Lab] Updated {} knobs: games={}, sims={}, steps={}, batch={}, lr={:.5}",
+                active_game.title(),
+                st.knobs.games_per_iteration,
+                st.knobs.simulations_per_move,
+                st.knobs.train_steps,
+                st.knobs.batch_size,
+                st.knobs.learning_rate
+            );
         }
         let updated = hub.to_json();
         return write_http_response(&mut stream, "200 OK", "application/json", &updated);
     }
 
     if method == "POST" && raw_path.starts_with("/api/models") {
-        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
-        let action = extract_json_str(body, "action").unwrap_or_default();
-        let name = extract_json_str(body, "name").unwrap_or_default();
+        let query = raw_path.split('?').nth(1).unwrap_or("");
+        let action = extract_json_str(body, "action")
+            .or_else(|| extract_query_param(query, "action").map(str::to_string))
+            .unwrap_or_default();
+        let name = extract_json_str(body, "name")
+            .or_else(|| extract_query_param(query, "name").map(str::to_string))
+            .unwrap_or_default();
+        let game = extract_json_str(body, "game")
+            .or_else(|| extract_query_param(query, "game").map(str::to_string))
+            .map(|s| LabGame::from_str_lossy(&s))
+            .unwrap_or_else(|| hub.active_game());
 
-        let ctx_opt = hub
-            .inner
-            .lock()
-            .expect("telemetry mutex poisoned")
-            .ttt_context
-            .clone();
+        let (ttt_ctx, uttt_ctx, cur_iter) = {
+            let guard = hub.inner.lock().expect("telemetry mutex poisoned");
+            (
+                guard.ttt_context.clone(),
+                guard.uttt_context.clone(),
+                guard.state_for(game).current_iteration,
+            )
+        };
+
+        let raw_target_name = if action == "snapshot" && name.trim().is_empty() {
+            format!("{}iter_{:03}.safetensors", game.prefix(), cur_iter)
+        } else {
+            name
+        };
 
         match action.as_str() {
-            "save" => {
-                let Some(ctx) = ctx_opt else {
-                    return write_http_response(
-                        &mut stream,
-                        "400 Bad Request",
-                        "application/json",
-                        "{\"error\":\"No live model attached\"}",
-                    );
-                };
-                let Some(filename) = sanitize_safetensors_filename(&name) else {
+            "save" | "snapshot" => {
+                let Some(filename) = ensure_game_prefixed_filename(game, &raw_target_name) else {
                     return write_http_response(
                         &mut stream,
                         "400 Bad Request",
@@ -1112,7 +2195,31 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                         "{\"error\":\"Invalid model name\"}",
                     );
                 };
-                if let Err(e) = ctx.live_service.evaluator().save_safetensors(&filename) {
+                let save_res = match game {
+                    LabGame::Ttt => {
+                        let Some(ctx) = ttt_ctx else {
+                            return write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                "{\"error\":\"No live TTT model attached\"}",
+                            );
+                        };
+                        ctx.live_service.evaluator().save_safetensors(&filename)
+                    }
+                    LabGame::Uttt => {
+                        let Some(ctx) = uttt_ctx else {
+                            return write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                "{\"error\":\"No live UTTT model attached\"}",
+                            );
+                        };
+                        ctx.live_service.evaluator().save_safetensors(&filename)
+                    }
+                };
+                if let Err(e) = save_res {
                     let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e.to_string()));
                     return write_http_response(
                         &mut stream,
@@ -1121,23 +2228,10 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                         &msg,
                     );
                 }
-                let iter = hub
-                    .inner
-                    .lock()
-                    .expect("telemetry mutex poisoned")
-                    .current_iteration;
-                hub.set_phase(iter, format!("Saved checkpoint {filename}"));
+                hub.set_phase_for(game, cur_iter, format!("Saved checkpoint {filename}"));
             }
             "load_to_live" => {
-                let Some(ctx) = ctx_opt else {
-                    return write_http_response(
-                        &mut stream,
-                        "400 Bad Request",
-                        "application/json",
-                        "{\"error\":\"No live model attached\"}",
-                    );
-                };
-                let Some(filename) = sanitize_safetensors_filename(&name) else {
+                let Some(filename) = sanitize_safetensors_filename(&raw_target_name) else {
                     return write_http_response(
                         &mut stream,
                         "400 Bad Request",
@@ -1145,10 +2239,37 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                         "{\"error\":\"Invalid model name\"}",
                     );
                 };
-                ctx.live_service.pause_inference();
-                let res = ctx.live_service.evaluator().load_safetensors(&filename);
-                ctx.live_service.resume_inference();
-                if let Err(e) = res {
+                let load_res = match game {
+                    LabGame::Ttt => {
+                        let Some(ctx) = ttt_ctx else {
+                            return write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                "{\"error\":\"No live TTT model attached\"}",
+                            );
+                        };
+                        ctx.live_service.pause_inference();
+                        let r = ctx.live_service.evaluator().load_safetensors(&filename);
+                        ctx.live_service.resume_inference();
+                        r
+                    }
+                    LabGame::Uttt => {
+                        let Some(ctx) = uttt_ctx else {
+                            return write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                "{\"error\":\"No live UTTT model attached\"}",
+                            );
+                        };
+                        ctx.live_service.pause_inference();
+                        let r = ctx.live_service.evaluator().load_safetensors(&filename);
+                        ctx.live_service.resume_inference();
+                        r
+                    }
+                };
+                if let Err(e) = load_res {
                     let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e.to_string()));
                     return write_http_response(
                         &mut stream,
@@ -1157,15 +2278,10 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                         &msg,
                     );
                 }
-                let iter = hub
-                    .inner
-                    .lock()
-                    .expect("telemetry mutex poisoned")
-                    .current_iteration;
-                hub.set_phase(iter, format!("Loaded {filename} into Live"));
+                hub.set_phase_for(game, cur_iter, format!("Loaded {filename} into Live"));
             }
             "delete" => {
-                if let Some(filename) = sanitize_safetensors_filename(&name) {
+                if let Some(filename) = sanitize_safetensors_filename(&raw_target_name) {
                     let _ = std::fs::remove_file(&filename);
                 }
             }
@@ -1176,13 +2292,40 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
         return write_http_response(&mut stream, "200 OK", "application/json", &updated);
     }
 
+    if (method == "POST" || method == "GET") && raw_path.starts_with("/api/calibrate") {
+        let query = raw_path.split('?').nth(1).unwrap_or("");
+        let game = extract_json_str(body, "game")
+            .or_else(|| extract_query_param(query, "game").map(str::to_string))
+            .map(|s| LabGame::from_str_lossy(&s))
+            .unwrap_or_else(|| hub.active_game());
+        println!("⚡ [Browser Lab] Running hardware timing calibration for {}...", game.title());
+        match hub.calibrate_game(game) {
+            Ok(report) => {
+                return write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &report.to_json(),
+                );
+            }
+            Err(err) => {
+                let msg = format!("{{\"error\":\"{}\"}}", escape_json(&err));
+                return write_http_response(&mut stream, "400 Bad Request", "application/json", &msg);
+            }
+        }
+    }
+
     if method == "POST" && raw_path.starts_with("/api/match") {
-        let body = req.split("\r\n\r\n").nth(1).unwrap_or("");
+        let query = raw_path.split('?').nth(1).unwrap_or("");
+        let game = extract_json_str(body, "game")
+            .or_else(|| extract_query_param(query, "game").map(str::to_string))
+            .map(|s| LabGame::from_str_lossy(&s))
+            .unwrap_or_else(|| hub.active_game());
         let cfg_a = parse_engine_config(body, "a_");
         let cfg_b = parse_engine_config(body, "b_");
         let num_games = extract_json_f64(body, "num_games")
             .map(|v| v as usize)
-            .unwrap_or(100);
+            .unwrap_or(40);
         let num_workers = extract_json_f64(body, "num_workers")
             .map(|v| v as usize)
             .unwrap_or(4);
@@ -1193,7 +2336,22 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
             .map(|v| v as u64)
             .unwrap_or(2026);
 
-        match hub.run_ttt_match(&cfg_a, &cfg_b, num_games, num_workers, max_batch_size, seed) {
+        println!(
+            "⚔️  [Browser Lab] Starting {} multi-match ({} games): {} vs {}",
+            game.title(),
+            num_games,
+            cfg_a.summary_label(),
+            cfg_b.summary_label()
+        );
+        match hub.run_match_for_game(
+            game,
+            &cfg_a,
+            &cfg_b,
+            num_games,
+            num_workers,
+            max_batch_size,
+            seed,
+        ) {
             Ok(rec) => {
                 return write_http_response(&mut stream, "200 OK", "application/json", &rec.to_json());
             }
@@ -1329,7 +2487,14 @@ fn parse_ttt_query(query: &str) -> (TttGame, usize, usize, f32, f32, String) {
         }
     }
 
-    (TttGame::new(player, state), sims, trees, c_init, dir_eps, model)
+    (
+        TttGame::new(player, state),
+        sims,
+        trees,
+        c_init,
+        dir_eps,
+        model,
+    )
 }
 
 fn parse_engine_config(body: &str, prefix: &str) -> TttEngineConfig {
@@ -1340,38 +2505,38 @@ fn parse_engine_config(body: &str, prefix: &str) -> TttEngineConfig {
     if let Some(v) = extract_json_f64(body, &format!("{prefix}depth")) {
         cfg.depth = (v as u32).clamp(0, 9);
     }
-    if let Some(v) = extract_json_bool(body, &format!("{prefix}heuristic")) {
+    if let Some(v) = extract_json_bool(body, &format!("{prefix}use_heuristic")) {
         cfg.use_heuristic = v;
     }
     if let Some(v) = extract_json_str(body, &format!("{prefix}budget_kind")) {
         cfg.budget_kind = v;
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}budget_val")) {
-        cfg.budget_val = (v as usize).clamp(1, 1_000_000);
+        cfg.budget_val = (v as usize).clamp(1, 200_000);
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}arena_cap")) {
-        cfg.arena_cap = (v as usize).clamp(64, 1_000_000);
+        cfg.arena_cap = (v as usize).clamp(64, 500_000);
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}sims")) {
-        cfg.sims = (v as usize).clamp(1, 10_000);
+        cfg.sims = (v as usize).clamp(1, 50_000);
     }
-    if let Some(v) = extract_json_f64(body, &format!("{prefix}trees")) {
+    if let Some(v) = extract_json_f64(body, &format!("{prefix}num_trees")) {
         cfg.num_trees = (v as usize).clamp(1, 64);
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}c_uct")) {
         cfg.c_uct = (v as f32).clamp(0.0, 10.0);
     }
-    if let Some(v) = extract_json_f64(body, &format!("{prefix}opening")) {
-        cfg.opening_moves = (v as usize).clamp(0, 9);
+    if let Some(v) = extract_json_f64(body, &format!("{prefix}opening_moves")) {
+        cfg.opening_moves = (v as usize).clamp(0, 81);
     }
     if let Some(v) = extract_json_str(body, &format!("{prefix}model")) {
         cfg.model = v;
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}c_init")) {
-        cfg.c_init = (v as f32).clamp(0.05, 10.0);
+        cfg.c_init = (v as f32).clamp(0.01, 20.0);
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}c_base")) {
-        cfg.c_base = (v as f32).clamp(1.0, 1_000_000.0);
+        cfg.c_base = (v as f32).clamp(100.0, 1_000_000.0);
     }
     if let Some(v) = extract_json_f64(body, &format!("{prefix}dir_alpha")) {
         cfg.dir_alpha = (v as f32).clamp(0.01, 10.0);
@@ -1382,41 +2547,46 @@ fn parse_engine_config(body: &str, prefix: &str) -> TttEngineConfig {
     cfg
 }
 
-fn apply_knob_updates(knobs: &mut LiveKnobs, body: &str) {
-    if let Some(v) = extract_json_bool(body, "paused") {
+fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
+    if let Some(v) = extract_json_bool(json, "paused") {
         knobs.paused = v;
     }
-    if let Some(v) = extract_json_f64(body, "games_per_iteration") {
-        knobs.games_per_iteration = (v as usize).clamp(8, 4096);
+    if let Some(v) = extract_json_f64(json, "games_per_iteration") {
+        knobs.games_per_iteration = (v as usize).clamp(4, 2048);
     }
-    if let Some(v) = extract_json_f64(body, "simulations_per_move") {
+    if let Some(v) = extract_json_f64(json, "simulations_per_move") {
         knobs.simulations_per_move = (v as usize).clamp(4, 2000);
     }
-    if let Some(v) = extract_json_f64(body, "train_steps") {
+    if let Some(v) = extract_json_f64(json, "train_steps") {
         knobs.train_steps = (v as usize).clamp(1, 1000);
     }
-    if let Some(v) = extract_json_f64(body, "batch_size") {
+    if let Some(v) = extract_json_f64(json, "batch_size") {
         knobs.batch_size = (v as usize).clamp(8, 1024);
     }
-    if let Some(v) = extract_json_f64(body, "learning_rate") {
-        knobs.learning_rate = v.clamp(1e-6, 1.0);
+    if let Some(v) = extract_json_f64(json, "learning_rate") {
+        knobs.learning_rate = v.clamp(1e-6, 1e-1);
     }
-    if let Some(v) = extract_json_f64(body, "dirichlet_epsilon") {
-        knobs.dirichlet_epsilon = (v as f32).clamp(0.0, 1.0);
+    if let Some(v) = extract_json_f64(json, "dirichlet_epsilon") {
+        knobs.dirichlet_epsilon = (v as f32).clamp(0.0, 0.9);
     }
-    if let Some(v) = extract_json_f64(body, "c_init") {
+    if let Some(v) = extract_json_f64(json, "c_init") {
         knobs.c_init = (v as f32).clamp(0.1, 10.0);
     }
 }
 
+fn extract_json_after_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let pos = json.find(&needle)?;
+    let rest = &json[pos + needle.len()..];
+    let colon = rest.find(':')?;
+    Some(rest[colon + 1..].trim_start())
+}
+
 fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
-    let pat = format!("\"{key}\"");
-    let pos = json.find(&pat)?;
-    let rest = json[pos + pat.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    if rest.starts_with("true") {
+    let s = extract_json_after_key(json, key)?;
+    if s.starts_with("true") {
         Some(true)
-    } else if rest.starts_with("false") {
+    } else if s.starts_with("false") {
         Some(false)
     } else {
         None
@@ -1424,26 +2594,18 @@ fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
 }
 
 fn extract_json_f64(json: &str, key: &str) -> Option<f64> {
-    let pat = format!("\"{key}\"");
-    let pos = json.find(&pat)?;
-    let rest = json[pos + pat.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let end = rest
-        .find(|c: char| {
-            !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
-        })
-        .unwrap_or(rest.len());
-    rest[..end].parse::<f64>().ok()
+    let s = extract_json_after_key(json, key)?;
+    let end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E')
+        .unwrap_or(s.len());
+    s[..end].parse::<f64>().ok()
 }
 
 fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let pos = json.find(&pat)?;
-    let rest = json[pos + pat.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    let s = extract_json_after_key(json, key)?;
+    let s = s.strip_prefix('"')?;
+    let end = s.find('"')?;
+    Some(s[..end].to_string())
 }
 
 #[inline]
@@ -1460,19 +2622,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pure-Rust AlphaZero Lab, Multi-Engine Arena & Inspector</title>
+<title>Pure-Rust AlphaZero Live Lab & Multi-Engine Arena</title>
 <style>
   :root {
     --bg: #0b0f19;
     --panel: #131b2e;
-    --panel-border: #23304d;
+    --panel-alt: #18233c;
+    --border: #263457;
     --text: #e2e8f0;
     --muted: #94a3b8;
     --accent: #38bdf8;
-    --green: #22c55e;
-    --amber: #f59e0b;
-    --red: #ef4444;
-    --purple: #a855f7;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --rose: #fb7185;
+    --purple: #a78bfa;
   }
   * { box-sizing: border-box; }
   body {
@@ -1480,331 +2643,457 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
     background: var(--bg);
     color: var(--text);
+    padding: 16px 22px;
   }
   header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    padding: 14px 24px;
-    background: #0f1629;
-    border-bottom: 1px solid var(--panel-border);
+    gap: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
   }
-  .brand { font-size: 18px; font-weight: 700; color: var(--accent); }
-  .badges { display: flex; gap: 12px; align-items: center; font-size: 13px; }
-  .badge {
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
+  .title-block h1 {
+    margin: 0;
+    font-size: 1.25rem;
+    color: var(--accent);
   }
-  .tabs {
+  .title-block p {
+    margin: 4px 0 0;
+    font-size: 0.82rem;
+    color: var(--muted);
+  }
+  .game-switcher {
     display: flex;
-    gap: 8px;
-    padding: 12px 24px 0;
-    border-bottom: 1px solid var(--panel-border);
+    gap: 6px;
+    background: var(--panel);
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
   }
-  .tab-btn {
+  .game-btn {
     background: transparent;
     color: var(--muted);
     border: none;
-    border-bottom: 2px solid transparent;
-    padding: 10px 16px;
+    padding: 7px 14px;
+    border-radius: 6px;
     cursor: pointer;
-    font-size: 14px;
+    font-weight: 700;
+    font-size: 0.84rem;
+  }
+  .game-btn.active {
+    background: var(--accent);
+    color: #0b0f19;
+  }
+  .badges {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .badge {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 5px 11px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+  }
+  .badge.live { border-color: var(--green); color: var(--green); }
+  .badge.paused { border-color: var(--amber); color: var(--amber); }
+  .tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .tab-btn {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 8px 16px;
+    border-radius: 6px;
+    cursor: pointer;
     font-weight: 600;
+    font-size: 0.85rem;
   }
   .tab-btn.active {
-    color: var(--accent);
-    border-bottom-color: var(--accent);
+    background: var(--accent);
+    color: #0b0f19;
+    border-color: var(--accent);
   }
-  .container { padding: 20px 24px; max-width: 1500px; margin: 0 auto; }
-  .grid-4 {
+  .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(430px, 1fr));
     gap: 14px;
-    margin-bottom: 18px;
-  }
-  .grid-2 {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
-    gap: 16px;
-    margin-bottom: 18px;
   }
   .card {
     background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 10px;
-    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
   }
-  .card h3 {
-    margin: 0 0 8px 0;
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+  .card h2 {
+    margin: 0 0 6px;
+    font-size: 0.95rem;
+    color: var(--accent);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .card p.hint {
+    margin: 0 0 10px;
+    font-size: 0.76rem;
     color: var(--muted);
   }
-  .metric-val { font-size: 26px; font-weight: 700; }
-  .metric-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  canvas { width: 100%; height: 220px; display: block; }
+  canvas {
+    width: 100%;
+    height: 205px;
+    background: #0d1322;
+    border-radius: 6px;
+    border: 1px solid #1e293b;
+  }
+  .legend {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    font-size: 0.75rem;
+    margin-top: 6px;
+    color: var(--muted);
+  }
+  .legend span::before {
+    content: "● ";
+  }
+  .train-control-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
+  }
+  .train-btn-group {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
   .knobs-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
-    gap: 12px;
-    align-items: end;
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+    gap: 10px;
   }
-  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  input[type="number"], input[type="text"], select {
-    width: 100%;
-    padding: 7px 10px;
-    background: #0b0f19;
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    color: var(--text);
-    font-family: inherit;
-  }
-  button.btn {
-    padding: 8px 14px;
-    border-radius: 6px;
-    border: 1px solid var(--accent);
-    background: rgba(56, 189, 248, 0.15);
-    color: var(--accent);
-    font-weight: 600;
-    cursor: pointer;
-  }
-  button.btn:hover { background: rgba(56, 189, 248, 0.28); }
-  button.btn-green {
-    border-color: var(--green);
-    background: rgba(34, 197, 94, 0.16);
-    color: var(--green);
-  }
-  button.btn-green:hover { background: rgba(34, 197, 94, 0.3); }
-  button.btn-red {
-    border-color: var(--red);
-    background: rgba(239, 68, 68, 0.14);
-    color: var(--red);
-    padding: 5px 10px;
-    font-size: 12px;
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td {
+  .knob-item {
+    background: var(--panel-alt);
     padding: 8px 10px;
-    text-align: right;
-    border-bottom: 1px solid var(--panel-border);
+    border-radius: 6px;
+    border: 1px solid var(--border);
   }
-  th { color: var(--muted); font-weight: 600; }
-  td.left, th.left { text-align: left; }
-  /* Play & Inspector Tab */
+  .knob-item label {
+    display: block;
+    font-size: 0.73rem;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .knob-item input, .knob-item select {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 5px 7px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.83rem;
+  }
+  .btn {
+    background: var(--accent);
+    color: #0b0f19;
+    border: none;
+    padding: 7px 14px;
+    border-radius: 6px;
+    font-weight: 700;
+    cursor: pointer;
+    font-size: 0.82rem;
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .btn.secondary {
+    background: var(--panel-alt);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn.green {
+    background: var(--green);
+    color: #0b0f19;
+  }
+  .btn.amber {
+    background: var(--amber);
+    color: #0b0f19;
+  }
+  .btn.danger {
+    background: #3b1826;
+    color: var(--rose);
+    border: 1px solid var(--rose);
+  }
   .play-layout {
     display: grid;
-    grid-template-columns: 420px 1fr;
-    gap: 24px;
+    grid-template-columns: 330px 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 820px) {
+    .play-layout { grid-template-columns: 1fr; }
   }
   .board {
     display: grid;
-    grid-template-columns: repeat(3, 120px);
-    grid-template-rows: repeat(3, 120px);
-    gap: 10px;
-    margin: 16px 0;
+    grid-template-columns: repeat(3, 98px);
+    grid-template-rows: repeat(3, 98px);
+    gap: 8px;
+    margin: 12px 0;
   }
   .cell {
-    background: #0b0f19;
-    border: 2px solid var(--panel-border);
-    border-radius: 10px;
-    position: relative;
-    cursor: pointer;
+    background: var(--panel-alt);
+    border: 2px solid var(--border);
+    border-radius: 8px;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 6px;
-    transition: border-color 0.15s;
+    cursor: pointer;
+    position: relative;
+    user-select: none;
   }
   .cell:hover { border-color: var(--accent); }
-  .cell.best-choice { border-color: var(--green); box-shadow: 0 0 12px rgba(34,197,94,0.25); }
-  .sym { font-size: 42px; font-weight: 800; line-height: 1; }
-  .sym.x { color: var(--accent); }
-  .sym.o { color: var(--amber); }
-  .overlay-stats {
-    font-size: 11px;
-    line-height: 1.35;
-    width: 100%;
-    text-align: left;
+  .cell .sym {
+    font-size: 2.0rem;
+    font-weight: 800;
+  }
+  .cell .sym.x { color: var(--accent); }
+  .cell .sym.o { color: var(--rose); }
+  .cell .overlay {
+    font-size: 0.67rem;
     color: var(--muted);
+    text-align: center;
+    line-height: 1.2;
   }
-  .bar-bg {
+  table {
     width: 100%;
-    height: 5px;
-    background: #1e293b;
-    border-radius: 3px;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  th, td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    text-align: right;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; }
+  .bar-wrap {
+    width: 90px;
+    background: #0b0f19;
+    height: 8px;
+    border-radius: 4px;
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 6px;
     overflow: hidden;
-    margin: 3px 0;
   }
-  .bar-fill { height: 100%; background: var(--green); }
-  .wdl-bar {
-    display: flex;
-    height: 22px;
-    border-radius: 6px;
-    overflow: hidden;
-    margin: 10px 0;
-    font-size: 12px;
-    font-weight: 700;
-  }
-  .wdl-seg {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #0b0f19;
-  }
+  .bar-fill { height: 100%; background: var(--accent); }
   .hidden { display: none; }
+  .engine-params {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+  .est-pill {
+    font-size: 0.76rem;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: #0d1322;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .fairness-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: #0d1322;
+    border: 1px solid var(--border);
+    margin-bottom: 14px;
+    font-size: 0.82rem;
+  }
 </style>
 </head>
 <body>
 <header>
-  <div class="brand">⚡ Pure-Rust AlphaZero Lab, Multi-Engine Arena & Inspector</div>
+  <div class="title-block">
+    <h1>🦀 Pure-Rust AlphaZero Lab, Calibrated Arena & Inspector</h1>
+    <p>Interactive Training Control • Tic-Tac-Toe & Ultimate Tic-Tac-Toe • Equal-Compute Match Calibration</p>
+  </div>
+  <div class="game-switcher">
+    <button id="game-btn-ttt" class="game-btn active" onclick="switchActiveGame('ttt')">🎯 Tic-Tac-Toe (3x3)</button>
+    <button id="game-btn-uttt" class="game-btn" onclick="switchActiveGame('uttt')">⚔️ Ultimate Tic-Tac-Toe (9x9)</button>
+  </div>
   <div class="badges">
     <span class="badge" id="device-badge">Device: ...</span>
-    <span class="badge" id="phase-badge">Phase: ...</span>
-    <span class="badge" id="iter-badge">Iteration: 0 / 0</span>
+    <span class="badge paused" id="phase-badge">Phase: Idle</span>
+    <span class="badge" id="iter-badge">Iter: 0 / 0</span>
   </div>
 </header>
 
 <div class="tabs">
-  <button class="tab-btn active" onclick="switchTab('lab', this)">📊 Live Training & System Lab</button>
-  <button class="tab-btn" onclick="switchTab('arena', this)">⚔️ Multi-Match Arena & NN Models</button>
-  <button class="tab-btn" onclick="switchTab('play', this)">🎮 Interactive Play & MCTS/NN Inspector</button>
+  <button class="tab-btn active" id="tab-btn-lab" onclick="switchTab('lab')">📊 Live Training & System Lab</button>
+  <button class="tab-btn" id="tab-btn-arena" onclick="switchTab('arena')">⚔️ Multi-Match Arena & Compute Calibrator</button>
+  <button class="tab-btn" id="tab-btn-play" onclick="switchTab('play')">🎮 3x3 Play & MCTS/NN Inspector</button>
 </div>
 
-<!-- TAB 1: LIVE TRAINING & SYSTEM LAB -->
-<div class="container" id="tab-lab">
-  <div class="grid-4">
-    <div class="card">
-      <h3>5. System Batch Fill & Dedup</h3>
-      <div class="metric-val" id="m-batch">--</div>
-      <div class="metric-sub" id="m-batch-sub">Unique batch & deduplication savings</div>
+<!-- TAB 1: TRAINING & SYSTEM LAB -->
+<div id="tab-lab">
+  <!-- Interactive Training Lifecycle Bar -->
+  <div class="train-control-bar">
+    <div class="train-btn-group">
+      <button class="btn green" id="btn-start-train" onclick="sendTrainControl('start')">▶ Start / Resume Training</button>
+      <button class="btn amber" id="btn-pause-train" onclick="sendTrainControl('pause')">⏸ Pause</button>
+      <button class="btn secondary" id="btn-step-train" onclick="sendTrainControl('step')">⏭ Step (+1 Iter)</button>
+      <button class="btn secondary" onclick="snapshotLiveModel()">📸 Save Snapshot Now</button>
+      <button class="btn danger" onclick="confirmResetTraining()">🔄 Reset to Untrained</button>
     </div>
-    <div class="card">
-      <h3>Search & NN Throughput</h3>
-      <div class="metric-val" id="m-speed">--</div>
-      <div class="metric-sub" id="m-speed-sub">Latency: -- µs / state</div>
-    </div>
-    <div class="card">
-      <h3>2 & 3. Policy KL & Root Entropy</h3>
-      <div class="metric-val" id="m-kl">--</div>
-      <div class="metric-sub" id="m-entropy-sub">Root Visit Entropy H(π): -- nats</div>
-    </div>
-    <div class="card">
-      <h3>1. Arena vs Optimal Minimax(d=5)</h3>
-      <div class="metric-val" id="m-arena">--</div>
-      <div class="metric-sub" id="m-arena-sub">vs Random: -- | vs MM(d=2): --</div>
+    <div class="train-btn-group" style="font-size:0.8rem; color:var(--muted);">
+      <label>Target Iters:
+        <input type="number" id="ctrl-total-iters" value="15" min="1" max="5000" style="width:65px; background:var(--bg); color:var(--text); border:1px solid var(--border); padding:4px 6px; border-radius:4px;" onchange="updateTrainTargets()">
+      </label>
+      <label>Auto-Save Every:
+        <input type="number" id="ctrl-autosave" value="5" min="0" max="500" style="width:55px; background:var(--bg); color:var(--text); border:1px solid var(--border); padding:4px 6px; border-radius:4px;" onchange="updateTrainTargets()"> iters (0=off)
+      </label>
     </div>
   </div>
 
-  <div class="grid-2">
+  <div class="grid">
     <div class="card">
-      <h3>1. Arena Win + Draw Rate (%) vs Fixed Baselines (100% = Never Loses)</h3>
-      <canvas id="chart-arena" width="600" height="220"></canvas>
+      <h2>
+        <span>1. Arena Win + 0.5×Draw Rate (%)</span>
+        <span id="latest-wdl" style="font-size:0.78rem;color:var(--green)">—</span>
+      </h2>
+      <p class="hint" id="arena-chart-hint">True playing strength vs Random & Minimax baselines.</p>
+      <canvas id="chart-arena" width="600" height="205"></canvas>
+      <div class="legend">
+        <span style="color:#34d399">vs Random</span>
+        <span style="color:#38bdf8" id="legend-mm-mid">vs Minimax(d=2)</span>
+        <span style="color:#fbbf24" id="legend-mm-strong">vs Minimax(d=5)</span>
+      </div>
     </div>
+
     <div class="card">
-      <h3>2 & 3. Policy KL-Divergence KL(π||p) [Green→0] & Root Entropy H(π) [Blue]</h3>
-      <canvas id="chart-policy" width="600" height="220"></canvas>
+      <h2>
+        <span>2. Policy KL Divergence & Root Entropy</span>
+        <span id="latest-kl" style="font-size:0.78rem;color:var(--accent)">—</span>
+      </h2>
+      <p class="hint">KL(π_MCTS || p_NN) has a true 0.0 floor. Root Entropy H(π) tracks exploration sharpness.</p>
+      <canvas id="chart-policy" width="600" height="205"></canvas>
+      <div class="legend">
+        <span style="color:#38bdf8">Policy KL (→ 0)</span>
+        <span style="color:#a78bfa">Root MCTS Entropy H(π)</span>
+        <span style="color:#fb7185">Total Loss</span>
+      </div>
     </div>
+
     <div class="card">
-      <h3>4. Value MSE Loss [Amber] & Total Loss [Purple]</h3>
-      <canvas id="chart-loss" width="600" height="220"></canvas>
+      <h2>
+        <span>3. Value MSE & Game Length (Moves)</span>
+        <span id="latest-val" style="font-size:0.78rem;color:var(--rose)">—</span>
+      </h2>
+      <p class="hint">Value MSE < 0.05 prevents premature collapse; rising game length shows deeper defense.</p>
+      <canvas id="chart-value" width="600" height="205"></canvas>
+      <div class="legend">
+        <span style="color:#fb7185">Value MSE (left)</span>
+        <span style="color:#34d399">Avg Game Moves / 10 (right)</span>
+      </div>
     </div>
+
     <div class="card">
-      <h3>5. System Pipeline: Logical Batch [Cyan] vs Unique NN Batch [Green]</h3>
-      <canvas id="chart-system" width="600" height="220"></canvas>
+      <h2>
+        <span>4. System Queue, Batch Fill & Intra-Batch Dedup</span>
+        <span id="latest-sys" style="font-size:0.78rem;color:var(--amber)">—</span>
+      </h2>
+      <p class="hint">Logical batch vs Unique NN evaluations after intra-batch state deduplication.</p>
+      <canvas id="chart-sys" width="600" height="205"></canvas>
+      <div class="legend">
+        <span style="color:#fbbf24">Logical Batch</span>
+        <span style="color:#a78bfa">Unique NN Batch</span>
+        <span style="color:#38bdf8">Dedup Saved (%)</span>
+      </div>
     </div>
   </div>
 
-  <div class="card" style="margin-bottom: 18px;">
-    <h3>🎛️ Live Training Knobs (Applied on Next Iteration)</h3>
+  <div class="card" style="margin-top:14px;">
+    <h2>
+      <span>🎛️ Live Hyperparameter Knobs (<span id="knobs-game-label">Tic-Tac-Toe</span> — Applied on Next Iteration)</span>
+      <button class="btn" onclick="pushKnobs()">Apply Knobs</button>
+    </h2>
     <div class="knobs-grid">
-      <div>
-        <label>Games / Iteration</label>
-        <input type="number" id="k-games" value="128" min="8" max="2048" step="16">
+      <div class="knob-item">
+        <label>Self-Play Games / Iter</label>
+        <input type="number" id="k-games" min="4" max="2048" step="4" value="128">
       </div>
-      <div>
-        <label>Simulations / Move</label>
-        <input type="number" id="k-sims" value="64" min="8" max="1000" step="8">
+      <div class="knob-item">
+        <label>MCTS Sims / Move</label>
+        <input type="number" id="k-sims" min="4" max="1000" step="4" value="80">
       </div>
-      <div>
+      <div class="knob-item">
         <label>SGD Steps / Iter</label>
-        <input type="number" id="k-steps" value="60" min="5" max="500" step="5">
+        <input type="number" id="k-steps" min="1" max="500" step="5" value="28">
       </div>
-      <div>
-        <label>SGD Batch Size</label>
-        <input type="number" id="k-batch" value="64" min="16" max="512" step="16">
+      <div class="knob-item">
+        <label>SGD Mini-Batch Size</label>
+        <input type="number" id="k-batch" min="16" max="512" step="16" value="64">
       </div>
-      <div>
-        <label>Learning Rate</label>
-        <input type="number" id="k-lr" value="0.002" step="0.0005">
+      <div class="knob-item">
+        <label>Learning Rate (AdamW)</label>
+        <input type="number" id="k-lr" min="0.00001" max="0.05" step="0.0005" value="0.0015">
       </div>
-      <div>
-        <label>Dirichlet ε</label>
-        <input type="number" id="k-eps" value="0.25" min="0" max="1" step="0.05">
+      <div class="knob-item">
+        <label>Root Dirichlet ε</label>
+        <input type="number" id="k-eps" min="0.0" max="0.75" step="0.05" value="0.25">
       </div>
-      <div>
+      <div class="knob-item">
         <label>PUCT c_init</label>
-        <input type="number" id="k-cinit" value="1.25" min="0.1" max="5" step="0.05">
+        <input type="number" id="k-cinit" min="0.2" max="5.0" step="0.05" value="1.25">
       </div>
-      <div style="display:flex; gap:8px;">
-        <button class="btn" onclick="submitKnobs(null)">Apply Knobs</button>
-        <button class="btn" id="pause-btn" onclick="togglePause()">Pause</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>📋 Iteration Telemetry Log</h3>
-    <div style="overflow-x:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Iter</th>
-            <th>Total Loss</th>
-            <th>Policy CE</th>
-            <th>Policy KL</th>
-            <th>Value MSE</th>
-            <th>Root H(π)</th>
-            <th>Avg Moves</th>
-            <th>vs Random</th>
-            <th>vs MM(d=2)</th>
-            <th>vs MM(d=5)</th>
-            <th>Batch (Log / Uniq)</th>
-            <th>Dedup %</th>
-            <th>Sims/s</th>
-            <th>SP / SGD / Eval (ms)</th>
-          </tr>
-        </thead>
-        <tbody id="log-tbody"></tbody>
-      </table>
     </div>
   </div>
 </div>
 
-<!-- TAB 2: MULTI-MATCH ARENA & NN MODEL MANAGER -->
-<div class="container hidden" id="tab-arena">
-  <!-- NN Model Manager -->
-  <div class="card" style="margin-bottom: 18px;">
-    <h3>🧠 Trained Neural Network Registry & Checkpoint Manager</h3>
-    <div style="display:flex; gap:12px; align-items:end; flex-wrap:wrap; margin-bottom:14px;">
-      <div style="min-width:260px;">
-        <label>Save Current Live NN Checkpoint As (.safetensors)</label>
-        <input type="text" id="model-save-name" value="ttt_checkpoint.safetensors" placeholder="e.g. ttt_iter15.safetensors">
+<!-- TAB 2: MULTI-MATCH ARENA, NN MODELS & COMPUTE CALIBRATOR -->
+<div id="tab-arena" class="hidden">
+  <!-- NN Checkpoint Manager -->
+  <div class="card" style="margin-bottom:14px;">
+    <h2>
+      <span>🧠 Trained Neural Network Checkpoints (<span id="models-game-label">Tic-Tac-Toe</span>)</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input type="text" id="save-model-name" placeholder="e.g. iter_010" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:5px 9px;border-radius:4px;font-family:inherit;font-size:0.8rem;width:180px;">
+        <button class="btn" onclick="saveLiveModel()">💾 Save Live Model</button>
+        <button class="btn secondary" onclick="snapshotLiveModel()">📸 Quick Snapshot</button>
       </div>
-      <button class="btn btn-green" onclick="saveLiveModel()">💾 Save Live Model</button>
-      <button class="btn" onclick="pollState()">🔄 Refresh Models</button>
-      <span id="model-msg" style="font-size:13px; color:var(--accent);"></span>
-    </div>
+    </h2>
+    <p class="hint">Checkpoints are scoped per game (<code>ttt_*.safetensors</code> and <code>uttt_*.safetensors</code>). Select any saved checkpoint in Engine A or Engine B below to compare training stages.</p>
     <table>
       <thead>
         <tr>
-          <th class="left">Model ID</th>
-          <th class="left">Type</th>
-          <th>File Size</th>
-          <th class="left">Description</th>
+          <th>Model ID</th>
+          <th>Kind</th>
+          <th>Size</th>
+          <th>Description</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -1812,863 +3101,1168 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </table>
   </div>
 
-  <!-- Engine A vs Engine B Configurator -->
-  <div class="grid-2">
-    <!-- Engine A -->
+  <!-- Compute & Thinking-Time Calibration Panel -->
+  <div class="card" style="margin-bottom:14px;">
+    <h2>
+      <span>⏱️ Compute & Thinking-Time Calibrator (<span id="cal-game-label">Tic-Tac-Toe</span>)</span>
+      <button class="btn green" id="btn-calibrate" onclick="runCalibration()">⚡ Measure Hardware Speed & Calibrate</button>
+    </h2>
+    <p class="hint">Measures actual microsecond speeds on this machine for <b>AlphaZero</b>, <b>MCTS</b>, <b>Tree-Minimax</b>, and <b>Recursive Minimax</b> so you can pit algorithms against each other at equal thinking time per move.</p>
+    <div id="cal-metrics-bar" style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; font-size:0.78rem; color:var(--muted);">
+      <span class="badge">Click "⚡ Measure Hardware Speed & Calibrate" to benchmark this machine</span>
+    </div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; padding-top:8px; border-top:1px solid var(--border);">
+      <label style="font-size:0.8rem; color:var(--muted);">
+        Target Thinking Time / Move (ms):
+        <input type="number" id="cal-target-ms" value="2.0" min="0.05" max="1000" step="0.5" style="width:80px; background:var(--bg); color:var(--text); border:1px solid var(--border); padding:5px 7px; border-radius:4px; margin-left:4px;">
+      </label>
+      <div style="display:flex; gap:5px; flex-wrap:wrap;">
+        <button class="btn secondary" style="padding:4px 8px;font-size:0.74rem;" onclick="setTargetMs(0.5)">0.5 ms</button>
+        <button class="btn secondary" style="padding:4px 8px;font-size:0.74rem;" onclick="setTargetMs(1.0)">1.0 ms</button>
+        <button class="btn secondary" style="padding:4px 8px;font-size:0.74rem;" onclick="setTargetMs(2.5)">2.5 ms</button>
+        <button class="btn secondary" style="padding:4px 8px;font-size:0.74rem;" onclick="setTargetMs(5.0)">5.0 ms</button>
+        <button class="btn secondary" style="padding:4px 8px;font-size:0.74rem;" onclick="setTargetMs(15.0)">15 ms</button>
+      </div>
+      <button class="btn" onclick="calibrateBothToTarget()">⚖️ Calibrate Both Engines to Target Time</button>
+      <button class="btn secondary" onclick="matchEngineTime('b_to_a')">🔗 Match B → Engine A's Time</button>
+      <button class="btn secondary" onclick="matchEngineTime('a_to_b')">🔗 Match A → Engine B's Time</button>
+    </div>
+  </div>
+
+  <!-- Fairness Live Banner -->
+  <div class="fairness-banner" id="fairness-banner">
+    <span id="fairness-summary">⚖️ Configure Engine A and Engine B below. Estimated thinking time per move updates live.</span>
+    <span id="fairness-ratio-badge" class="badge">Ratio: —</span>
+  </div>
+
+  <!-- Engine A vs Engine B Configuration -->
+  <div class="grid" style="margin-bottom:14px;">
+    <!-- ENGINE A -->
     <div class="card">
-      <h3 style="color:var(--green);">🟢 Player A Engine Configuration</h3>
-      <div class="knobs-grid" style="margin-bottom:12px;">
-        <div style="grid-column: span 2;">
-          <label>Engine Type</label>
-          <select id="a-engine" onchange="updateEngineFields('a')">
-            <option value="alphazero" selected>AlphaZero (Neural Network + PUCT)</option>
-            <option value="mcts">MCTS (Classical UCT + Random Playouts)</option>
-            <option value="tree-minimax">Tree-Minimax (Persistent Tree + Iterative Deepening)</option>
-            <option value="minimax">Minimax (Stateless Alpha-Beta)</option>
-            <option value="random">Random (Uniform Baseline)</option>
-          </select>
-        </div>
+      <h2>
+        <span style="color:var(--accent)">🅰️ Engine A Configuration</span>
+        <span class="est-pill" id="a-est-pill">Est: — µs/move</span>
+      </h2>
+      <div class="knob-item">
+        <label>Engine Type</label>
+        <select id="a-engine" onchange="updateEngineForm('a')">
+          <option value="alphazero" selected>AlphaZero (MCTS + Neural Network)</option>
+          <option value="mcts">Classical MCTS (Random Rollouts)</option>
+          <option value="tree-minimax">Tree-Minimax (Arena Subtree Reuse)</option>
+          <option value="minimax">Recursive Minimax (Alpha-Beta)</option>
+          <option value="random">Random Player (Baseline)</option>
+        </select>
       </div>
 
-      <div id="a-params-az" class="knobs-grid">
-        <div style="grid-column: span 2;">
+      <div id="a-params-az" class="engine-params knobs-grid">
+        <div class="knob-item">
           <label>Neural Network Model</label>
-          <select id="a-model" class="model-select"></select>
+          <select id="a-az-model" class="model-select" onchange="updateEstimatedTimes()"></select>
         </div>
-        <div>
-          <label>Sims / Tree</label>
-          <input type="number" id="a-az-sims" value="80" min="1" max="5000">
+        <div class="knob-item">
+          <label>Simulations / Tree</label>
+          <input type="number" id="a-az-sims" value="64" min="1" max="10000" step="8" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Root Trees (K)</label>
-          <input type="number" id="a-az-trees" value="1" min="1" max="64">
+        <div class="knob-item">
+          <label>Root-Parallel Trees (K)</label>
+          <input type="number" id="a-az-trees" value="1" min="1" max="64" oninput="updateEstimatedTimes()">
         </div>
-        <div>
+        <div class="knob-item">
           <label>PUCT c_init</label>
-          <input type="number" id="a-c-init" value="1.25" step="0.05">
+          <input type="number" id="a-az-cinit" value="1.25" min="0.1" max="10.0" step="0.05">
         </div>
-        <div>
-          <label>PUCT c_base</label>
-          <input type="number" id="a-c-base" value="19652" step="500">
+        <div class="knob-item">
+          <label>Root Dirichlet ε</label>
+          <input type="number" id="a-az-eps" value="0.0" min="0.0" max="0.75" step="0.05">
         </div>
-        <div>
-          <label>Dirichlet α</label>
-          <input type="number" id="a-dir-alpha" value="0.30" step="0.05">
-        </div>
-        <div>
-          <label>Dirichlet ε (Noise)</label>
-          <input type="number" id="a-dir-eps" value="0.00" step="0.05">
-        </div>
-        <div>
-          <label>Opening Plies</label>
-          <input type="number" id="a-az-open" value="0" min="0" max="9">
+        <div class="knob-item">
+          <label>Opening Moves (Temp)</label>
+          <input type="number" id="a-az-open" value="0" min="0" max="20">
         </div>
       </div>
 
-      <div id="a-params-mcts" class="knobs-grid hidden">
-        <div>
-          <label>Sims / Tree</label>
-          <input type="number" id="a-mcts-sims" value="200" min="1" max="10000">
+      <div id="a-params-mcts" class="engine-params knobs-grid hidden">
+        <div class="knob-item">
+          <label>Playout Sims / Tree</label>
+          <input type="number" id="a-mcts-sims" value="200" min="1" max="50000" step="20" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Root Trees (K)</label>
-          <input type="number" id="a-mcts-trees" value="1" min="1" max="64">
+        <div class="knob-item">
+          <label>Root-Parallel Trees (K)</label>
+          <input type="number" id="a-mcts-trees" value="1" min="1" max="64" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>UCT Exploration c</label>
-          <input type="number" id="a-c-uct" value="1.414" step="0.1">
+        <div class="knob-item">
+          <label>UCT Constant (c)</label>
+          <input type="number" id="a-mcts-c" value="1.414" min="0.1" max="5.0" step="0.1">
         </div>
-        <div>
-          <label>Opening Plies</label>
-          <input type="number" id="a-mcts-open" value="0" min="0" max="9">
+        <div class="knob-item">
+          <label>Opening Moves</label>
+          <input type="number" id="a-mcts-open" value="0" min="0" max="20">
         </div>
       </div>
 
-      <div id="a-params-tmm" class="knobs-grid hidden">
-        <div>
+      <div id="a-params-tm" class="engine-params knobs-grid hidden">
+        <div class="knob-item">
           <label>Budget Mode</label>
-          <select id="a-budget-kind">
-            <option value="depth" selected>Fixed Depth (0..9)</option>
-            <option value="evals">Max Node Evaluations</option>
-            <option value="ms">Max Time (ms / move)</option>
+          <select id="a-tm-kind" onchange="updateEstimatedTimes()">
+            <option value="evals" selected>Max Leaf Evaluations</option>
+            <option value="depth">Fixed Depth (Plies)</option>
+            <option value="ms">Time Limit (ms / move)</option>
           </select>
         </div>
-        <div>
-          <label>Budget Value</label>
-          <input type="number" id="a-budget-val" value="4" min="0" max="500000">
+        <div class="knob-item">
+          <label>Budget Value (Evals / Depth / ms)</label>
+          <input type="number" id="a-tm-val" value="250" min="1" max="100000" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Leaf Heuristic</label>
-          <select id="a-tmm-heur">
-            <option value="true" selected>TttHeuristic (Line threat score)</option>
-            <option value="false">ZeroHeuristic (Terminal only)</option>
+        <div class="knob-item">
+          <label>Heuristic Evaluation</label>
+          <select id="a-tm-heur">
+            <option value="true" selected>Enabled (Board Heuristic)</option>
+            <option value="false">Disabled (Terminal Only)</option>
           </select>
         </div>
-        <div>
-          <label>Arena Capacity</label>
-          <input type="number" id="a-arena-cap" value="4096" min="64" max="500000">
+        <div class="knob-item">
+          <label>Arena Capacity (Nodes)</label>
+          <input type="number" id="a-tm-cap" value="16384" min="256" max="500000" step="1024">
         </div>
       </div>
 
-      <div id="a-params-mm" class="knobs-grid hidden">
-        <div>
-          <label>Search Depth (0=1ply, 5=optimal)</label>
-          <input type="number" id="a-depth" value="2" min="0" max="9">
+      <div id="a-params-mm" class="engine-params knobs-grid hidden">
+        <div class="knob-item">
+          <label>Search Depth (Plies)</label>
+          <input type="number" id="a-mm-depth" value="2" min="1" max="9" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Leaf Heuristic</label>
+        <div class="knob-item">
+          <label>Heuristic Evaluation</label>
           <select id="a-mm-heur">
-            <option value="true" selected>TttHeuristic (Line threat score)</option>
-            <option value="false">ZeroHeuristic (Terminal only)</option>
+            <option value="true" selected>Enabled (Board Heuristic)</option>
+            <option value="false">Disabled (Terminal Only)</option>
           </select>
         </div>
       </div>
     </div>
 
-    <!-- Engine B -->
+    <!-- ENGINE B -->
     <div class="card">
-      <h3 style="color:var(--amber);">🟠 Player B Engine Configuration</h3>
-      <div class="knobs-grid" style="margin-bottom:12px;">
-        <div style="grid-column: span 2;">
-          <label>Engine Type</label>
-          <select id="b-engine" onchange="updateEngineFields('b')">
-            <option value="alphazero">AlphaZero (Neural Network + PUCT)</option>
-            <option value="mcts" selected>MCTS (Classical UCT + Random Playouts)</option>
-            <option value="tree-minimax">Tree-Minimax (Persistent Tree + Iterative Deepening)</option>
-            <option value="minimax">Minimax (Stateless Alpha-Beta)</option>
-            <option value="random">Random (Uniform Baseline)</option>
-          </select>
-        </div>
+      <h2>
+        <span style="color:var(--rose)">🅱️ Engine B Configuration</span>
+        <span class="est-pill" id="b-est-pill">Est: — µs/move</span>
+      </h2>
+      <div class="knob-item">
+        <label>Engine Type</label>
+        <select id="b-engine" onchange="updateEngineForm('b')">
+          <option value="alphazero">AlphaZero (MCTS + Neural Network)</option>
+          <option value="mcts" selected>Classical MCTS (Random Rollouts)</option>
+          <option value="tree-minimax">Tree-Minimax (Arena Subtree Reuse)</option>
+          <option value="minimax">Recursive Minimax (Alpha-Beta)</option>
+          <option value="random">Random Player (Baseline)</option>
+        </select>
       </div>
 
-      <div id="b-params-az" class="knobs-grid hidden">
-        <div style="grid-column: span 2;">
+      <div id="b-params-az" class="engine-params knobs-grid hidden">
+        <div class="knob-item">
           <label>Neural Network Model</label>
-          <select id="b-model" class="model-select"></select>
+          <select id="b-az-model" class="model-select" onchange="updateEstimatedTimes()"></select>
         </div>
-        <div>
-          <label>Sims / Tree</label>
-          <input type="number" id="b-az-sims" value="80" min="1" max="5000">
+        <div class="knob-item">
+          <label>Simulations / Tree</label>
+          <input type="number" id="b-az-sims" value="64" min="1" max="10000" step="8" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Root Trees (K)</label>
-          <input type="number" id="b-az-trees" value="1" min="1" max="64">
+        <div class="knob-item">
+          <label>Root-Parallel Trees (K)</label>
+          <input type="number" id="b-az-trees" value="1" min="1" max="64" oninput="updateEstimatedTimes()">
         </div>
-        <div>
+        <div class="knob-item">
           <label>PUCT c_init</label>
-          <input type="number" id="b-c-init" value="1.25" step="0.05">
+          <input type="number" id="b-az-cinit" value="1.25" min="0.1" max="10.0" step="0.05">
         </div>
-        <div>
-          <label>PUCT c_base</label>
-          <input type="number" id="b-c-base" value="19652" step="500">
+        <div class="knob-item">
+          <label>Root Dirichlet ε</label>
+          <input type="number" id="b-az-eps" value="0.0" min="0.0" max="0.75" step="0.05">
         </div>
-        <div>
-          <label>Dirichlet α</label>
-          <input type="number" id="b-dir-alpha" value="0.30" step="0.05">
-        </div>
-        <div>
-          <label>Dirichlet ε (Noise)</label>
-          <input type="number" id="b-dir-eps" value="0.00" step="0.05">
-        </div>
-        <div>
-          <label>Opening Plies</label>
-          <input type="number" id="b-az-open" value="0" min="0" max="9">
+        <div class="knob-item">
+          <label>Opening Moves (Temp)</label>
+          <input type="number" id="b-az-open" value="0" min="0" max="20">
         </div>
       </div>
 
-      <div id="b-params-mcts" class="knobs-grid">
-        <div>
-          <label>Sims / Tree</label>
-          <input type="number" id="b-mcts-sims" value="200" min="1" max="10000">
+      <div id="b-params-mcts" class="engine-params knobs-grid">
+        <div class="knob-item">
+          <label>Playout Sims / Tree</label>
+          <input type="number" id="b-mcts-sims" value="200" min="1" max="50000" step="20" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Root Trees (K)</label>
-          <input type="number" id="b-mcts-trees" value="1" min="1" max="64">
+        <div class="knob-item">
+          <label>Root-Parallel Trees (K)</label>
+          <input type="number" id="b-mcts-trees" value="1" min="1" max="64" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>UCT Exploration c</label>
-          <input type="number" id="b-c-uct" value="1.414" step="0.1">
+        <div class="knob-item">
+          <label>UCT Constant (c)</label>
+          <input type="number" id="b-mcts-c" value="1.414" min="0.1" max="5.0" step="0.1">
         </div>
-        <div>
-          <label>Opening Plies</label>
-          <input type="number" id="b-mcts-open" value="0" min="0" max="9">
+        <div class="knob-item">
+          <label>Opening Moves</label>
+          <input type="number" id="b-mcts-open" value="0" min="0" max="20">
         </div>
       </div>
 
-      <div id="b-params-tmm" class="knobs-grid hidden">
-        <div>
+      <div id="b-params-tm" class="engine-params knobs-grid hidden">
+        <div class="knob-item">
           <label>Budget Mode</label>
-          <select id="b-budget-kind">
-            <option value="depth" selected>Fixed Depth (0..9)</option>
-            <option value="evals">Max Node Evaluations</option>
-            <option value="ms">Max Time (ms / move)</option>
+          <select id="b-tm-kind" onchange="updateEstimatedTimes()">
+            <option value="evals" selected>Max Leaf Evaluations</option>
+            <option value="depth">Fixed Depth (Plies)</option>
+            <option value="ms">Time Limit (ms / move)</option>
           </select>
         </div>
-        <div>
-          <label>Budget Value</label>
-          <input type="number" id="b-budget-val" value="4" min="0" max="500000">
+        <div class="knob-item">
+          <label>Budget Value (Evals / Depth / ms)</label>
+          <input type="number" id="b-tm-val" value="250" min="1" max="100000" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Leaf Heuristic</label>
-          <select id="b-tmm-heur">
-            <option value="true" selected>TttHeuristic (Line threat score)</option>
-            <option value="false">ZeroHeuristic (Terminal only)</option>
+        <div class="knob-item">
+          <label>Heuristic Evaluation</label>
+          <select id="b-tm-heur">
+            <option value="true" selected>Enabled (Board Heuristic)</option>
+            <option value="false">Disabled (Terminal Only)</option>
           </select>
         </div>
-        <div>
-          <label>Arena Capacity</label>
-          <input type="number" id="b-arena-cap" value="4096" min="64" max="500000">
+        <div class="knob-item">
+          <label>Arena Capacity (Nodes)</label>
+          <input type="number" id="b-tm-cap" value="16384" min="256" max="500000" step="1024">
         </div>
       </div>
 
-      <div id="b-params-mm" class="knobs-grid hidden">
-        <div>
-          <label>Search Depth (0=1ply, 5=optimal)</label>
-          <input type="number" id="b-depth" value="2" min="0" max="9">
+      <div id="b-params-mm" class="engine-params knobs-grid hidden">
+        <div class="knob-item">
+          <label>Search Depth (Plies)</label>
+          <input type="number" id="b-mm-depth" value="2" min="1" max="9" oninput="updateEstimatedTimes()">
         </div>
-        <div>
-          <label>Leaf Heuristic</label>
+        <div class="knob-item">
+          <label>Heuristic Evaluation</label>
           <select id="b-mm-heur">
-            <option value="true" selected>TttHeuristic (Line threat score)</option>
-            <option value="false">ZeroHeuristic (Terminal only)</option>
+            <option value="true" selected>Enabled (Board Heuristic)</option>
+            <option value="false">Disabled (Terminal Only)</option>
           </select>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- Match Execution Bar -->
-  <div class="card" style="margin-bottom: 18px;">
-    <h3>🏁 Multi-Match Execution Settings (Role-Swapped 50% X / 50% O)</h3>
-    <div class="knobs-grid">
-      <div>
-        <label>Total Games</label>
-        <input type="number" id="m-num-games" value="100" min="2" max="2000" step="10">
+  <!-- Match Controls & Latest Result -->
+  <div class="card" style="margin-bottom:14px;">
+    <h2>
+      <span>🏁 Run Multi-Match Tournament (<span id="match-game-label">Tic-Tac-Toe</span> — Role-Swapped 50% X / 50% O)</span>
+      <button class="btn" id="run-match-btn" onclick="runArenaMatch()">⚔️ Start Multi-Match</button>
+    </h2>
+    <div class="knobs-grid" style="margin-bottom:12px;">
+      <div class="knob-item">
+        <label>Total Games (Role-Swapped)</label>
+        <input type="number" id="m-games" value="40" min="2" max="2000" step="10">
       </div>
-      <div>
-        <label>Parallel Worker Threads</label>
-        <input type="number" id="m-workers" value="4" min="1" max="16">
+      <div class="knob-item">
+        <label>Worker Threads</label>
+        <input type="number" id="m-workers" value="4" min="1" max="32">
       </div>
-      <div>
+      <div class="knob-item">
         <label>NN Max Batch Size</label>
-        <input type="number" id="m-batch-cap" value="32" min="1" max="256">
+        <input type="number" id="m-batch" value="32" min="1" max="256">
       </div>
-      <div>
-        <label>Random Seed</label>
-        <input type="number" id="m-seed" value="2026" min="1">
-      </div>
-      <div>
-        <button class="btn btn-green" id="run-match-btn" onclick="runArenaMatch()" style="width:100%;">⚔️ Start Multi-Match</button>
+      <div class="knob-item">
+        <label>Deterministic Seed</label>
+        <input type="number" id="m-seed" value="2026" min="1" max="999999">
       </div>
     </div>
-
-    <div id="match-latest-box" class="hidden" style="margin-top:16px; padding-top:14px; border-top:1px solid var(--panel-border);">
-      <div style="display:flex; justify-content:space-between; font-size:14px; font-weight:700;">
-        <span id="match-title-a" style="color:var(--green);">Player A</span>
-        <span id="match-summary-mid" style="color:var(--accent);">--</span>
-        <span id="match-title-b" style="color:var(--amber);">Player B</span>
-      </div>
-      <div class="wdl-bar" id="match-wdl-bar"></div>
-      <div style="font-size:12px; color:var(--muted);" id="match-perf-sub"></div>
+    <div id="latest-match-banner" style="padding:10px 12px; background:var(--panel-alt); border:1px solid var(--border); border-radius:6px; font-size:0.84rem; color:var(--muted);">
+      Configure Engine A and Engine B above and click <b>⚔️ Start Multi-Match</b>.
     </div>
   </div>
 
   <!-- Match History Table -->
   <div class="card">
-    <h3>🏆 Multi-Match Benchmark History</h3>
-    <div style="overflow-x:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th class="left">Player A</th>
-            <th class="left">Player B</th>
-            <th>Games</th>
-            <th>A Wins</th>
-            <th>Draws</th>
-            <th>B Wins</th>
-            <th>A Score %</th>
-            <th>Avg Moves</th>
-            <th>NN Batch (Log→Uniq)</th>
-            <th>Dedup Saved</th>
-            <th>Games/s (ms)</th>
-          </tr>
-        </thead>
-        <tbody id="matches-tbody"></tbody>
-      </table>
-    </div>
+    <h2><span>📜 Multi-Match Tournament History (<span id="hist-game-label">Tic-Tac-Toe</span>)</span></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Engine A vs Engine B</th>
+          <th>Games</th>
+          <th>A Wins / Draws / B Wins</th>
+          <th>A Score %</th>
+          <th>Actual Compute (A vs B µs/mv)</th>
+          <th>Speed</th>
+          <th>NN Batch (Unique / Dedup%)</th>
+        </tr>
+      </thead>
+      <tbody id="matches-tbody"></tbody>
+    </table>
   </div>
 </div>
 
 <!-- TAB 3: INTERACTIVE PLAY & MCTS/NN INSPECTOR -->
-<div class="container hidden" id="tab-play">
+<div id="tab-play" class="hidden">
   <div class="play-layout">
     <div class="card">
-      <h3>🎮 Interactive Board & Neural/MCTS Overlay</h3>
-      <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
-        <button class="btn" onclick="resetBoard()">Reset Empty</button>
-        <button class="btn" onclick="stepAiMove()">🤖 Play Best AI Move</button>
-        <label style="display:flex; align-items:center; gap:6px; margin:0;">
-          <input type="checkbox" id="auto-ai" checked> Auto-Reply as AI
+      <h2>
+        <span>Tic-Tac-Toe Board</span>
+        <span id="game-status-text" style="font-size:0.8rem;color:var(--green)">Your Turn (X)</span>
+      </h2>
+      <p class="hint">Click a square to play or inspect. Toggle "Auto-Play AI" to let AlphaZero reply automatically.</p>
+      <div class="board" id="ttt-board"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+        <button class="btn" onclick="resetBoard()">Reset Board</button>
+        <button class="btn secondary" onclick="stepAiMove()">Let AI Play Best Move</button>
+      </div>
+      <div style="margin-top:12px; display:grid; grid-template-columns: 1fr 1fr; gap:8px; font-size:0.78rem; color:var(--muted);">
+        <label style="grid-column: span 2;">
+          Inspect TTT NN Model:
+          <select id="play-model" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px;border-radius:4px;margin-top:2px;" onchange="inspectCurrentBoard()"></select>
+        </label>
+        <label>
+          Total MCTS Sims:
+          <input type="number" id="play-sims" value="160" min="8" max="2000" step="16" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px;border-radius:4px;" onchange="inspectCurrentBoard()">
+        </label>
+        <label>
+          Root-Parallel Trees:
+          <input type="number" id="play-trees" value="4" min="1" max="32" style="width:100%;background:var(--bg);color:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px;border-radius:4px;" onchange="inspectCurrentBoard()">
+        </label>
+        <label>
+          PUCT c_init:
+          <input type="number" id="play-cinit" value="1.25" min="0.1" max="5.0" step="0.05" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px;border-radius:4px;" onchange="inspectCurrentBoard()">
+        </label>
+        <label>
+          Root Dirichlet ε:
+          <input type="number" id="play-eps" value="0.0" min="0.0" max="0.75" step="0.05" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:4px;border-radius:4px;" onchange="inspectCurrentBoard()">
+        </label>
+        <label style="grid-column: span 2; margin-top:4px;">
+          <input type="checkbox" id="auto-ai" checked> Auto-reply with AI move
         </label>
       </div>
-      <div class="knobs-grid" style="margin-bottom:10px;">
-        <div style="grid-column: span 2;">
-          <label>Inspect Neural Network Model</label>
-          <select id="insp-model" class="model-select" onchange="inspectBoard()"></select>
-        </div>
-        <div>
-          <label>Total Sims</label>
-          <input type="number" id="insp-sims" value="160" min="8" max="2000" step="16" onchange="inspectBoard()">
-        </div>
-        <div>
-          <label>Root Trees (K)</label>
-          <input type="number" id="insp-trees" value="1" min="1" max="32" onchange="inspectBoard()">
-        </div>
-        <div>
-          <label>PUCT c_init</label>
-          <input type="number" id="insp-cinit" value="1.25" step="0.05" onchange="inspectBoard()">
-        </div>
-        <div>
-          <label>Dirichlet ε</label>
-          <input type="number" id="insp-eps" value="0.00" min="0" max="1" step="0.05" onchange="inspectBoard()">
-        </div>
-      </div>
-      <div class="board" id="ttt-board"></div>
-      <div id="play-status" style="font-size:14px; font-weight:600; color:var(--accent);"></div>
     </div>
 
     <div class="card">
-      <h3>🔍 Live Position Diagnostics (Raw Neural Network vs. MCTS Search)</h3>
-      <p style="font-size:13px; color:var(--muted); margin-top:0;">
-        Click any square on the left to make a move. Compare what the selected
-        <strong>Neural Network</strong> predicts in a single forward pass against how
-        <strong>PUCT MCTS</strong> refines the visit distribution and Q-values, and observe
-        how intra-batch deduplication collapses identical leaf evaluations!
+      <h2>
+        <span>🔍 Live Neural Network vs. MCTS Search Breakdown</span>
+        <span id="nn-value-readout" style="font-size:0.82rem;color:var(--accent)">V(s) = 0.000</span>
+      </h2>
+      <p class="hint">
+        Compares raw Neural Network policy priors <code>P(s, a)</code> against post-search MCTS visit counts <code>N(s, a)</code> and action values <code>Q(s, a)</code>.
+        <span id="inspect-dedup-readout" style="color:var(--amber);margin-left:6px;"></span>
       </p>
-      <div class="grid-4" style="margin-top:12px;">
-        <div class="card">
-          <h3>Raw NN Value V(s)</h3>
-          <div class="metric-val" id="insp-nn-val">--</div>
-          <div class="metric-sub">Current player's expected return [-1, +1]</div>
-        </div>
-        <div class="card">
-          <h3>Recommended Move</h3>
-          <div class="metric-val" id="insp-best-mv">--</div>
-          <div class="metric-sub" id="insp-best-sub">Most visited root child</div>
-        </div>
-        <div class="card">
-          <h3>NN Evaluations (Dedup)</h3>
-          <div class="metric-val" id="insp-dedup-val">--</div>
-          <div class="metric-sub" id="insp-dedup-sub">Unique NN evals / Logical requests</div>
-        </div>
-      </div>
       <table>
         <thead>
           <tr>
             <th>Cell (Row, Col)</th>
             <th>Raw NN Prior P(s,a)</th>
             <th>MCTS Visits N(s,a)</th>
-            <th>MCTS Policy π(a|s)</th>
+            <th>MCTS Share π(s,a)</th>
             <th>Action Value Q(s,a)</th>
           </tr>
         </thead>
-        <tbody id="insp-tbody"></tbody>
+        <tbody id="inspect-tbody"></tbody>
       </table>
     </div>
   </div>
 </div>
 
 <script>
-let latestState = null;
-let knobsInitialized = false;
+let stateData = null;
+let activeGame = 'ttt';
+let knobsInitializedForGame = null;
+let modelsSignature = '';
+let tttModelsSignature = '';
 let board = ['.', '.', '.', '.', '.', '.', '.', '.', '.'];
-let currentPlayer = 0; // 0 = X, 1 = O
-let lastInspection = null;
-let knownModelIds = '';
+let currentPlayer = 0;
+let lastInspect = null;
 
-function switchTab(tab, btn) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
+function switchTab(tab) {
   document.getElementById('tab-lab').classList.toggle('hidden', tab !== 'lab');
   document.getElementById('tab-arena').classList.toggle('hidden', tab !== 'arena');
   document.getElementById('tab-play').classList.toggle('hidden', tab !== 'play');
-  if (tab === 'play') inspectBoard();
+  document.getElementById('tab-btn-lab').classList.toggle('active', tab === 'lab');
+  document.getElementById('tab-btn-arena').classList.toggle('active', tab === 'arena');
+  document.getElementById('tab-btn-play').classList.toggle('active', tab === 'play');
+  if (tab === 'play') inspectCurrentBoard();
+  if (tab === 'arena') {
+    updateEstimatedTimes();
+    if (!stateData || !stateData.calibration) {
+      runCalibration();
+    }
+  }
 }
 
-async function pollState() {
+async function switchActiveGame(game) {
+  activeGame = game;
+  knobsInitializedForGame = null;
+  modelsSignature = '';
+  const res = await fetch(`/api/train_control?action=set_game&game=${encodeURIComponent(game)}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'set_game', game })
+  });
+  if (res.ok) {
+    stateData = await res.json();
+    renderDashboard(stateData);
+  } else {
+    await fetchState();
+  }
+}
+
+async function sendTrainControl(action) {
+  const total_iterations = parseInt(document.getElementById('ctrl-total-iters').value, 10) || 15;
+  const auto_save_every = parseInt(document.getElementById('ctrl-autosave').value, 10) || 0;
+  const payload = {
+    action,
+    game: activeGame,
+    total_iterations,
+    auto_save_every,
+    games_per_iteration: parseInt(document.getElementById('k-games').value, 10),
+    simulations_per_move: parseInt(document.getElementById('k-sims').value, 10),
+    train_steps: parseInt(document.getElementById('k-steps').value, 10),
+    batch_size: parseInt(document.getElementById('k-batch').value, 10),
+    learning_rate: parseFloat(document.getElementById('k-lr').value),
+    dirichlet_epsilon: parseFloat(document.getElementById('k-eps').value),
+    c_init: parseFloat(document.getElementById('k-cinit').value),
+  };
+  const qs = `action=${encodeURIComponent(action)}&game=${encodeURIComponent(activeGame)}&total_iterations=${total_iterations}&auto_save_every=${auto_save_every}`;
+  const res = await fetch(`/api/train_control?${qs}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  if (res.ok) {
+    stateData = await res.json();
+    renderDashboard(stateData);
+  } else {
+    await fetchState();
+  }
+}
+
+async function updateTrainTargets() {
+  const total_iterations = parseInt(document.getElementById('ctrl-total-iters').value, 10) || 15;
+  const auto_save_every = parseInt(document.getElementById('ctrl-autosave').value, 10) || 0;
+  const qs = `action=set_targets&game=${encodeURIComponent(activeGame)}&total_iterations=${total_iterations}&auto_save_every=${auto_save_every}`;
+  const res = await fetch(`/api/train_control?${qs}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'set_targets', game: activeGame, total_iterations, auto_save_every })
+  });
+  if (res.ok) {
+    stateData = await res.json();
+    renderDashboard(stateData);
+  } else {
+    await fetchState();
+  }
+}
+
+async function confirmResetTraining() {
+  await sendTrainControl('reset');
+}
+
+async function snapshotLiveModel() {
+  const res = await fetch(`/api/models?action=snapshot&game=${encodeURIComponent(activeGame)}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'snapshot', game: activeGame })
+  });
+  const data = await res.json();
+  if (!data.error) {
+    modelsSignature = '';
+    stateData = data;
+    renderDashboard(stateData);
+  }
+}
+
+async function fetchState() {
   try {
     const res = await fetch('/api/state');
-    latestState = await res.json();
-    renderLab(latestState);
-    renderModelsAndMatches(latestState);
+    stateData = await res.json();
+    renderDashboard(stateData);
   } catch (e) {}
 }
 
-function renderLab(st) {
-  document.getElementById('device-badge').innerText = `Device: ${st.device_name}`;
-  document.getElementById('phase-badge').innerText = `Phase: ${st.phase}`;
-  document.getElementById('iter-badge').innerText = `Iteration: ${st.current_iteration} / ${st.total_iterations}`;
-  document.getElementById('pause-btn').innerText = st.knobs.paused ? 'Resume' : 'Pause';
+function renderDashboard(d) {
+  activeGame = d.active_game || 'ttt';
+  const title = d.active_game_title || (activeGame === 'uttt' ? 'Ultimate Tic-Tac-Toe (9x9)' : 'Tic-Tac-Toe (3x3)');
 
-  if (!knobsInitialized && st.knobs) {
-    knobsInitialized = true;
-    document.getElementById('k-games').value = st.knobs.games_per_iteration;
-    document.getElementById('k-sims').value = st.knobs.simulations_per_move;
-    document.getElementById('k-steps').value = st.knobs.train_steps;
-    document.getElementById('k-batch').value = st.knobs.batch_size;
-    document.getElementById('k-lr').value = st.knobs.learning_rate;
-    document.getElementById('k-eps').value = st.knobs.dirichlet_epsilon;
-    document.getElementById('k-cinit').value = st.knobs.c_init;
+  document.getElementById('game-btn-ttt').classList.toggle('active', activeGame === 'ttt');
+  document.getElementById('game-btn-uttt').classList.toggle('active', activeGame === 'uttt');
+  document.getElementById('knobs-game-label').textContent = title;
+  document.getElementById('models-game-label').textContent = title;
+  document.getElementById('cal-game-label').textContent = title;
+  document.getElementById('match-game-label').textContent = title;
+  document.getElementById('hist-game-label').textContent = title;
+
+  if (activeGame === 'uttt') {
+    document.getElementById('legend-mm-mid').textContent = 'vs Minimax(d=1)';
+    document.getElementById('legend-mm-strong').textContent = 'vs Minimax(d=2)';
+    document.getElementById('arena-chart-hint').textContent = 'Ultimate Tic-Tac-Toe W+0.5*D % vs Random, Minimax(d=1), and Minimax(d=2).';
+  } else {
+    document.getElementById('legend-mm-mid').textContent = 'vs Minimax(d=2)';
+    document.getElementById('legend-mm-strong').textContent = 'vs Minimax(d=5 Optimal)';
+    document.getElementById('arena-chart-hint').textContent = 'Tic-Tac-Toe W+0.5*D % vs Random, Minimax(d=2), and Minimax(d=5 Optimal).';
   }
 
-  const h = st.history;
-  if (!h || h.length === 0) return;
+  document.getElementById('device-badge').textContent = 'Device: ' + d.device_name;
+  const phaseEl = document.getElementById('phase-badge');
+  phaseEl.textContent = (d.knobs.paused ? '⏸ ' : '🟢 ') + d.phase;
+  phaseEl.className = 'badge ' + (d.knobs.paused ? 'paused' : 'live');
+  document.getElementById('iter-badge').textContent = `Iter: ${d.current_iteration} / ${d.total_iterations}`;
+
+  if (knobsInitializedForGame !== activeGame) {
+    document.getElementById('k-games').value = d.knobs.games_per_iteration;
+    document.getElementById('k-sims').value = d.knobs.simulations_per_move;
+    document.getElementById('k-steps').value = d.knobs.train_steps;
+    document.getElementById('k-batch').value = d.knobs.batch_size;
+    document.getElementById('k-lr').value = d.knobs.learning_rate;
+    document.getElementById('k-eps').value = d.knobs.dirichlet_epsilon;
+    document.getElementById('k-cinit').value = d.knobs.c_init;
+    document.getElementById('ctrl-total-iters').value = d.total_iterations;
+    document.getElementById('ctrl-autosave').value = d.auto_save_every;
+    knobsInitializedForGame = activeGame;
+  } else if (document.activeElement !== document.getElementById('ctrl-total-iters')) {
+    document.getElementById('ctrl-total-iters').value = d.total_iterations;
+  }
+
+  renderModels(d.models || [], d.ttt_models || []);
+  renderCalibration(d.calibration);
+  renderMatches(d.matches || []);
+
+  const h = d.history || [];
+  if (!h.length) {
+    document.getElementById('latest-wdl').textContent = '—';
+    document.getElementById('latest-kl').textContent = '—';
+    document.getElementById('latest-val').textContent = '—';
+    document.getElementById('latest-sys').textContent = '—';
+    clearCanvas('chart-arena');
+    clearCanvas('chart-policy');
+    clearCanvas('chart-value');
+    clearCanvas('chart-sys');
+    return;
+  }
   const last = h[h.length - 1];
+  const scorePct = (arr) => {
+    const tot = arr[0] + arr[1] + arr[2];
+    return tot > 0 ? ((arr[0] + 0.5 * arr[1]) / tot) * 100.0 : 0.0;
+  };
+  const strongLabel = activeGame === 'uttt' ? 'vs MM(d=2)' : 'vs MM(d=5)';
+  document.getElementById('latest-wdl').textContent =
+    `${strongLabel}: ${last.vs_mm5[0]}W-${last.vs_mm5[1]}D-${last.vs_mm5[2]}L`;
+  document.getElementById('latest-kl').textContent =
+    `KL=${last.policy_kl.toFixed(4)} | H=${last.root_entropy_mean.toFixed(2)}`;
+  document.getElementById('latest-val').textContent =
+    `MSE=${last.value_loss.toFixed(4)} | Moves=${last.game_moves_mean.toFixed(1)}`;
+  document.getElementById('latest-sys').textContent =
+    `Batch=${last.batch_size_mean.toFixed(1)} → Uniq=${last.unique_batch_mean.toFixed(1)} (Saved ${last.dedup_saved_pct.toFixed(1)}%) | ${Math.round(last.simulations_per_sec)} sims/s`;
 
-  document.getElementById('m-batch').innerText =
-    `${last.batch_size_mean.toFixed(1)} → ${last.unique_batch_mean.toFixed(1)} uniq`;
-  document.getElementById('m-batch-sub').innerText =
-    `Dedup Saved: ${last.dedup_saved_pct.toFixed(1)}% | Replay Buf: ${last.buffer_len}/${last.buffer_capacity}`;
-
-  document.getElementById('m-speed').innerText = `${last.simulations_per_sec.toFixed(0)} sims/s`;
-  document.getElementById('m-speed-sub').innerText = `NN Latency: ${last.inference_us_mean.toFixed(1)} µs / state`;
-
-  document.getElementById('m-kl').innerText = `KL: ${last.policy_kl.toFixed(4)}`;
-  document.getElementById('m-entropy-sub').innerText = `Root Entropy H(π): ${last.root_entropy_mean.toFixed(3)} nats | CE: ${last.policy_loss.toFixed(3)}`;
-
-  const mm5Total = last.vs_mm5[0] + last.vs_mm5[1] + last.vs_mm5[2];
-  const mm5NoLoss = mm5Total > 0 ? (((last.vs_mm5[0] + last.vs_mm5[1]) / mm5Total) * 100).toFixed(0) : '0';
-  document.getElementById('m-arena').innerText = `${mm5NoLoss}% (${last.vs_mm5[0]}W-${last.vs_mm5[1]}D-${last.vs_mm5[2]}L)`;
-  document.getElementById('m-arena-sub').innerText =
-    `vs Random: ${last.vs_random[0]}W-${last.vs_random[1]}D-${last.vs_random[2]}L | vs MM2: ${last.vs_mm2[0]}W-${last.vs_mm2[1]}D-${last.vs_mm2[2]}L`;
-
-  const tbody = document.getElementById('log-tbody');
-  tbody.innerHTML = h.slice().reverse().map(r => `
-    <tr>
-      <td><strong>#${r.iteration}</strong></td>
-      <td>${r.total_loss.toFixed(4)}</td>
-      <td>${r.policy_loss.toFixed(4)}</td>
-      <td style="color:var(--green)">${r.policy_kl.toFixed(4)}</td>
-      <td style="color:var(--amber)">${r.value_loss.toFixed(4)}</td>
-      <td>${r.root_entropy_mean.toFixed(3)}</td>
-      <td>${r.game_moves_mean.toFixed(1)}</td>
-      <td>${r.vs_random[0]}W-${r.vs_random[1]}D-${r.vs_random[2]}L</td>
-      <td>${r.vs_mm2[0]}W-${r.vs_mm2[1]}D-${r.vs_mm2[2]}L</td>
-      <td><strong>${r.vs_mm5[0]}W-${r.vs_mm5[1]}D-${r.vs_mm5[2]}L</strong></td>
-      <td>${r.batch_size_mean.toFixed(1)} / ${r.unique_batch_mean.toFixed(1)}</td>
-      <td style="color:var(--accent)">${r.dedup_saved_pct.toFixed(1)}%</td>
-      <td>${r.simulations_per_sec.toFixed(0)}</td>
-      <td>${r.self_play_ms.toFixed(0)} / ${r.train_ms.toFixed(0)} / ${r.eval_ms.toFixed(0)}</td>
-    </tr>
-  `).join('');
-
-  drawLineChart('chart-arena', h.map(r => r.iteration), [
-    { label: 'vs Random (W+D %)', color: '#22c55e', data: h.map(r => pctNoLoss(r.vs_random)) },
-    { label: 'vs MM(d=2) (W+D %)', color: '#38bdf8', data: h.map(r => pctNoLoss(r.vs_mm2)) },
-    { label: 'vs MM(d=5) (W+D %)', color: '#f59e0b', data: h.map(r => pctNoLoss(r.vs_mm5)) },
+  drawChart('chart-arena', h.map(x => x.iteration), [
+    { data: h.map(x => scorePct(x.vs_random)), color: '#34d399' },
+    { data: h.map(x => scorePct(x.vs_mm2)), color: '#38bdf8' },
+    { data: h.map(x => scorePct(x.vs_mm5)), color: '#fbbf24' },
   ], 0, 100);
 
-  drawLineChart('chart-policy', h.map(r => r.iteration), [
-    { label: 'Policy KL(π||p)', color: '#22c55e', data: h.map(r => r.policy_kl) },
-    { label: 'Root Entropy H(π)', color: '#38bdf8', data: h.map(r => r.root_entropy_mean) },
+  drawChart('chart-policy', h.map(x => x.iteration), [
+    { data: h.map(x => x.policy_kl), color: '#38bdf8' },
+    { data: h.map(x => x.root_entropy_mean), color: '#a78bfa' },
+    { data: h.map(x => x.total_loss), color: '#fb7185' },
   ]);
 
-  drawLineChart('chart-loss', h.map(r => r.iteration), [
-    { label: 'Value MSE', color: '#f59e0b', data: h.map(r => r.value_loss) },
-    { label: 'Total Loss', color: '#a855f7', data: h.map(r => r.total_loss) },
+  drawChart('chart-value', h.map(x => x.iteration), [
+    { data: h.map(x => x.value_loss), color: '#fb7185' },
+    { data: h.map(x => x.game_moves_mean / 10.0), color: '#34d399' },
   ]);
 
-  drawLineChart('chart-system', h.map(r => r.iteration), [
-    { label: 'Logical Batch', color: '#38bdf8', data: h.map(r => r.batch_size_mean) },
-    { label: 'Unique NN Batch', color: '#22c55e', data: h.map(r => r.unique_batch_mean) },
-  ], 0);
+  drawChart('chart-sys', h.map(x => x.iteration), [
+    { data: h.map(x => x.batch_size_mean), color: '#fbbf24' },
+    { data: h.map(x => x.unique_batch_mean), color: '#a78bfa' },
+    { data: h.map(x => x.dedup_saved_pct), color: '#38bdf8' },
+  ], 0, Math.max(100, last.max_batch_size));
 }
 
-function renderModelsAndMatches(st) {
-  const models = st.models || [];
-  const sig = models.map(m => `${m.id}:${m.size_bytes}`).join('|');
-  if (sig !== knownModelIds) {
-    knownModelIds = sig;
-    document.querySelectorAll('.model-select').forEach(sel => {
-      const prev = sel.value;
-      sel.innerHTML = models.map(m =>
-        `<option value="${m.id}">${m.id} (${m.kind})</option>`
-      ).join('');
-      if (models.some(m => m.id === prev)) sel.value = prev;
+function clearCanvas(id) {
+  const c = document.getElementById(id);
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+}
+
+function renderModels(models, tttModels) {
+  const sig = activeGame + ':' + models.map(m => `${m.id}:${m.size_bytes}:${m.description}`).join('|');
+  if (sig !== modelsSignature) {
+    modelsSignature = sig;
+    const tbody = document.getElementById('models-tbody');
+    tbody.innerHTML = '';
+    models.forEach(m => {
+      const tr = document.createElement('tr');
+      const szText = m.size_bytes > 0 ? `${(m.size_bytes / 1024).toFixed(1)} KB` : 'In-Memory';
+      let actions = '—';
+      if (m.kind === 'disk') {
+        actions = `
+          <button class="btn secondary" style="padding:4px 8px;font-size:0.74rem;" onclick="loadModelToLive('${m.id}')">Load → Live</button>
+          <button class="btn danger" style="padding:4px 8px;font-size:0.74rem;" onclick="deleteModel('${m.id}')">Delete</button>
+        `;
+      }
+      tr.innerHTML = `
+        <td><b>${m.id}</b></td>
+        <td><span class="badge">${m.kind}</span></td>
+        <td>${szText}</td>
+        <td style="color:var(--muted)">${m.description}</td>
+        <td>${actions}</td>
+      `;
+      tbody.appendChild(tr);
     });
 
-    const mbody = document.getElementById('models-tbody');
-    mbody.innerHTML = models.map(m => {
-      const sz = m.size_bytes > 0 ? `${(m.size_bytes / 1024).toFixed(1)} KB` : 'In-Memory';
-      const actions = m.kind === 'disk'
-        ? `<button class="btn" style="padding:4px 10px; font-size:12px;" onclick="loadModelToLive('${m.id}')">⬆️ Load to Live</button>
-           <button class="btn btn-red" onclick="deleteModel('${m.id}')">🗑️ Delete</button>`
-        : `<span style="color:var(--muted)">Built-in</span>`;
-      return `
-        <tr>
-          <td class="left"><strong>${m.id}</strong></td>
-          <td class="left">${m.kind}</td>
-          <td>${sz}</td>
-          <td class="left" style="color:var(--muted)">${m.description}</td>
-          <td>${actions}</td>
-        </tr>
-      `;
-    }).join('');
+    document.querySelectorAll('.model-select').forEach(sel => {
+      const prev = sel.value || 'live';
+      sel.innerHTML = '';
+      models.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = `${m.id} (${m.kind})`;
+        sel.appendChild(opt);
+      });
+      if ([...sel.options].some(o => o.value === prev)) {
+        sel.value = prev;
+      }
+    });
   }
 
-  const matches = st.matches || [];
-  const mtbody = document.getElementById('matches-tbody');
-  mtbody.innerHTML = matches.slice().reverse().map(m => `
-    <tr>
-      <td><strong>#${m.match_id}</strong></td>
-      <td class="left" style="color:var(--green)">${m.engine_a}</td>
-      <td class="left" style="color:var(--amber)">${m.engine_b}</td>
+  const tttSig = tttModels.map(m => `${m.id}:${m.size_bytes}`).join('|');
+  if (tttSig !== tttModelsSignature) {
+    tttModelsSignature = tttSig;
+    const playSel = document.getElementById('play-model');
+    if (playSel) {
+      const prev = playSel.value || 'live';
+      playSel.innerHTML = '';
+      tttModels.forEach(m => {
+        const opt = document.createElement('option');
+        opt.value = m.id;
+        opt.textContent = `${m.id} (${m.kind})`;
+        playSel.appendChild(opt);
+      });
+      if ([...playSel.options].some(o => o.value === prev)) {
+        playSel.value = prev;
+      }
+    }
+  }
+}
+
+function renderCalibration(cal) {
+  const bar = document.getElementById('cal-metrics-bar');
+  if (!cal) {
+    bar.innerHTML = `<span class="badge">Not calibrated yet for ${activeGame.toUpperCase()} — click "⚡ Measure Hardware Speed & Calibrate"</span>`;
+    updateEstimatedTimes();
+    return;
+  }
+  const depthsText = (cal.minimax_depths || [])
+    .map(d => `d=${d.depth}: ${formatUs(d.us_per_move)}`)
+    .join(' • ');
+  bar.innerHTML = `
+    <span class="badge live">AlphaZero (1T): ${cal.alphazero_us_per_sim_1tree.toFixed(1)} µs/sim</span>
+    <span class="badge live">AlphaZero (4T): ${cal.alphazero_us_per_sim_4tree.toFixed(1)} µs/sim</span>
+    <span class="badge">MCTS (1T): ${cal.mcts_us_per_sim_1tree.toFixed(2)} µs/sim</span>
+    <span class="badge">Tree-Minimax: ${cal.tree_minimax_us_per_eval.toFixed(2)} µs/eval</span>
+    <span class="badge">Minimax: ${depthsText}</span>
+  `;
+  updateEstimatedTimes();
+}
+
+function formatUs(us) {
+  if (!us || !isFinite(us)) return '—';
+  if (us >= 1000) return `${(us / 1000).toFixed(2)} ms (${Math.round(us)} µs)`;
+  return `${us.toFixed(0)} µs (${(us / 1000).toFixed(2)} ms)`;
+}
+
+function estimateEngineUs(prefix) {
+  const cal = stateData && stateData.calibration ? stateData.calibration : null;
+  const eng = document.getElementById(`${prefix}-engine`).value;
+  if (eng === 'random') return 1.0;
+  if (!cal) return null;
+
+  if (eng === 'alphazero') {
+    const sims = parseInt(document.getElementById(`${prefix}-az-sims`).value, 10) || 1;
+    const trees = parseInt(document.getElementById(`${prefix}-az-trees`).value, 10) || 1;
+    const perSim = trees > 1 ? cal.alphazero_us_per_sim_4tree : cal.alphazero_us_per_sim_1tree;
+    return sims * trees * perSim;
+  }
+  if (eng === 'mcts') {
+    const sims = parseInt(document.getElementById(`${prefix}-mcts-sims`).value, 10) || 1;
+    const trees = parseInt(document.getElementById(`${prefix}-mcts-trees`).value, 10) || 1;
+    const perSim = trees > 1 ? cal.mcts_us_per_sim_4tree : cal.mcts_us_per_sim_1tree;
+    return sims * trees * perSim;
+  }
+  if (eng === 'tree-minimax') {
+    const kind = document.getElementById(`${prefix}-tm-kind`).value;
+    const val = parseInt(document.getElementById(`${prefix}-tm-val`).value, 10) || 1;
+    if (kind === 'ms') return val * 1000.0;
+    if (kind === 'evals') return val * cal.tree_minimax_us_per_eval;
+    const found = (cal.minimax_depths || []).find(d => d.depth === val);
+    return found ? found.us_per_move : val * 200.0;
+  }
+  if (eng === 'minimax') {
+    const depth = parseInt(document.getElementById(`${prefix}-mm-depth`).value, 10) || 1;
+    const depths = cal.minimax_depths || [];
+    const exact = depths.find(d => d.depth === depth);
+    if (exact) return exact.us_per_move;
+    if (depths.length > 0) {
+      const last = depths[depths.length - 1];
+      return last.us_per_move * Math.pow(6, depth - last.depth);
+    }
+  }
+  return null;
+}
+
+function applyTargetUsToEngine(prefix, targetUs) {
+  const cal = stateData && stateData.calibration ? stateData.calibration : null;
+  if (!cal || !targetUs || targetUs <= 0) return;
+  const eng = document.getElementById(`${prefix}-engine`).value;
+
+  if (eng === 'alphazero') {
+    const trees = parseInt(document.getElementById(`${prefix}-az-trees`).value, 10) || 1;
+    const perSim = trees > 1 ? cal.alphazero_us_per_sim_4tree : cal.alphazero_us_per_sim_1tree;
+    const sims = Math.max(2, Math.round(targetUs / (trees * Math.max(0.1, perSim))));
+    document.getElementById(`${prefix}-az-sims`).value = sims;
+  } else if (eng === 'mcts') {
+    const trees = parseInt(document.getElementById(`${prefix}-mcts-trees`).value, 10) || 1;
+    const perSim = trees > 1 ? cal.mcts_us_per_sim_4tree : cal.mcts_us_per_sim_1tree;
+    const sims = Math.max(4, Math.round(targetUs / (trees * Math.max(0.05, perSim))));
+    document.getElementById(`${prefix}-mcts-sims`).value = sims;
+  } else if (eng === 'tree-minimax') {
+    const kind = document.getElementById(`${prefix}-tm-kind`).value;
+    if (kind === 'ms') {
+      document.getElementById(`${prefix}-tm-val`).value = Math.max(1, Math.round(targetUs / 1000.0));
+    } else if (kind === 'evals') {
+      const evals = Math.max(10, Math.round(targetUs / Math.max(0.05, cal.tree_minimax_us_per_eval)));
+      document.getElementById(`${prefix}-tm-val`).value = evals;
+    } else {
+      const best = findClosestDepth(cal.minimax_depths || [], targetUs);
+      document.getElementById(`${prefix}-tm-val`).value = best;
+    }
+  } else if (eng === 'minimax') {
+    const best = findClosestDepth(cal.minimax_depths || [], targetUs);
+    document.getElementById(`${prefix}-mm-depth`).value = best;
+  }
+}
+
+function findClosestDepth(depths, targetUs) {
+  if (!depths.length) return 2;
+  let bestDepth = depths[0].depth;
+  let bestDiff = Math.abs(Math.log(Math.max(1, depths[0].us_per_move)) - Math.log(Math.max(1, targetUs)));
+  depths.forEach(d => {
+    const diff = Math.abs(Math.log(Math.max(1, d.us_per_move)) - Math.log(Math.max(1, targetUs)));
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestDepth = d.depth;
+    }
+  });
+  return bestDepth;
+}
+
+function updateEstimatedTimes() {
+  const usA = estimateEngineUs('a');
+  const usB = estimateEngineUs('b');
+  document.getElementById('a-est-pill').textContent = usA ? `⏱️ Est: ${formatUs(usA)} / mv` : '⏱️ Est: (Calibrate first)';
+  document.getElementById('b-est-pill').textContent = usB ? `⏱️ Est: ${formatUs(usB)} / mv` : '⏱️ Est: (Calibrate first)';
+
+  const summary = document.getElementById('fairness-summary');
+  const badge = document.getElementById('fairness-ratio-badge');
+  if (usA && usB) {
+    const ratio = Math.max(usA, usB) / Math.max(0.1, Math.min(usA, usB));
+    const fair = ratio <= 1.35;
+    summary.innerHTML = `⚖️ <b>Estimated Compute / Move:</b> Engine A <code>${formatUs(usA)}</code> vs Engine B <code>${formatUs(usB)}</code>`;
+    badge.textContent = fair ? `Ratio: ${ratio.toFixed(2)}x (Fair Compute ✅)` : `Ratio: ${ratio.toFixed(1)}x (Unbalanced ⚠️)`;
+    badge.className = 'badge ' + (fair ? 'live' : 'paused');
+  } else {
+    summary.textContent = '⚖️ Click "⚡ Measure Hardware Speed & Calibrate" above to estimate per-move thinking times.';
+    badge.textContent = 'Ratio: —';
+    badge.className = 'badge';
+  }
+}
+
+async function runCalibration() {
+  const btn = document.getElementById('btn-calibrate');
+  btn.disabled = true;
+  btn.textContent = '⏳ Benchmarking Hardware...';
+  try {
+    const res = await fetch('/api/calibrate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ game: activeGame })
+    });
+    const cal = await res.json();
+    if (!cal.error && stateData) {
+      stateData.calibration = cal;
+      renderCalibration(cal);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚡ Measure Hardware Speed & Calibrate';
+  }
+}
+
+function setTargetMs(ms) {
+  document.getElementById('cal-target-ms').value = ms;
+  calibrateBothToTarget();
+}
+
+async function calibrateBothToTarget() {
+  if (!stateData || !stateData.calibration) {
+    await runCalibration();
+  }
+  const targetMs = parseFloat(document.getElementById('cal-target-ms').value) || 2.0;
+  const targetUs = targetMs * 1000.0;
+  applyTargetUsToEngine('a', targetUs);
+  applyTargetUsToEngine('b', targetUs);
+  updateEstimatedTimes();
+}
+
+async function matchEngineTime(dir) {
+  if (!stateData || !stateData.calibration) {
+    await runCalibration();
+  }
+  if (dir === 'b_to_a') {
+    const usA = estimateEngineUs('a');
+    if (usA) {
+      document.getElementById('cal-target-ms').value = (usA / 1000.0).toFixed(2);
+      applyTargetUsToEngine('b', usA);
+    }
+  } else {
+    const usB = estimateEngineUs('b');
+    if (usB) {
+      document.getElementById('cal-target-ms').value = (usB / 1000.0).toFixed(2);
+      applyTargetUsToEngine('a', usB);
+    }
+  }
+  updateEstimatedTimes();
+}
+
+function renderMatches(matches) {
+  const tbody = document.getElementById('matches-tbody');
+  tbody.innerHTML = '';
+  [...matches].reverse().forEach(m => {
+    const tr = document.createElement('tr');
+    const nnText = m.nn_logical_batch > 0
+      ? `${m.nn_logical_batch.toFixed(1)} → ${m.nn_unique_batch.toFixed(1)} (-${m.nn_dedup_saved_pct.toFixed(1)}%)`
+      : '—';
+    const ratio = Math.max(m.a_us_per_move, m.b_us_per_move) / Math.max(0.1, Math.min(m.a_us_per_move, m.b_us_per_move));
+    const computeText = `${Math.round(m.a_us_per_move)} vs ${Math.round(m.b_us_per_move)} µs (${ratio.toFixed(2)}x)`;
+    tr.innerHTML = `
+      <td>#${m.match_id}</td>
+      <td><span style="color:var(--accent)">${m.engine_a}</span> <span style="color:var(--muted)">vs</span> <span style="color:var(--rose)">${m.engine_b}</span></td>
       <td>${m.num_games}</td>
-      <td style="color:var(--green)"><strong>${m.wins_a}</strong></td>
-      <td style="color:var(--accent)">${m.draws}</td>
-      <td style="color:var(--amber)"><strong>${m.wins_b}</strong></td>
-      <td><strong>${m.score_a_pct.toFixed(1)}%</strong></td>
-      <td>${m.avg_moves.toFixed(1)}</td>
-      <td>${m.nn_logical_batch > 0 ? `${m.nn_logical_batch.toFixed(1)} → ${m.nn_unique_batch.toFixed(1)}` : '—'}</td>
-      <td style="color:var(--accent)">${m.nn_logical_batch > 0 ? `${m.nn_dedup_saved_pct.toFixed(1)}%` : '—'}</td>
-      <td>${m.games_per_sec.toFixed(1)}/s (${m.duration_ms.toFixed(0)} ms)</td>
-    </tr>
-  `).join('');
+      <td><b>${m.wins_a}W</b> - ${m.draws}D - <b>${m.wins_b}L</b></td>
+      <td style="color:${m.score_a_pct >= 50 ? 'var(--green)' : 'var(--rose)'}"><b>${m.score_a_pct.toFixed(1)}%</b></td>
+      <td>${computeText}</td>
+      <td>${m.games_per_sec.toFixed(0)} g/s (${m.duration_ms.toFixed(0)} ms)</td>
+      <td>${nnText}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function updateEngineForm(prefix) {
+  const eng = document.getElementById(`${prefix}-engine`).value;
+  document.getElementById(`${prefix}-params-az`).classList.toggle('hidden', eng !== 'alphazero');
+  document.getElementById(`${prefix}-params-mcts`).classList.toggle('hidden', eng !== 'mcts');
+  document.getElementById(`${prefix}-params-tm`).classList.toggle('hidden', eng !== 'tree-minimax');
+  document.getElementById(`${prefix}-params-mm`).classList.toggle('hidden', eng !== 'minimax');
+  updateEstimatedTimes();
+}
+
+function collectEngineConfig(prefix) {
+  const eng = document.getElementById(`${prefix}-engine`).value;
+  const out = { [`${prefix}_engine`]: eng };
+  if (eng === 'alphazero') {
+    out[`${prefix}_model`] = document.getElementById(`${prefix}-az-model`).value || 'live';
+    out[`${prefix}_sims`] = parseInt(document.getElementById(`${prefix}-az-sims`).value, 10);
+    out[`${prefix}_num_trees`] = parseInt(document.getElementById(`${prefix}-az-trees`).value, 10);
+    out[`${prefix}_c_init`] = parseFloat(document.getElementById(`${prefix}-az-cinit`).value);
+    out[`${prefix}_dir_eps`] = parseFloat(document.getElementById(`${prefix}-az-eps`).value);
+    out[`${prefix}_opening_moves`] = parseInt(document.getElementById(`${prefix}-az-open`).value, 10);
+  } else if (eng === 'mcts') {
+    out[`${prefix}_sims`] = parseInt(document.getElementById(`${prefix}-mcts-sims`).value, 10);
+    out[`${prefix}_num_trees`] = parseInt(document.getElementById(`${prefix}-mcts-trees`).value, 10);
+    out[`${prefix}_c_uct`] = parseFloat(document.getElementById(`${prefix}-mcts-c`).value);
+    out[`${prefix}_opening_moves`] = parseInt(document.getElementById(`${prefix}-mcts-open`).value, 10);
+  } else if (eng === 'tree-minimax') {
+    out[`${prefix}_budget_kind`] = document.getElementById(`${prefix}-tm-kind`).value;
+    out[`${prefix}_budget_val`] = parseInt(document.getElementById(`${prefix}-tm-val`).value, 10);
+    out[`${prefix}_use_heuristic`] = document.getElementById(`${prefix}-tm-heur`).value === 'true';
+    out[`${prefix}_arena_cap`] = parseInt(document.getElementById(`${prefix}-tm-cap`).value, 10);
+  } else if (eng === 'minimax') {
+    out[`${prefix}_depth`] = parseInt(document.getElementById(`${prefix}-mm-depth`).value, 10);
+    out[`${prefix}_use_heuristic`] = document.getElementById(`${prefix}-mm-heur`).value === 'true';
+  }
+  return out;
+}
+
+async function runArenaMatch() {
+  const btn = document.getElementById('run-match-btn');
+  const banner = document.getElementById('latest-match-banner');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running Match...';
+  banner.textContent = 'Running parallel role-swapped tournament...';
+
+  const payload = {
+    game: activeGame,
+    ...collectEngineConfig('a'),
+    ...collectEngineConfig('b'),
+    num_games: parseInt(document.getElementById('m-games').value, 10),
+    num_workers: parseInt(document.getElementById('m-workers').value, 10),
+    max_batch_size: parseInt(document.getElementById('m-batch').value, 10),
+    seed: parseInt(document.getElementById('m-seed').value, 10),
+  };
+
+  try {
+    const res = await fetch('/api/match', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const rec = await res.json();
+    if (rec.error) {
+      banner.innerHTML = `<span style="color:var(--rose)">Error: ${rec.error}</span>`;
+    } else {
+      const dedupInfo = rec.nn_logical_batch > 0
+        ? ` | NN Batch: <b>${rec.nn_logical_batch.toFixed(1)}</b> → Unique: <b>${rec.nn_unique_batch.toFixed(1)}</b> (Saved <b>${rec.nn_dedup_saved_pct.toFixed(1)}%</b> duplicate evals)`
+        : '';
+      const ratio = Math.max(rec.a_us_per_move, rec.b_us_per_move) / Math.max(0.1, Math.min(rec.a_us_per_move, rec.b_us_per_move));
+      banner.innerHTML = `
+        <b>Match #${rec.match_id} (${rec.game.toUpperCase()}) Complete (${rec.duration_ms.toFixed(1)} ms, ${rec.games_per_sec.toFixed(0)} games/sec):</b>
+        <span style="color:var(--accent)">${rec.engine_a}</span> vs <span style="color:var(--rose)">${rec.engine_b}</span> —
+        <b style="color:var(--green)">${rec.wins_a}W - ${rec.draws}D - ${rec.wins_b}L</b>
+        (A Score: <b>${rec.score_a_pct.toFixed(1)}%</b>) |
+        Actual Compute: <b>${Math.round(rec.a_us_per_move)} µs/mv</b> vs <b>${Math.round(rec.b_us_per_move)} µs/mv</b> (<b>${ratio.toFixed(2)}x</b>)${dedupInfo}
+      `;
+      fetchState();
+    }
+  } catch (e) {
+    banner.innerHTML = `<span style="color:var(--rose)">Request failed: ${e}</span>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚔️ Start Multi-Match';
+  }
 }
 
 async function saveLiveModel() {
-  const name = document.getElementById('model-save-name').value;
+  const nameInput = document.getElementById('save-model-name');
+  const name = nameInput.value.trim();
+  if (!name) return;
   const res = await fetch('/api/models', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'save', name })
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'save', name, game: activeGame })
   });
   const data = await res.json();
-  if (data.error) {
-    document.getElementById('model-msg').innerText = `Error: ${data.error}`;
-  } else {
-    document.getElementById('model-msg').innerText = `Saved ${name}!`;
-    knownModelIds = '';
-    renderModelsAndMatches(data);
-  }
+  modelsSignature = '';
+  renderDashboard(data);
 }
 
 async function loadModelToLive(name) {
   const res = await fetch('/api/models', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'load_to_live', name })
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'load_to_live', name, game: activeGame })
   });
   const data = await res.json();
-  if (!data.error) {
-    document.getElementById('model-msg').innerText = `Loaded ${name} into Live model!`;
-    renderLab(data);
-    inspectBoard();
-  }
+  modelsSignature = '';
+  renderDashboard(data);
 }
 
 async function deleteModel(name) {
   const res = await fetch('/api/models', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'delete', name })
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action: 'delete', name, game: activeGame })
   });
   const data = await res.json();
-  knownModelIds = '';
-  renderModelsAndMatches(data);
+  modelsSignature = '';
+  renderDashboard(data);
 }
 
-function updateEngineFields(side) {
-  const eng = document.getElementById(`${side}-engine`).value;
-  document.getElementById(`${side}-params-az`).classList.toggle('hidden', eng !== 'alphazero');
-  document.getElementById(`${side}-params-mcts`).classList.toggle('hidden', eng !== 'mcts');
-  document.getElementById(`${side}-params-tmm`).classList.toggle('hidden', eng !== 'tree-minimax');
-  document.getElementById(`${side}-params-mm`).classList.toggle('hidden', eng !== 'minimax');
-}
-
-function readSidePayload(side, out) {
-  const eng = document.getElementById(`${side}-engine`).value;
-  out[`${side}_engine`] = eng;
-  if (eng === 'alphazero') {
-    out[`${side}_model`] = document.getElementById(`${side}-model`).value || 'live';
-    out[`${side}_sims`] = Number(document.getElementById(`${side}-az-sims`).value);
-    out[`${side}_trees`] = Number(document.getElementById(`${side}-az-trees`).value);
-    out[`${side}_c_init`] = Number(document.getElementById(`${side}-c-init`).value);
-    out[`${side}_c_base`] = Number(document.getElementById(`${side}-c-base`).value);
-    out[`${side}_dir_alpha`] = Number(document.getElementById(`${side}-dir-alpha`).value);
-    out[`${side}_dir_eps`] = Number(document.getElementById(`${side}-dir-eps`).value);
-    out[`${side}_opening`] = Number(document.getElementById(`${side}-az-open`).value);
-  } else if (eng === 'mcts') {
-    out[`${side}_sims`] = Number(document.getElementById(`${side}-mcts-sims`).value);
-    out[`${side}_trees`] = Number(document.getElementById(`${side}-mcts-trees`).value);
-    out[`${side}_c_uct`] = Number(document.getElementById(`${side}-c-uct`).value);
-    out[`${side}_opening`] = Number(document.getElementById(`${side}-mcts-open`).value);
-  } else if (eng === 'tree-minimax') {
-    out[`${side}_budget_kind`] = document.getElementById(`${side}-budget-kind`).value;
-    out[`${side}_budget_val`] = Number(document.getElementById(`${side}-budget-val`).value);
-    out[`${side}_heuristic`] = document.getElementById(`${side}-tmm-heur`).value === 'true';
-    out[`${side}_arena_cap`] = Number(document.getElementById(`${side}-arena-cap`).value);
-  } else if (eng === 'minimax') {
-    out[`${side}_depth`] = Number(document.getElementById(`${side}-depth`).value);
-    out[`${side}_heuristic`] = document.getElementById(`${side}-mm-heur`).value === 'true';
-  }
-}
-
-async function runArenaMatch() {
-  const btn = document.getElementById('run-match-btn');
-  btn.disabled = true;
-  btn.innerText = '⏳ Running Multi-Match...';
-  const payload = {
-    num_games: Number(document.getElementById('m-num-games').value),
-    num_workers: Number(document.getElementById('m-workers').value),
-    max_batch_size: Number(document.getElementById('m-batch-cap').value),
-    seed: Number(document.getElementById('m-seed').value),
-  };
-  readSidePayload('a', payload);
-  readSidePayload('b', payload);
-
-  try {
-    const res = await fetch('/api/match', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const m = await res.json();
-    if (!m.error) {
-      showLatestMatchBanner(m);
-      await pollState();
-    }
-  } finally {
-    btn.disabled = false;
-    btn.innerText = '⚔️ Start Multi-Match';
-  }
-}
-
-function showLatestMatchBanner(m) {
-  document.getElementById('match-latest-box').classList.remove('hidden');
-  document.getElementById('match-title-a').innerText = `${m.engine_a}: ${m.wins_a}W`;
-  document.getElementById('match-summary-mid').innerText =
-    `Draws: ${m.draws} | Score A: ${m.score_a_pct.toFixed(1)}%`;
-  document.getElementById('match-title-b').innerText = `${m.engine_b}: ${m.wins_b}W`;
-
-  const tot = Math.max(m.num_games, 1);
-  const waPct = (m.wins_a / tot) * 100;
-  const dPct = (m.draws / tot) * 100;
-  const wbPct = (m.wins_b / tot) * 100;
-
-  document.getElementById('match-wdl-bar').innerHTML = `
-    <div class="wdl-seg" style="width:${waPct}%; background:var(--green);">${waPct >= 8 ? `${waPct.toFixed(0)}% W` : ''}</div>
-    <div class="wdl-seg" style="width:${dPct}%; background:var(--accent);">${dPct >= 8 ? `${dPct.toFixed(0)}% D` : ''}</div>
-    <div class="wdl-seg" style="width:${wbPct}%; background:var(--amber);">${wbPct >= 8 ? `${wbPct.toFixed(0)}% L` : ''}</div>
-  `;
-
-  const nnStr = m.nn_logical_batch > 0
-    ? ` | NN Batch: ${m.nn_logical_batch.toFixed(1)} logical → ${m.nn_unique_batch.toFixed(1)} unique (${m.nn_dedup_saved_pct.toFixed(1)}% dedup saved, ${m.nn_us_per_state.toFixed(1)} µs/state)`
-    : '';
-  document.getElementById('match-perf-sub').innerText =
-    `Completed ${m.num_games} games in ${m.duration_ms.toFixed(1)} ms (${m.games_per_sec.toFixed(1)} games/sec) | Avg Game Length: ${m.avg_moves.toFixed(1)} moves${nnStr}`;
-}
-
-function pctNoLoss(arr) {
-  const tot = arr[0] + arr[1] + arr[2];
-  return tot > 0 ? ((arr[0] + arr[1]) / tot) * 100.0 : 0;
-}
-
-function drawLineChart(canvasId, xs, series, fixedMin = null, fixedMax = null) {
-  const canvas = document.getElementById(canvasId);
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
+function drawChart(canvasId, xs, series, fixedMin, fixedMax) {
+  const c = document.getElementById(canvasId);
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
   ctx.clearRect(0, 0, W, H);
+  if (!xs.length) return;
 
-  const padL = 44, padR = 16, padT = 24, padB = 26;
-  let allVals = [];
-  series.forEach(s => allVals.push(...s.data));
-  let minV = fixedMin !== null ? fixedMin : Math.min(...allVals, 0);
-  let maxV = fixedMax !== null ? fixedMax : Math.max(...allVals, minV + 1e-3) * 1.08;
-  if (maxV <= minV) maxV = minV + 1;
+  let minY = fixedMin !== undefined ? fixedMin : Infinity;
+  let maxY = fixedMax !== undefined ? fixedMax : -Infinity;
+  if (fixedMin === undefined || fixedMax === undefined) {
+    series.forEach(s => s.data.forEach(v => {
+      if (v < minY) minY = v;
+      if (v > maxY) maxY = v;
+    }));
+  }
+  if (minY === maxY) { minY -= 0.5; maxY += 0.5; }
+  const padL = 44, padR = 14, padT = 14, padB = 24;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
 
   ctx.strokeStyle = '#1e293b';
-  ctx.lineWidth = 1;
-  ctx.fillStyle = '#94a3b8';
+  ctx.fillStyle = '#64748b';
   ctx.font = '11px monospace';
   for (let i = 0; i <= 4; i++) {
-    const y = padT + ((H - padT - padB) * i) / 4;
-    const val = maxV - ((maxV - minV) * i) / 4;
-    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-    ctx.fillText(val.toFixed(val >= 10 ? 0 : 2), 4, y + 4);
+    const y = padT + (plotH * i) / 4;
+    const val = maxY - ((maxY - minY) * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(W - padR, y);
+    ctx.stroke();
+    ctx.fillText(val.toFixed(2), 4, y + 4);
   }
-
-  let lx = padL;
-  series.forEach(s => {
-    ctx.fillStyle = s.color;
-    ctx.fillRect(lx, 6, 10, 10);
-    ctx.fillStyle = '#e2e8f0';
-    ctx.fillText(s.label, lx + 14, 15);
-    lx += ctx.measureText(s.label).width + 32;
-  });
 
   series.forEach(s => {
     ctx.strokeStyle = s.color;
     ctx.lineWidth = 2.2;
     ctx.beginPath();
     s.data.forEach((v, idx) => {
-      const x = xs.length <= 1
-        ? padL + (W - padL - padR) / 2
-        : padL + ((W - padL - padR) * idx) / (xs.length - 1);
-      const y = padT + (H - padT - padB) * (1 - (v - minV) / (maxV - minV));
-      if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      const x = padL + (xs.length === 1 ? plotW / 2 : (plotW * idx) / (xs.length - 1));
+      const y = padT + plotH * (1 - (v - minY) / (maxY - minY));
+      if (idx === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     });
     ctx.stroke();
-
-    s.data.forEach((v, idx) => {
-      const x = xs.length <= 1
-        ? padL + (W - padL - padR) / 2
-        : padL + ((W - padL - padR) * idx) / (xs.length - 1);
-      const y = padT + (H - padT - padB) * (1 - (v - minV) / (maxV - minV));
-      ctx.fillStyle = s.color;
-      ctx.beginPath(); ctx.arc(x, y, 3.2, 0, Math.PI * 2); ctx.fill();
-    });
   });
 }
 
-async function submitKnobs(pauseOverride) {
-  const payload = {
-    paused: pauseOverride !== null ? pauseOverride : (latestState ? latestState.knobs.paused : false),
-    games_per_iteration: Number(document.getElementById('k-games').value),
-    simulations_per_move: Number(document.getElementById('k-sims').value),
-    train_steps: Number(document.getElementById('k-steps').value),
-    batch_size: Number(document.getElementById('k-batch').value),
-    learning_rate: Number(document.getElementById('k-lr').value),
-    dirichlet_epsilon: Number(document.getElementById('k-eps').value),
-    c_init: Number(document.getElementById('k-cinit').value),
+async function pushKnobs() {
+  const body = {
+    games_per_iteration: parseInt(document.getElementById('k-games').value, 10),
+    simulations_per_move: parseInt(document.getElementById('k-sims').value, 10),
+    train_steps: parseInt(document.getElementById('k-steps').value, 10),
+    batch_size: parseInt(document.getElementById('k-batch').value, 10),
+    learning_rate: parseFloat(document.getElementById('k-lr').value),
+    dirichlet_epsilon: parseFloat(document.getElementById('k-eps').value),
+    c_init: parseFloat(document.getElementById('k-cinit').value),
   };
   const res = await fetch('/api/knobs', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
   });
-  latestState = await res.json();
-  renderLab(latestState);
+  stateData = await res.json();
+  renderDashboard(stateData);
 }
 
-function togglePause() {
-  const nextPaused = latestState ? !latestState.knobs.paused : true;
-  submitKnobs(nextPaused);
+// Interactive 3x3 Tic-Tac-Toe Board & Inspector
+function renderBoardUI() {
+  const container = document.getElementById('ttt-board');
+  container.innerHTML = '';
+  const totalVisits = lastInspect ? lastInspect.mcts_visits.reduce((a, b) => a + b, 0) : 0;
+
+  for (let i = 0; i < 9; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+    const sym = board[i];
+    if (sym === 'X' || sym === 'O') {
+      const sp = document.createElement('div');
+      sp.className = 'sym ' + (sym === 'X' ? 'x' : 'o');
+      sp.textContent = sym;
+      cell.appendChild(sp);
+    } else if (lastInspect && lastInspect.legal_mask[i]) {
+      const prior = (lastInspect.raw_nn_priors[i] * 100).toFixed(0);
+      const visits = lastInspect.mcts_visits[i];
+      const share = totalVisits > 0 ? ((visits / totalVisits) * 100).toFixed(0) : 0;
+      const q = lastInspect.mcts_q_values[i].toFixed(2);
+      const ov = document.createElement('div');
+      ov.className = 'overlay';
+      ov.innerHTML = `<b style="color:#38bdf8">${share}%</b> (${visits}v)<br>NN:${prior}% Q:${q}`;
+      cell.appendChild(ov);
+    }
+    cell.onclick = () => onCellClick(i);
+    container.appendChild(cell);
+  }
 }
 
-// Interactive Play & Inspector
-function resetBoard() {
-  board = ['.', '.', '.', '.', '.', '.', '.', '.', '.'];
-  currentPlayer = 0;
-  inspectBoard();
-}
-
-async function inspectBoard() {
+async function inspectCurrentBoard() {
   const bStr = board.join('');
-  const sims = document.getElementById('insp-sims').value || 160;
-  const trees = document.getElementById('insp-trees').value || 1;
-  const cinit = document.getElementById('insp-cinit').value || 1.25;
-  const eps = document.getElementById('insp-eps').value || 0.0;
-  const model = document.getElementById('insp-model').value || 'live';
+  const sims = document.getElementById('play-sims').value || 160;
+  const trees = document.getElementById('play-trees').value || 4;
+  const cinit = document.getElementById('play-cinit').value || 1.25;
+  const eps = document.getElementById('play-eps').value || 0.0;
+  const model = document.getElementById('play-model').value || 'live';
   try {
     const res = await fetch(`/api/inspect_ttt?board=${bStr}&player=${currentPlayer}&sims=${sims}&trees=${trees}&c_init=${cinit}&eps=${eps}&model=${encodeURIComponent(model)}`);
-    lastInspection = await res.json();
-    renderBoard();
+    if (!res.ok) return;
+    lastInspect = await res.json();
+    updateInspectTable();
+    renderBoardUI();
   } catch (e) {}
 }
 
-function renderBoard() {
-  const el = document.getElementById('ttt-board');
-  const insp = lastInspection;
-  const totalVisits = insp ? insp.mcts_visits.reduce((a, b) => a + b, 0) : 0;
+function updateInspectTable() {
+  if (!lastInspect) return;
+  document.getElementById('nn-value-readout').textContent =
+    `Raw NN Value V(s) = ${lastInspect.raw_nn_value >= 0 ? '+' : ''}${lastInspect.raw_nn_value.toFixed(3)}`;
 
-  el.innerHTML = board.map((cell, idx) => {
-    const isBest = insp && insp.chosen_move === idx;
-    if (cell === 'X' || cell === 'O') {
-      return `<div class="cell"><div class="sym ${cell.toLowerCase()}">${cell}</div></div>`;
-    }
-    if (!insp || !insp.legal_mask[idx]) {
-      return `<div class="cell"></div>`;
-    }
-    const priorPct = (insp.raw_nn_priors[idx] * 100).toFixed(1);
-    const visits = insp.mcts_visits[idx];
-    const visitPct = totalVisits > 0 ? ((visits / totalVisits) * 100).toFixed(1) : '0.0';
-    const q = insp.mcts_q_values[idx];
-    const qColor = q >= 0.05 ? 'var(--green)' : (q <= -0.05 ? 'var(--red)' : 'var(--text)');
-    return `
-      <div class="cell ${isBest ? 'best-choice' : ''}" onclick="playCell(${idx})">
-        <div class="overlay-stats">
-          <div><strong>π: ${visitPct}%</strong> (${visits})</div>
-          <div class="bar-bg"><div class="bar-fill" style="width:${visitPct}%"></div></div>
-          <div>NN P: ${priorPct}%</div>
-          <div style="color:${qColor}">Q: ${q >= 0 ? '+' : ''}${q.toFixed(2)}</div>
-        </div>
-      </div>
+  const reqs = lastInspect.nn_requests || 0;
+  const uniq = lastInspect.nn_unique_evals || 0;
+  const savedPct = reqs > 0 && uniq < reqs ? ((1 - uniq / reqs) * 100).toFixed(1) : '0.0';
+  document.getElementById('inspect-dedup-readout').textContent =
+    `[NN Evals: ${uniq} unique / ${reqs} requests (${savedPct}% dedup saved)]`;
+
+  const stEl = document.getElementById('game-status-text');
+  if (lastInspect.status === 'ongoing') {
+    stEl.textContent = currentPlayer === 0 ? 'Turn: Player 1 (X)' : 'Turn: Player 2 (O)';
+    stEl.style.color = '#34d399';
+  } else {
+    stEl.textContent = `Terminal: ${lastInspect.status.toUpperCase()}`;
+    stEl.style.color = '#fbbf24';
+  }
+
+  const tbody = document.getElementById('inspect-tbody');
+  tbody.innerHTML = '';
+  const totalVisits = lastInspect.mcts_visits.reduce((a, b) => a + b, 0);
+
+  for (let i = 0; i < 9; i++) {
+    const r = Math.floor(i / 3), c = i % 3;
+    const legal = lastInspect.legal_mask[i];
+    const priorPct = (lastInspect.raw_nn_priors[i] * 100).toFixed(1);
+    const visits = lastInspect.mcts_visits[i];
+    const sharePct = totalVisits > 0 ? ((visits / totalVisits) * 100).toFixed(1) : '0.0';
+    const q = lastInspect.mcts_q_values[i].toFixed(3);
+    const isBest = lastInspect.chosen_move === i;
+
+    const tr = document.createElement('tr');
+    if (isBest) tr.style.background = '#1e293b';
+    tr.innerHTML = `
+      <td>Square ${i} (${r},${c}) ${isBest ? '⭐' : ''}</td>
+      <td>${legal ? `<div class="bar-wrap"><div class="bar-fill" style="width:${priorPct}%;background:#a78bfa"></div></div>${priorPct}%` : '—'}</td>
+      <td>${legal ? visits : '—'}</td>
+      <td>${legal ? `<div class="bar-wrap"><div class="bar-fill" style="width:${sharePct}%"></div></div>${sharePct}%` : '—'}</td>
+      <td style="color:${lastInspect.mcts_q_values[i] >= 0 ? '#34d399' : '#fb7185'}">${legal ? q : '—'}</td>
     `;
-  }).join('');
-
-  if (!insp) return;
-  document.getElementById('insp-nn-val').innerText =
-    `${insp.raw_nn_value >= 0 ? '+' : ''}${insp.raw_nn_value.toFixed(3)}`;
-  document.getElementById('insp-best-mv').innerText =
-    insp.chosen_move !== null ? `Cell ${insp.chosen_move} (${Math.floor(insp.chosen_move/3)}, ${insp.chosen_move%3})` : 'Terminal';
-
-  const savedPct = insp.nn_requests > 0
-    ? (((insp.nn_requests - insp.nn_unique_evals) / insp.nn_requests) * 100).toFixed(1)
-    : '0.0';
-  document.getElementById('insp-dedup-val').innerText =
-    `${insp.nn_unique_evals} / ${insp.nn_requests}`;
-  document.getElementById('insp-dedup-sub').innerText =
-    `Intra-batch dedup saved ${savedPct}%`;
-
-  const statusMap = {
-    ongoing: `Turn: ${currentPlayer === 0 ? 'X (Player 1)' : 'O (Player 2)'}`,
-    p1_win: '🏆 Player 1 (X) Wins!',
-    p2_win: '🏆 Player 2 (O) Wins!',
-    draw: '🤝 Draw Game!'
-  };
-  document.getElementById('play-status').innerText = statusMap[insp.status] || insp.status;
-
-  const tbody = document.getElementById('insp-tbody');
-  tbody.innerHTML = [0,1,2,3,4,5,6,7,8].map(i => {
-    if (!insp.legal_mask[i]) {
-      return `<tr style="opacity:0.4"><td>Cell ${i} (${Math.floor(i/3)}, ${i%3})</td><td colspan="4">Occupied (${board[i]})</td></tr>`;
-    }
-    const vPct = totalVisits > 0 ? ((insp.mcts_visits[i] / totalVisits) * 100).toFixed(1) : '0.0';
-    return `
-      <tr style="${insp.chosen_move === i ? 'color:var(--green); font-weight:700;' : ''}">
-        <td>Cell ${i} (${Math.floor(i/3)}, ${i%3})</td>
-        <td>${(insp.raw_nn_priors[i] * 100).toFixed(1)}%</td>
-        <td>${insp.mcts_visits[i]}</td>
-        <td>${vPct}%</td>
-        <td>${insp.mcts_q_values[i] >= 0 ? '+' : ''}${insp.mcts_q_values[i].toFixed(3)}</td>
-      </tr>
-    `;
-  }).join('');
+    tbody.appendChild(tr);
+  }
 }
 
-async function playCell(idx) {
-  if (!lastInspection || lastInspection.status !== 'ongoing' || board[idx] !== '.') return;
+async function onCellClick(idx) {
+  if (!lastInspect || lastInspect.status !== 'ongoing' || !lastInspect.legal_mask[idx]) return;
   board[idx] = currentPlayer === 0 ? 'X' : 'O';
   currentPlayer = 1 - currentPlayer;
-  await inspectBoard();
-  if (document.getElementById('auto-ai').checked && lastInspection && lastInspection.status === 'ongoing') {
+  await inspectCurrentBoard();
+  if (document.getElementById('auto-ai').checked && lastInspect && lastInspect.status === 'ongoing') {
     await stepAiMove();
   }
 }
 
 async function stepAiMove() {
-  if (!lastInspection || lastInspection.status !== 'ongoing' || lastInspection.chosen_move === null) return;
-  const mv = lastInspection.chosen_move;
-  board[mv] = currentPlayer === 0 ? 'X' : 'O';
-  currentPlayer = 1 - currentPlayer;
-  await inspectBoard();
+  await inspectCurrentBoard();
+  if (lastInspect && lastInspect.status === 'ongoing' && lastInspect.chosen_move !== null) {
+    board[lastInspect.chosen_move] = currentPlayer === 0 ? 'X' : 'O';
+    currentPlayer = 1 - currentPlayer;
+    await inspectCurrentBoard();
+  }
 }
 
-setInterval(pollState, 500);
-pollState();
-resetBoard();
+function resetBoard() {
+  board = ['.', '.', '.', '.', '.', '.', '.', '.', '.'];
+  currentPlayer = 0;
+  inspectCurrentBoard();
+}
+
+renderBoardUI();
+fetchState();
+setInterval(fetchState, 800);
 </script>
 </body>
 </html>
@@ -2677,91 +4271,163 @@ resetBoard();
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::FnBatchEvaluator;
-    use crate::nn::default_device;
+    use crate::nn::AlphaZeroNetConfig;
     use crate::training::AlphaZeroTrainer;
+    use rand::SeedableRng;
 
     #[test]
     fn telemetry_hub_json_and_ttt_position_inspector_work() {
-        let eval = FnBatchEvaluator(
-            |_states: &[[f32; 27]], policies: &mut [[f32; 9]], values: &mut [[f32; 2]]| {
-                for p in policies.iter_mut() {
-                    *p = [0.1, 0.0, 0.1, 0.0, 0.8, 0.0, 0.1, 0.0, 0.1];
-                }
-                for v in values.iter_mut() {
-                    *v = [0.25, -0.25];
-                }
-            },
+        let dev = Device::Cpu;
+        let trainer = AlphaZeroTrainer::<27, 9, 2>::new(
+            AlphaZeroNetConfig::tic_tac_toe_mlp(),
+            1e-3,
+            1e-4,
+            dev.clone(),
+        )
+        .expect("trainer init");
+        let service = Arc::new(
+            trainer
+                .build_inference_service(16, &[dev])
+                .expect("service init"),
         );
-        let service = InferenceService::new(eval, 16, 1);
+
+        let hub = TelemetryHub::new("Cpu", 10, LiveKnobs::default());
+        let svc_ref = Arc::clone(&service);
+        hub.set_inspector(move |game, sims| inspect_ttt_position(game, &svc_ref, sims));
+
         let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+        let inspection = inspect_ttt_position(&game, &service, 32);
+        assert_eq!(inspection.status, "ongoing");
+        assert!(inspection.legal_mask.iter().all(|&b| b));
+        assert!(inspection.chosen_move.is_some());
 
-        let insp = inspect_ttt_position(&game, &service, 64);
-        assert_eq!(insp.status, "ongoing");
-        assert!(insp.raw_nn_priors[4] > insp.raw_nn_priors[0]);
-        assert!((insp.raw_nn_value - 0.25).abs() < 1e-5);
-        // 8 trees x 8 simulations/tree = 64 total simulations (8 root expansions + 56 child visits).
-        assert_eq!(insp.mcts_visits.iter().sum::<u64>(), 56);
-        assert!(insp.chosen_move.is_some());
-        assert!(insp.nn_requests >= insp.nn_unique_evals);
+        let prior_sum: f32 = inspection.raw_nn_priors.iter().sum();
+        assert!(
+            (prior_sum - 1.0).abs() < 1e-4,
+            "priors must sum to 1.0, got {prior_sum}"
+        );
 
-        let hub = TelemetryHub::new("CPU", 10, LiveKnobs::default());
         let json = hub.to_json();
-        assert!(json.contains("\"device_name\":\"CPU\""));
+        assert!(json.contains("\"device_name\":\"Cpu\""));
     }
 
     #[test]
-    fn arena_multi_match_between_all_ttt_engines_works() {
-        let dev = default_device();
-        let net_cfg = AlphaZeroNetConfig::tic_tac_toe_mlp();
-        let trainer =
-            AlphaZeroTrainer::<27, 9, 2>::new(net_cfg, 1e-3, 1e-4, dev.clone()).unwrap();
-        let live_svc = Arc::new(
-            trainer
+    fn arena_multi_match_and_calibration_work_for_ttt_and_uttt() {
+        let dev = Device::Cpu;
+        let ttt_cfg = AlphaZeroNetConfig::tic_tac_toe_mlp();
+        let ttt_trainer =
+            AlphaZeroTrainer::<27, 9, 2>::new(ttt_cfg, 1e-3, 1e-4, dev.clone()).expect("ttt init");
+        let ttt_service = Arc::new(
+            ttt_trainer
                 .build_inference_service(16, std::slice::from_ref(&dev))
-                .unwrap(),
+                .expect("ttt service"),
         );
 
-        let hub = TelemetryHub::new("CPU", 5, LiveKnobs::default());
-        hub.attach_ttt_service(live_svc, net_cfg, vec![dev]);
+        let uttt_cfg = AlphaZeroNetConfig::ultimate_ttt_mlp();
+        let uttt_trainer = AlphaZeroTrainer::<324, 81, 2>::new(uttt_cfg, 1e-3, 1e-4, dev.clone())
+            .expect("uttt init");
+        let uttt_service = Arc::new(
+            uttt_trainer
+                .build_inference_service(16, std::slice::from_ref(&dev))
+                .expect("uttt service"),
+        );
 
-        // 1. AlphaZero (live) vs MCTS (classical UCT)
+        let hub = TelemetryHub::new("Cpu", 5, LiveKnobs::default());
+        hub.attach_ttt_service(ttt_service, ttt_cfg, vec![dev.clone()]);
+        hub.attach_uttt_service(uttt_service, uttt_cfg, vec![dev]);
+
+        // 1. Calibration works for TTT
+        let cal_ttt = hub.calibrate_game(LabGame::Ttt).expect("calibrate ttt");
+        assert_eq!(cal_ttt.game, "ttt");
+        assert!(cal_ttt.alphazero_us_per_sim_1tree > 0.0);
+        assert!(!cal_ttt.minimax_depths.is_empty());
+
+        // 2. Match works for UTTT (AlphaZero vs Tree-Minimax)
         let cfg_az = TttEngineConfig {
             engine: "alphazero".to_string(),
             model: "live".to_string(),
-            sims: 16,
-            num_trees: 2,
-            ..Default::default()
-        };
-        let cfg_mcts = TttEngineConfig {
-            engine: "mcts".to_string(),
-            sims: 32,
+            sims: 8,
             num_trees: 1,
             ..Default::default()
         };
-        let rec1 = hub
-            .run_ttt_match(&cfg_az, &cfg_mcts, 8, 2, 16, 42)
-            .expect("AZ vs MCTS match must succeed");
-        assert_eq!(rec1.wins_a + rec1.draws + rec1.wins_b, 8);
-        assert!(rec1.nn_logical_batch >= 1.0);
-
-        // 2. Tree-Minimax vs Minimax
-        let cfg_tmm = TttEngineConfig {
+        let cfg_tm = TttEngineConfig {
             engine: "tree-minimax".to_string(),
-            budget_kind: "depth".to_string(),
-            budget_val: 3,
+            budget_kind: "evals".to_string(),
+            budget_val: 32,
             use_heuristic: true,
+            arena_cap: 2048,
             ..Default::default()
         };
-        let cfg_mm = TttEngineConfig {
-            engine: "minimax".to_string(),
-            depth: 2,
-            use_heuristic: true,
-            ..Default::default()
+        let rec = hub
+            .run_match_for_game(LabGame::Uttt, &cfg_az, &cfg_tm, 4, 2, 16, 42)
+            .expect("uttt match");
+        assert_eq!(rec.game, "uttt");
+        assert_eq!(rec.wins_a + rec.draws + rec.wins_b, 4);
+        assert!(rec.a_us_per_move > 0.0);
+        assert!(rec.b_us_per_move > 0.0);
+
+        // 3. UTTT self-play + SGD train_epoch
+        let mut uttt_trainer = uttt_trainer;
+        let mut uttt_buffer = crate::training::ReplayBuffer::<324, 81, 2>::new(4096);
+        let mut rng = rand::prelude::SmallRng::seed_from_u64(2026);
+        let root_uttt = UtttGame::new(PlayerIndex::PLAYER1, UTTT_EMPTY_STATE);
+        let sp_cfg = crate::alphazero::SelfPlayConfig::new(4, 8, 5131)
+            .with_workers(2)
+            .with_opening_moves(4)
+            .with_puct(19_652.0, 1.25)
+            .with_dirichlet(0.3, 0.25);
+        let uttt_svc = hub
+            .inner
+            .lock()
+            .unwrap()
+            .uttt_context
+            .as_ref()
+            .unwrap()
+            .live_service
+            .clone();
+        let sp_res = crate::alphazero::run_self_play(&root_uttt, &uttt_svc, &sp_cfg);
+        assert_eq!(sp_res.total_games, 4);
+        uttt_buffer.extend(&sp_res.positions);
+        let metrics = uttt_trainer
+            .train_epoch(&uttt_buffer, &uttt_svc, 16, 4, &mut rng)
+            .expect("uttt train_epoch");
+        assert!(metrics.total_loss.is_finite());
+    }
+
+    struct FragmentedReader {
+        chunks: Vec<Vec<u8>>,
+        idx: usize,
+    }
+
+    impl Read for FragmentedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.idx >= self.chunks.len() {
+                return Ok(0);
+            }
+            let chunk = &self.chunks[self.idx];
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            self.idx += 1;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn fragmented_http_post_body_is_reassembled_across_reads() {
+        let json_body = b"{\"action\":\"start\",\"game\":\"uttt\",\"total_iterations\":30}";
+        let headers = format!(
+            "POST /api/train_control HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            json_body.len()
+        );
+        let mut reader = FragmentedReader {
+            chunks: vec![headers.into_bytes(), json_body.to_vec()],
+            idx: 0,
         };
-        let rec2 = hub
-            .run_ttt_match(&cfg_tmm, &cfg_mm, 8, 2, 16, 99)
-            .expect("TreeMinimax vs Minimax match must succeed");
-        assert_eq!(rec2.wins_a + rec2.draws + rec2.wins_b, 8);
+        let (method, path, body) = read_http_request(&mut reader).expect("read fragmented post");
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/api/train_control");
+        assert_eq!(extract_json_str(&body, "action").as_deref(), Some("start"));
+        assert_eq!(extract_json_str(&body, "game").as_deref(), Some("uttt"));
+        assert_eq!(extract_json_f64(&body, "total_iterations"), Some(30.0));
     }
 }

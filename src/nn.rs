@@ -19,6 +19,7 @@
 //!    learnable parameter saved/loaded by `.safetensors`.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{
@@ -28,27 +29,17 @@ use candle_nn::{
 
 use crate::inference::BatchEvaluator;
 
-/// Selects the best single accelerator device available on the current machine
-/// (`CUDA(0)` -> `Metal(0)` -> `Cpu`).
-pub fn default_device() -> Device {
-    if let Ok(dev) = Device::new_cuda(0) {
-        return dev;
-    }
-    if let Ok(dev) = Device::new_metal(0) {
-        return dev;
-    }
-    Device::Cpu
-}
-
-/// Discovers up to `max_workers` inference devices for [`crate::inference::InferenceService`].
+/// Process-wide cache of discovered hardware accelerator devices so that [`default_device`] and
+/// [`discover_devices`] always return clones of the **exact same** `Device` instance (`DeviceId`).
 ///
-/// - On a multi-GPU RunPod node (`--features cuda`), binds `worker_id` `0..K` to `CUDA(0)..CUDA(K-1)`.
-/// - On Apple Silicon (`--features metal`), binds to `Metal(0)`.
-/// - Otherwise falls back to `Device::Cpu`.
-pub fn discover_devices(max_workers: usize) -> Vec<Device> {
-    let limit = max_workers.max(1);
+/// In `candle_core`, each call to `Device::new_metal(0)` or `Device::new_cuda(idx)` allocates a
+/// distinct internal `DeviceId`, which would cause `Tensor::matmul` to fail with a `device mismatch`
+/// error if a model is built on one `Device::new_metal(0)` call and evaluated on another!
+static CACHED_DEVICES: OnceLock<Vec<Device>> = OnceLock::new();
+
+fn init_hardware_devices() -> Vec<Device> {
     let mut cuda_devices = Vec::new();
-    for idx in 0..limit {
+    for idx in 0..16 {
         if let Ok(dev) = Device::new_cuda(idx) {
             cuda_devices.push(dev);
         } else {
@@ -62,6 +53,23 @@ pub fn discover_devices(max_workers: usize) -> Vec<Device> {
         return vec![dev];
     }
     vec![Device::Cpu]
+}
+
+/// Selects the best single accelerator device available on the current machine
+/// (`CUDA(0)` -> `Metal(0)` -> `Cpu`), sharing the same underlying `DeviceId` as [`discover_devices`].
+pub fn default_device() -> Device {
+    CACHED_DEVICES.get_or_init(init_hardware_devices)[0].clone()
+}
+
+/// Discovers up to `max_workers` inference devices for [`crate::inference::InferenceService`].
+///
+/// - On a multi-GPU RunPod node (`--features cuda`), binds `worker_id` `0..K` to `CUDA(0)..CUDA(K-1)`.
+/// - On Apple Silicon (`--features metal`), binds to `Metal(0)`.
+/// - Otherwise falls back to `Device::Cpu`.
+pub fn discover_devices(max_workers: usize) -> Vec<Device> {
+    let limit = max_workers.max(1);
+    let all = CACHED_DEVICES.get_or_init(init_hardware_devices);
+    all.iter().take(limit).cloned().collect()
 }
 
 /// Architecture configuration for [`AlphaZeroNet`].
@@ -123,6 +131,15 @@ impl AlphaZeroNetConfig {
             policy_channels: 8,
             value_channels: 4,
             fc_hidden: 128,
+        }
+    }
+
+    /// Fast Residual MLP configuration for `9x9` Ultimate Tic-Tac-Toe (`G = 324, P = 81, N = 2`).
+    pub const fn ultimate_ttt_mlp() -> Self {
+        Self::ResMlp {
+            hidden_dim: 128,
+            num_res_blocks: 2,
+            head_hidden: 96,
         }
     }
 
@@ -446,10 +463,18 @@ impl<const G: usize, const P: usize, const N: usize> CandleBatchEvaluator<G, P, 
         assert!(!devices.is_empty(), "devices slice must not be empty");
         let mut replicas = Vec::with_capacity(devices.len());
 
+        // Always bind Replica 0 to the exact `Device` (`DeviceId`) that `master_varmap`'s tensors
+        // were allocated on so `evaluate_batch` can never hit a `DeviceId` mismatch against `master_net`.
+        let master_device = master_varmap
+            .all_vars()
+            .first()
+            .map(|v| v.device().clone())
+            .unwrap_or_else(|| devices[0].clone());
+
         replicas.push(WorkerReplica {
             varmap: master_varmap.clone(),
             net: master_net.clone(),
-            device: devices[0].clone(),
+            device: master_device,
         });
 
         for dev in &devices[1..] {
@@ -546,6 +571,30 @@ impl<const G: usize, const P: usize, const N: usize> CandleBatchEvaluator<G, P, 
     pub fn load_safetensors<Pth: AsRef<Path>>(&self, path: Pth) -> Result<()> {
         let mut master_varmap = self.replicas[0].varmap.clone();
         master_varmap.load(path)?;
+        self.sync_workers()
+    }
+
+    /// Re-initializes the live model weights in-place to fresh random values and synchronizes all replicas.
+    pub fn reset_random_weights(&self, net_config: &AlphaZeroNetConfig) -> Result<()> {
+        let fresh_varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&fresh_varmap, DType::F32, &self.replicas[0].device);
+        let _fresh_net = AlphaZeroNet::<G, P, N>::new(vb, net_config)?;
+        {
+            let src_guard = fresh_varmap
+                .data()
+                .lock()
+                .expect("fresh varmap mutex poisoned");
+            let dst_guard = self.replicas[0]
+                .varmap
+                .data()
+                .lock()
+                .expect("master varmap mutex poisoned");
+            for (name, src_var) in src_guard.iter() {
+                if let Some(dst_var) = dst_guard.get(name) {
+                    dst_var.set(src_var.as_tensor())?;
+                }
+            }
+        }
         self.sync_workers()
     }
 }
