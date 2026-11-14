@@ -24,12 +24,11 @@
 
 use std::task::Poll;
 
-use rand::prelude::{IndexedRandom, Rng, RngExt, SeedableRng, SliceRandom, SmallRng};
-use rand_distr::{Distribution, Gamma};
+use rand::prelude::{IndexedRandom, RngExt, SeedableRng, SliceRandom, SmallRng};
 
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::player::Player;
-use crate::tree::{GenerationalTree, Node, NodeId, TreeArena};
+use crate::tree::{GenerationalTree, Node, NodeId};
 
 /// Per-node statistics stored inside [`Node<M, MctsPayload>`].
 ///
@@ -185,6 +184,15 @@ pub trait LeafEvaluator<R: GameRules<N>, const N: usize> {
     /// Wakes any background evaluation service before the caller parks waiting for responses.
     #[inline]
     fn notify_pending(&mut self) {}
+
+    /// Hook invoked once per turn on the root node's children after their initial priors have
+    /// been assigned (either immediately after the root is evaluated on Move 1, or at the start
+    /// of the turn's search when the root was reused from a previous turn's subtree).
+    ///
+    /// Classical evaluators ([`PlayoutEvaluator`]) leave this as a no-op, whereas
+    /// [`crate::alphazero::NnEvaluator`] uses it to blend root Dirichlet exploration noise.
+    #[inline]
+    fn prepare_root(&mut self, _root_children: &mut [Node<R::Move, MctsPayload>]) {}
 }
 
 /// Classical uniform random rollout evaluator (port of `montecarlo::Player::playout`).
@@ -269,9 +277,7 @@ pub struct MctsSearch<R: GameRules<N>, const N: usize, S: SelectionPolicy> {
     tree: GenerationalTree<R::Move, MctsPayload>,
     selector: S,
     rng: SmallRng,
-    dirichlet_alpha: f32,
-    dirichlet_epsilon: f32,
-    root_noise_applied: bool,
+    root_prepared: bool,
     sims_done: usize,
     pending_leaf: Option<(NodeId, Game<R, N>)>,
     /// Reusable root-to-leaf `(child_id, acting_player_who_chose_child)` stack.
@@ -296,23 +302,12 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
             tree: GenerationalTree::new(arena_capacity, dummy_move, MctsPayload::default()),
             selector,
             rng: SmallRng::seed_from_u64(seed),
-            dirichlet_alpha: 0.3,
-            dirichlet_epsilon: 0.0,
-            root_noise_applied: false,
+            root_prepared: false,
             sims_done: 0,
             pending_leaf: None,
             path_buf: Vec::with_capacity(64),
             move_buf: Vec::with_capacity(32),
         }
-    }
-
-    /// Configures root Dirichlet exploration noise `(alpha, epsilon)` mixed into root priors
-    /// once the root node's children have been evaluated.
-    #[inline]
-    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
-        self.dirichlet_alpha = alpha;
-        self.dirichlet_epsilon = epsilon;
-        self
     }
 
     #[inline]
@@ -328,13 +323,6 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     #[inline]
     pub fn tree_mut(&mut self) -> &mut GenerationalTree<R::Move, MctsPayload> {
         &mut self.tree
-    }
-
-    /// Returns disjoint mutable references to the generational arena tree and internal RNG
-    /// (allowing callers such as root Dirichlet noise to mutate `tree` while sampling `rng`).
-    #[inline]
-    pub fn tree_and_rng_mut(&mut self) -> (&mut GenerationalTree<R::Move, MctsPayload>, &mut SmallRng) {
-        (&mut self.tree, &mut self.rng)
     }
 
     #[inline]
@@ -435,18 +423,12 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     ) -> Poll<()> {
         while self.sims_done < target_simulations {
             if self.pending_leaf.is_none() {
-                if !self.root_noise_applied
-                    && self.dirichlet_epsilon > 0.0
+                if !self.root_prepared
                     && self.tree.root().payload.visits > 0
                     && !self.tree.active().children(NodeId::ROOT).is_empty()
                 {
-                    apply_root_dirichlet_noise(
-                        self.tree.active_mut(),
-                        self.dirichlet_alpha,
-                        self.dirichlet_epsilon,
-                        &mut self.rng,
-                    );
-                    self.root_noise_applied = true;
+                    evaluator.prepare_root(self.tree.active_mut().children_mut(NodeId::ROOT));
+                    self.root_prepared = true;
                 }
 
                 match self.select_to_leaf() {
@@ -470,19 +452,11 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
             match evaluator.poll_evaluate(leaf_game, children) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(payoffs) => {
-                    self.pending_leaf = None;
-                    if leaf_id == NodeId::ROOT
-                        && !self.root_noise_applied
-                        && self.dirichlet_epsilon > 0.0
-                    {
-                        apply_root_dirichlet_noise(
-                            self.tree.active_mut(),
-                            self.dirichlet_alpha,
-                            self.dirichlet_epsilon,
-                            &mut self.rng,
-                        );
-                        self.root_noise_applied = true;
+                    if leaf_id == NodeId::ROOT && !self.root_prepared {
+                        evaluator.prepare_root(children);
+                        self.root_prepared = true;
                     }
+                    self.pending_leaf = None;
                     self.backpropagate(payoffs);
                     self.sims_done += 1;
                 }
@@ -569,7 +543,7 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     pub fn advance(&mut self, mv: R::Move) -> bool {
         self.root_game = self.root_game.apply(mv);
         self.sims_done = 0;
-        self.root_noise_applied = false;
+        self.root_prepared = false;
         self.pending_leaf = None;
         self.tree.advance_or_reset(mv)
     }
@@ -579,7 +553,7 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     pub fn advance_to_child(&mut self, child_id: NodeId, mv: R::Move) {
         self.root_game = self.root_game.apply(mv);
         self.sims_done = 0;
-        self.root_noise_applied = false;
+        self.root_prepared = false;
         self.pending_leaf = None;
         self.tree.advance_to(child_id);
     }
@@ -590,7 +564,7 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
     pub fn reset(&mut self, root_game: Game<R, N>, dummy_move: R::Move) {
         self.root_game = root_game;
         self.sims_done = 0;
-        self.root_noise_applied = false;
+        self.root_prepared = false;
         self.pending_leaf = None;
         self.tree.reset_root(dummy_move, MctsPayload::default());
         self.path_buf.clear();
@@ -660,8 +634,6 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
 pub struct MctsConfig {
     pub simulations: usize,
     pub opening_moves: usize,
-    pub dirichlet_alpha: f32,
-    pub dirichlet_epsilon: f32,
     pub arena_capacity: usize,
     pub seed: u64,
 }
@@ -671,8 +643,6 @@ impl MctsConfig {
         Self {
             simulations,
             opening_moves: 0,
-            dirichlet_alpha: 0.3,
-            dirichlet_epsilon: 0.0,
             arena_capacity: simulations * 16,
             seed,
         }
@@ -680,12 +650,6 @@ impl MctsConfig {
 
     pub const fn with_opening_moves(mut self, opening_moves: usize) -> Self {
         self.opening_moves = opening_moves;
-        self
-    }
-
-    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
-        self.dirichlet_alpha = alpha;
-        self.dirichlet_epsilon = epsilon;
         self
     }
 
@@ -731,8 +695,7 @@ where
                 selector,
                 config.arena_capacity,
                 config.seed,
-            )
-            .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon),
+            ),
             evaluator,
             simulations: config.simulations,
             opening_moves: config.opening_moves,
@@ -795,45 +758,6 @@ where
     fn apply_external_move(&mut self, mv: R::Move) {
         self.move_count += 1;
         self.search.advance(mv);
-    }
-}
-
-/// Blends symmetric `Dirichlet(alpha)` exploration noise into the root node's child priors:
-/// `P'(s_root, a) = (1 - epsilon) * P(s_root, a) + epsilon * noise_a`.
-///
-/// Must be called *after* the root's children have been expanded and assigned their neural network
-/// softmax priors `P(s_root, a)`.
-pub fn apply_root_dirichlet_noise<M: Copy>(
-    arena: &mut TreeArena<M, MctsPayload>,
-    alpha: f32,
-    epsilon: f32,
-    rng: &mut impl Rng,
-) {
-    if epsilon <= 0.0 || alpha <= 0.0 {
-        return;
-    }
-    let children = arena.children_mut(NodeId::ROOT);
-    if children.len() <= 1 {
-        return;
-    }
-
-    let gamma = Gamma::new(alpha as f64, 1.0).expect("Dirichlet alpha must be > 0 and finite");
-    let mut samples = Vec::with_capacity(children.len());
-    let mut sum = 0.0f64;
-    for _ in 0..children.len() {
-        let s = gamma.sample(rng);
-        samples.push(s);
-        sum += s;
-    }
-
-    if sum <= f64::EPSILON {
-        return;
-    }
-
-    let inv_sum = 1.0 / sum;
-    for (child, &sample) in children.iter_mut().zip(samples.iter()) {
-        let noise = (sample * inv_sum) as f32;
-        child.payload.prior = (1.0 - epsilon) * child.payload.prior + epsilon * noise;
     }
 }
 

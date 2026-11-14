@@ -46,8 +46,6 @@ pub enum RootParallelBudget {
 pub struct RootParallelConfig {
     pub budget: RootParallelBudget,
     pub opening_moves: usize,
-    pub dirichlet_alpha: f32,
-    pub dirichlet_epsilon: f32,
     pub arena_capacity_per_thread: usize,
     pub seed: u64,
 }
@@ -68,8 +66,6 @@ impl RootParallelConfig {
         Self {
             budget,
             opening_moves: 0,
-            dirichlet_alpha: 0.3,
-            dirichlet_epsilon: 0.0,
             arena_capacity_per_thread: default_cap,
             seed,
         }
@@ -77,12 +73,6 @@ impl RootParallelConfig {
 
     pub const fn with_opening_moves(mut self, opening_moves: usize) -> Self {
         self.opening_moves = opening_moves;
-        self
-    }
-
-    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
-        self.dirichlet_alpha = alpha;
-        self.dirichlet_epsilon = epsilon;
         self
     }
 
@@ -164,8 +154,7 @@ where
                         selector,
                         config.arena_capacity_per_thread,
                         thread_seed,
-                    )
-                    .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon),
+                    ),
                     evaluator: make_evaluator(t, eval_seed),
                     done: false,
                 }

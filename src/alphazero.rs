@@ -28,7 +28,8 @@
 
 use std::task::Poll;
 
-use rand::prelude::{SeedableRng, SmallRng};
+use rand::prelude::{Rng, SeedableRng, SmallRng};
+use rand_distr::{Distribution, Gamma};
 
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::games::rubiks_cube::{self, RubiksCube};
@@ -37,7 +38,6 @@ use crate::games::twist_puzzle::{self, TwistPuzzle};
 use crate::games::ultimate_ttt::{self, UltimateTicTacToe};
 use crate::inference::{BatchEvaluator, InferenceClient, InferenceService};
 use crate::matchup::{PollableSlot, run_parallel_games};
-pub use crate::mcts::apply_root_dirichlet_noise;
 use crate::mcts::{
     LeafEvaluator, MctsPayload, MctsSearch, Puct, assign_masked_softmax_priors,
 };
@@ -46,7 +46,7 @@ use crate::root_parallel::{
     AggregatedRootChild, RootParallelBudget, RootParallelConfig, RootParallelPlayer,
 };
 use crate::statistics::Statistics;
-use crate::tree::{Node, NodeId};
+use crate::tree::{Node, NodeId, TreeArena};
 
 /// Trait bridging a [`GameRules<N>`] implementation to a neural network with flattened state
 /// input size `G` and policy logit output size `P`.
@@ -172,16 +172,66 @@ pub fn absolute_to_relative_values<const N: usize>(
     rel
 }
 
-/// Asynchronous neural-network [`LeafEvaluator`] that submits encoded leaf positions to a
-/// batched [`InferenceService`] and assigns masked softmax policy priors when the batch
-/// response arrives.
+/// Blends symmetric `Dirichlet(alpha)` exploration noise into a slice of root child nodes:
+/// `P'(s_root, a) = (1 - epsilon) * P(s_root, a) + epsilon * noise_a`.
 ///
-/// Pairing [`MctsSearch`] with [`Puct`] and [`NnEvaluator`] turns standard MCTS into AlphaZero.
+/// Must be called *after* the root's children have been expanded and assigned their neural network
+/// softmax priors `P(s_root, a)`.
+pub fn apply_dirichlet_noise_to_children<M: Copy>(
+    children: &mut [Node<M, MctsPayload>],
+    alpha: f32,
+    epsilon: f32,
+    rng: &mut impl Rng,
+) {
+    if epsilon <= 0.0 || alpha <= 0.0 || children.len() <= 1 {
+        return;
+    }
+
+    let gamma = Gamma::new(alpha as f64, 1.0).expect("Dirichlet alpha must be > 0 and finite");
+    let mut samples = Vec::with_capacity(children.len());
+    let mut sum = 0.0f64;
+    for _ in 0..children.len() {
+        let s = gamma.sample(rng);
+        samples.push(s);
+        sum += s;
+    }
+
+    if sum <= f64::EPSILON {
+        return;
+    }
+
+    let inv_sum = 1.0 / sum;
+    for (child, &sample) in children.iter_mut().zip(samples.iter()) {
+        let noise = (sample * inv_sum) as f32;
+        child.payload.prior = (1.0 - epsilon) * child.payload.prior + epsilon * noise;
+    }
+}
+
+/// Blends symmetric `Dirichlet(alpha)` exploration noise into the root node's child priors in `arena`.
+#[inline]
+pub fn apply_root_dirichlet_noise<M: Copy>(
+    arena: &mut TreeArena<M, MctsPayload>,
+    alpha: f32,
+    epsilon: f32,
+    rng: &mut impl Rng,
+) {
+    apply_dirichlet_noise_to_children(arena.children_mut(NodeId::ROOT), alpha, epsilon, rng);
+}
+
+/// Asynchronous neural-network [`LeafEvaluator`] that submits encoded leaf positions to a
+/// batched [`InferenceService`], assigns masked softmax policy priors when the batch response
+/// arrives, and blends root Dirichlet exploration noise via [`LeafEvaluator::prepare_root`].
+///
+/// Pairing [`MctsSearch`] with [`Puct`] and [`NnEvaluator`] turns standard MCTS into AlphaZero
+/// without polluting classical MCTS configs with neural network or Dirichlet noise parameters.
 pub struct NnEvaluator<'a, E, const G: usize, const P: usize, const N: usize>
 where
     E: BatchEvaluator<G, P, N> + 'static,
 {
     client: InferenceClient<'a, E, G, P, N>,
+    rng: SmallRng,
+    dirichlet_alpha: f32,
+    dirichlet_epsilon: f32,
     waiting: bool,
     unnotified: bool,
 }
@@ -191,12 +241,24 @@ where
     E: BatchEvaluator<G, P, N> + 'static,
 {
     #[inline]
-    pub fn new(service: &'a InferenceService<E, G, P, N>) -> Self {
+    pub fn new(service: &'a InferenceService<E, G, P, N>, seed: u64) -> Self {
         Self {
             client: service.client(1),
+            rng: SmallRng::seed_from_u64(seed),
+            dirichlet_alpha: 0.3,
+            dirichlet_epsilon: 0.0,
             waiting: false,
             unnotified: false,
         }
+    }
+
+    /// Configures root Dirichlet exploration noise `(alpha, epsilon)` blended into root child
+    /// priors inside [`LeafEvaluator::prepare_root`].
+    #[inline]
+    pub const fn with_dirichlet(mut self, alpha: f32, epsilon: f32) -> Self {
+        self.dirichlet_alpha = alpha;
+        self.dirichlet_epsilon = epsilon;
+        self
     }
 
     /// Wakes an idle background inference worker if this evaluator has enqueued an unnotified request.
@@ -247,6 +309,16 @@ where
     #[inline]
     fn notify_pending(&mut self) {
         self.notify();
+    }
+
+    #[inline]
+    fn prepare_root(&mut self, root_children: &mut [Node<R::Move, MctsPayload>]) {
+        apply_dirichlet_noise_to_children(
+            root_children,
+            self.dirichlet_alpha,
+            self.dirichlet_epsilon,
+            &mut self.rng,
+        );
     }
 
     fn evaluate(
@@ -381,7 +453,6 @@ where
             config.seed,
         )
         .with_opening_moves(config.opening_moves)
-        .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon)
         .with_arena_capacity_per_thread(config.resolved_arena_capacity());
 
         Self {
@@ -391,7 +462,10 @@ where
                 Puct::new(config.c_base, config.c_init),
                 num_trees,
                 rp_config,
-                |_t, _eval_seed| NnEvaluator::new(service),
+                |_t, eval_seed| {
+                    NnEvaluator::new(service, eval_seed)
+                        .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon)
+                },
             ),
         }
     }
@@ -623,12 +697,13 @@ where
             puct,
             config.resolved_arena_capacity(),
             slot_seed,
-        )
-        .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon);
+        );
+        let evaluator = NnEvaluator::new(service, slot_seed ^ 0xBF58_476D_1CE4_E5B9)
+            .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon);
 
         Self {
             search,
-            evaluator: NnEvaluator::new(service),
+            evaluator,
             simulations_per_move: config.simulations_per_move,
             opening_moves: config.opening_moves,
             move_count: 0,
@@ -889,9 +964,8 @@ mod tests {
 
         // Also directly test that after 1 simulation + Dirichlet noise via `poll_simulations`,
         // priors are non-uniform and sum to 1.0 (catching the C++ Move-1 overwrite bug).
-        let mut search = MctsSearch::new(game, tic_tac_toe::NO_MOVE, Puct::default(), 512, 99)
-            .with_dirichlet(0.3, 0.25);
-        let mut nn_eval = NnEvaluator::new(&service);
+        let mut search = MctsSearch::new(game, tic_tac_toe::NO_MOVE, Puct::default(), 512, 99);
+        let mut nn_eval = NnEvaluator::new(&service, 99).with_dirichlet(0.3, 0.25);
         search.run_simulations(1, &mut nn_eval);
 
         // Run simulation 2: must NOT overwrite the root's Dirichlet-perturbed priors!
