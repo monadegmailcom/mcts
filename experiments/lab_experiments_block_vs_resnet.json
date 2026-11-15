@@ -1,0 +1,1037 @@
+{
+  "next_id": 6,
+  "runs": [
+    {
+      "id": 1,
+      "spec": {
+        "name": "UTTT block net (tch MPS)",
+        "game": "uttt",
+        "net": "block",
+        "backend": "tch",
+        "device": "gpu",
+        "hp": {
+          "games_per_iteration": 256,
+          "simulations_per_move": 64,
+          "self_play_threads": 0,
+          "opening_moves": 8,
+          "dirichlet_alpha": 0.3,
+          "dirichlet_epsilon": 0.25,
+          "c_init": 1.25,
+          "c_base": 19652.0,
+          "value_q_weight": 0.5,
+          "train_steps": 200,
+          "batch_size": 256,
+          "learning_rate": 0.002,
+          "weight_decay": 0.0001,
+          "buffer_capacity": 300000,
+          "eval_games": 48,
+          "eval_sims": 0,
+          "eval_threads": 0
+        },
+        "budget_minutes": 20.0,
+        "max_iterations": 0,
+        "eval_every": 8,
+        "eval_sims": 100,
+        "eval_games": 48,
+        "infer_batch": 256,
+        "opponents": [],
+        "init_checkpoint": ""
+      },
+      "status": {
+        "state": "Done"
+      },
+      "opponents": [
+        "MCTS-200 rollouts",
+        "Minimax d=1",
+        "Minimax d=2"
+      ],
+      "device_label": "tch MPS · block net",
+      "points": [
+        {
+          "iteration": 0,
+          "games": 0,
+          "positions": 0,
+          "train_secs": 0.0,
+          "wall_secs": 12.956400125,
+          "scores": [
+            4.166667,
+            12.5,
+            6.25
+          ],
+          "value_loss": 0.0,
+          "policy_kl": 0.0,
+          "sims_per_sec": 0.0
+        },
+        {
+          "iteration": 8,
+          "games": 2048,
+          "positions": 103590,
+          "train_secs": 56.23513970800001,
+          "wall_secs": 79.129207458,
+          "scores": [
+            57.291668,
+            62.5,
+            50.0
+          ],
+          "value_loss": 0.20821647,
+          "policy_kl": 0.16189432,
+          "sims_per_sec": 138221.7
+        },
+        {
+          "iteration": 16,
+          "games": 4096,
+          "positions": 206586,
+          "train_secs": 109.076951958,
+          "wall_secs": 141.912168333,
+          "scores": [
+            85.41667,
+            92.70833,
+            78.125
+          ],
+          "value_loss": 0.19612882,
+          "policy_kl": 0.17710435,
+          "sims_per_sec": 148711.55
+        },
+        {
+          "iteration": 24,
+          "games": 6144,
+          "positions": 310723,
+          "train_secs": 163.216814791,
+          "wall_secs": 208.674983708,
+          "scores": [
+            85.41667,
+            95.83333,
+            87.5
+          ],
+          "value_loss": 0.18569003,
+          "policy_kl": 0.18141975,
+          "sims_per_sec": 154270.1
+        },
+        {
+          "iteration": 32,
+          "games": 8192,
+          "positions": 414685,
+          "train_secs": 223.060047832,
+          "wall_secs": 278.239069083,
+          "scores": [
+            94.79167,
+            97.91667,
+            93.75
+          ],
+          "value_loss": 0.17488939,
+          "policy_kl": 0.18961981,
+          "sims_per_sec": 139057.78
+        },
+        {
+          "iteration": 40,
+          "games": 10240,
+          "positions": 517284,
+          "train_secs": 278.85059091600004,
+          "wall_secs": 343.45091875,
+          "scores": [
+            96.875,
+            98.95833,
+            97.91667
+          ],
+          "value_loss": 0.1687478,
+          "policy_kl": 0.19504724,
+          "sims_per_sec": 154238.6
+        },
+        {
+          "iteration": 48,
+          "games": 12288,
+          "positions": 619566,
+          "train_secs": 334.62621745700005,
+          "wall_secs": 409.713511208,
+          "scores": [
+            97.91667,
+            100.0,
+            95.83333
+          ],
+          "value_loss": 0.16649766,
+          "policy_kl": 0.20444013,
+          "sims_per_sec": 128823.055
+        },
+        {
+          "iteration": 56,
+          "games": 14336,
+          "positions": 721986,
+          "train_secs": 388.50214920600007,
+          "wall_secs": 472.751062125,
+          "scores": [
+            100.0,
+            100.0,
+            97.91667
+          ],
+          "value_loss": 0.16813424,
+          "policy_kl": 0.20952757,
+          "sims_per_sec": 148573.27
+        },
+        {
+          "iteration": 64,
+          "games": 16384,
+          "positions": 824112,
+          "train_secs": 441.44146041400006,
+          "wall_secs": 534.515261666,
+          "scores": [
+            97.91667,
+            98.95833,
+            98.95833
+          ],
+          "value_loss": 0.16736852,
+          "policy_kl": 0.20772606,
+          "sims_per_sec": 151212.89
+        },
+        {
+          "iteration": 72,
+          "games": 18432,
+          "positions": 926128,
+          "train_secs": 496.00939045700005,
+          "wall_secs": 598.445200291,
+          "scores": [
+            100.0,
+            97.91667,
+            100.0
+          ],
+          "value_loss": 0.16682763,
+          "policy_kl": 0.2115435,
+          "sims_per_sec": 140204.23
+        },
+        {
+          "iteration": 80,
+          "games": 20480,
+          "positions": 1028901,
+          "train_secs": 551.5873769580002,
+          "wall_secs": 663.277331041,
+          "scores": [
+            100.0,
+            100.0,
+            97.91667
+          ],
+          "value_loss": 0.16592222,
+          "policy_kl": 0.21585411,
+          "sims_per_sec": 143534.4
+        },
+        {
+          "iteration": 88,
+          "games": 22528,
+          "positions": 1130532,
+          "train_secs": 605.9508353740001,
+          "wall_secs": 727.889800916,
+          "scores": [
+            100.0,
+            98.95833,
+            98.95833
+          ],
+          "value_loss": 0.16105823,
+          "policy_kl": 0.22465631,
+          "sims_per_sec": 145716.97
+        },
+        {
+          "iteration": 96,
+          "games": 24576,
+          "positions": 1233462,
+          "train_secs": 659.6709928320001,
+          "wall_secs": 790.293078,
+          "scores": [
+            100.0,
+            100.0,
+            98.95833
+          ],
+          "value_loss": 0.15794775,
+          "policy_kl": 0.22965516,
+          "sims_per_sec": 149278.64
+        },
+        {
+          "iteration": 104,
+          "games": 26624,
+          "positions": 1335979,
+          "train_secs": 712.0092326230002,
+          "wall_secs": 851.678414791,
+          "scores": [
+            96.875,
+            100.0,
+            97.91667
+          ],
+          "value_loss": 0.15386635,
+          "policy_kl": 0.23326556,
+          "sims_per_sec": 151642.05
+        },
+        {
+          "iteration": 112,
+          "games": 28672,
+          "positions": 1437898,
+          "train_secs": 763.8940287880001,
+          "wall_secs": 912.7705705,
+          "scores": [
+            100.0,
+            100.0,
+            98.95833
+          ],
+          "value_loss": 0.15438904,
+          "policy_kl": 0.23079008,
+          "sims_per_sec": 158164.62
+        },
+        {
+          "iteration": 120,
+          "games": 30720,
+          "positions": 1540383,
+          "train_secs": 816.1690066610003,
+          "wall_secs": 973.998982375,
+          "scores": [
+            100.0,
+            100.0,
+            96.875
+          ],
+          "value_loss": 0.15447317,
+          "policy_kl": 0.23865382,
+          "sims_per_sec": 146026.52
+        },
+        {
+          "iteration": 128,
+          "games": 32768,
+          "positions": 1642784,
+          "train_secs": 868.4825408710003,
+          "wall_secs": 1035.160638916,
+          "scores": [
+            100.0,
+            100.0,
+            98.95833
+          ],
+          "value_loss": 0.15535593,
+          "policy_kl": 0.23756997,
+          "sims_per_sec": 144188.69
+        },
+        {
+          "iteration": 136,
+          "games": 34816,
+          "positions": 1744992,
+          "train_secs": 921.1425799540002,
+          "wall_secs": 1096.512743833,
+          "scores": [
+            98.95833,
+            97.91667,
+            100.0
+          ],
+          "value_loss": 0.15274581,
+          "policy_kl": 0.2418654,
+          "sims_per_sec": 145653.2
+        },
+        {
+          "iteration": 144,
+          "games": 36864,
+          "positions": 1847458,
+          "train_secs": 973.516065161,
+          "wall_secs": 1158.063089791,
+          "scores": [
+            100.0,
+            100.0,
+            100.0
+          ],
+          "value_loss": 0.15046452,
+          "policy_kl": 0.23774917,
+          "sims_per_sec": 141037.78
+        },
+        {
+          "iteration": 152,
+          "games": 38912,
+          "positions": 1949067,
+          "train_secs": 1024.7449862870003,
+          "wall_secs": 1218.223733,
+          "scores": [
+            98.95833,
+            100.0,
+            100.0
+          ],
+          "value_loss": 0.15119256,
+          "policy_kl": 0.23646764,
+          "sims_per_sec": 147075.02
+        },
+        {
+          "iteration": 160,
+          "games": 40960,
+          "positions": 2050755,
+          "train_secs": 1076.038895621,
+          "wall_secs": 1278.685033375,
+          "scores": [
+            100.0,
+            98.95833,
+            100.0
+          ],
+          "value_loss": 0.14841746,
+          "policy_kl": 0.24078827,
+          "sims_per_sec": 156770.25
+        },
+        {
+          "iteration": 168,
+          "games": 43008,
+          "positions": 2151969,
+          "train_secs": 1127.744749372,
+          "wall_secs": 1339.164664166,
+          "scores": [
+            100.0,
+            98.95833,
+            100.0
+          ],
+          "value_loss": 0.15369162,
+          "policy_kl": 0.2435456,
+          "sims_per_sec": 150838.77
+        },
+        {
+          "iteration": 176,
+          "games": 45056,
+          "positions": 2253621,
+          "train_secs": 1179.449057124,
+          "wall_secs": 1399.940141375,
+          "scores": [
+            100.0,
+            96.875,
+            95.83333
+          ],
+          "value_loss": 0.15579693,
+          "policy_kl": 0.24935962,
+          "sims_per_sec": 149467.12
+        },
+        {
+          "iteration": 180,
+          "games": 46080,
+          "positions": 2304341,
+          "train_secs": 1205.706301417,
+          "wall_secs": 1434.981501291,
+          "scores": [
+            100.0,
+            98.95833,
+            100.0
+          ],
+          "value_loss": 0.15545109,
+          "policy_kl": 0.24812661,
+          "sims_per_sec": 139902.06
+        }
+      ],
+      "created_unix": 1794734682
+    },
+    {
+      "id": 2,
+      "spec": {
+        "name": "UTTT ResNet 4x64 (tch MPS)",
+        "game": "uttt",
+        "net": "resnet",
+        "backend": "tch",
+        "device": "gpu",
+        "hp": {
+          "games_per_iteration": 256,
+          "simulations_per_move": 64,
+          "self_play_threads": 0,
+          "opening_moves": 8,
+          "dirichlet_alpha": 0.3,
+          "dirichlet_epsilon": 0.25,
+          "c_init": 1.25,
+          "c_base": 19652.0,
+          "value_q_weight": 0.5,
+          "train_steps": 200,
+          "batch_size": 256,
+          "learning_rate": 0.002,
+          "weight_decay": 0.0001,
+          "buffer_capacity": 300000,
+          "eval_games": 48,
+          "eval_sims": 0,
+          "eval_threads": 0
+        },
+        "budget_minutes": 20.0,
+        "max_iterations": 0,
+        "eval_every": 3,
+        "eval_sims": 100,
+        "eval_games": 48,
+        "infer_batch": 256,
+        "opponents": [],
+        "init_checkpoint": ""
+      },
+      "status": {
+        "state": "Done"
+      },
+      "opponents": [
+        "MCTS-200 rollouts",
+        "Minimax d=1",
+        "Minimax d=2"
+      ],
+      "device_label": "tch MPS · resnet net",
+      "points": [
+        {
+          "iteration": 0,
+          "games": 0,
+          "positions": 0,
+          "train_secs": 0.0,
+          "wall_secs": 30.118433667,
+          "scores": [
+            4.166667,
+            12.5,
+            6.25
+          ],
+          "value_loss": 0.0,
+          "policy_kl": 0.0,
+          "sims_per_sec": 0.0
+        },
+        {
+          "iteration": 3,
+          "games": 768,
+          "positions": 43158,
+          "train_secs": 150.032966041,
+          "wall_secs": 204.537466959,
+          "scores": [
+            17.708332,
+            32.291664,
+            14.583333
+          ],
+          "value_loss": 0.22399399,
+          "policy_kl": 0.17546451,
+          "sims_per_sec": 21685.307
+        },
+        {
+          "iteration": 6,
+          "games": 1536,
+          "positions": 80182,
+          "train_secs": 283.385275292,
+          "wall_secs": 363.816318375,
+          "scores": [
+            30.208334,
+            58.333332,
+            31.25
+          ],
+          "value_loss": 0.2139008,
+          "policy_kl": 0.18583627,
+          "sims_per_sec": 21104.184
+        },
+        {
+          "iteration": 9,
+          "games": 2304,
+          "positions": 116705,
+          "train_secs": 414.510816542,
+          "wall_secs": 524.353038209,
+          "scores": [
+            34.375,
+            52.083332,
+            19.791668
+          ],
+          "value_loss": 0.20751047,
+          "policy_kl": 0.19783123,
+          "sims_per_sec": 21209.965
+        },
+        {
+          "iteration": 12,
+          "games": 3072,
+          "positions": 154144,
+          "train_secs": 545.919861167,
+          "wall_secs": 680.8504925,
+          "scores": [
+            59.375,
+            72.91667,
+            35.416664
+          ],
+          "value_loss": 0.20639122,
+          "policy_kl": 0.2000534,
+          "sims_per_sec": 21943.598
+        },
+        {
+          "iteration": 15,
+          "games": 3840,
+          "positions": 192479,
+          "train_secs": 679.135909793,
+          "wall_secs": 839.800257542,
+          "scores": [
+            70.83333,
+            75.0,
+            57.291668
+          ],
+          "value_loss": 0.20294496,
+          "policy_kl": 0.20124465,
+          "sims_per_sec": 21977.148
+        },
+        {
+          "iteration": 18,
+          "games": 4608,
+          "positions": 231162,
+          "train_secs": 811.0807551680001,
+          "wall_secs": 997.737362792,
+          "scores": [
+            72.91667,
+            79.16667,
+            81.25
+          ],
+          "value_loss": 0.19737805,
+          "policy_kl": 0.20162626,
+          "sims_per_sec": 22334.477
+        },
+        {
+          "iteration": 21,
+          "games": 5376,
+          "positions": 270199,
+          "train_secs": 944.7680062510002,
+          "wall_secs": 1160.650255292,
+          "scores": [
+            84.375,
+            77.08333,
+            65.625
+          ],
+          "value_loss": 0.19400807,
+          "policy_kl": 0.19922437,
+          "sims_per_sec": 21989.666
+        },
+        {
+          "iteration": 24,
+          "games": 6144,
+          "positions": 309622,
+          "train_secs": 1078.5437142100002,
+          "wall_secs": 1320.058488084,
+          "scores": [
+            90.625,
+            83.33333,
+            88.54167
+          ],
+          "value_loss": 0.1919989,
+          "policy_kl": 0.20192459,
+          "sims_per_sec": 22272.338
+        },
+        {
+          "iteration": 27,
+          "games": 6912,
+          "positions": 349731,
+          "train_secs": 1214.8312340020002,
+          "wall_secs": 1489.097436,
+          "scores": [
+            86.45833,
+            81.25,
+            83.33333
+          ],
+          "value_loss": 0.18606369,
+          "policy_kl": 0.20525461,
+          "sims_per_sec": 22441.082
+        }
+      ],
+      "created_unix": 1794734682
+    },
+    {
+      "id": 3,
+      "spec": {
+        "name": "UTTT block net (candle Metal)",
+        "game": "uttt",
+        "net": "block",
+        "backend": "candle",
+        "device": "gpu",
+        "hp": {
+          "games_per_iteration": 256,
+          "simulations_per_move": 64,
+          "self_play_threads": 0,
+          "opening_moves": 8,
+          "dirichlet_alpha": 0.3,
+          "dirichlet_epsilon": 0.25,
+          "c_init": 1.25,
+          "c_base": 19652.0,
+          "value_q_weight": 0.5,
+          "train_steps": 200,
+          "batch_size": 256,
+          "learning_rate": 0.002,
+          "weight_decay": 0.0001,
+          "buffer_capacity": 300000,
+          "eval_games": 48,
+          "eval_sims": 0,
+          "eval_threads": 0
+        },
+        "budget_minutes": 10.0,
+        "max_iterations": 0,
+        "eval_every": 8,
+        "eval_sims": 100,
+        "eval_games": 48,
+        "infer_batch": 256,
+        "opponents": [],
+        "init_checkpoint": ""
+      },
+      "status": {
+        "state": "Done"
+      },
+      "opponents": [
+        "MCTS-200 rollouts",
+        "Minimax d=1",
+        "Minimax d=2"
+      ],
+      "device_label": "candle Metal · block net",
+      "points": [
+        {
+          "iteration": 0,
+          "games": 0,
+          "positions": 0,
+          "train_secs": 0.0,
+          "wall_secs": 10.160819291,
+          "scores": [
+            4.166667,
+            12.5,
+            6.25
+          ],
+          "value_loss": 0.0,
+          "policy_kl": 0.0,
+          "sims_per_sec": 0.0
+        },
+        {
+          "iteration": 8,
+          "games": 2048,
+          "positions": 106801,
+          "train_secs": 82.06412100099999,
+          "wall_secs": 101.731836291,
+          "scores": [
+            1.0416667,
+            12.5,
+            2.0833335
+          ],
+          "value_loss": 0.22915044,
+          "policy_kl": 0.37200767,
+          "sims_per_sec": 94147.414
+        },
+        {
+          "iteration": 16,
+          "games": 4096,
+          "positions": 210780,
+          "train_secs": 163.449797499,
+          "wall_secs": 192.540519375,
+          "scores": [
+            7.2916665,
+            10.416666,
+            8.333334
+          ],
+          "value_loss": 0.2280373,
+          "policy_kl": 0.31380767,
+          "sims_per_sec": 95079.27
+        },
+        {
+          "iteration": 24,
+          "games": 6144,
+          "positions": 314408,
+          "train_secs": 244.63390970699996,
+          "wall_secs": 283.3858595,
+          "scores": [
+            13.541667,
+            11.458334,
+            16.666668
+          ],
+          "value_loss": 0.22902383,
+          "policy_kl": 0.2725188,
+          "sims_per_sec": 92007.17
+        },
+        {
+          "iteration": 32,
+          "games": 8192,
+          "positions": 416936,
+          "train_secs": 325.232709205,
+          "wall_secs": 373.9416505,
+          "scores": [
+            26.041666,
+            9.375,
+            8.333334
+          ],
+          "value_loss": 0.22807811,
+          "policy_kl": 0.24528275,
+          "sims_per_sec": 93995.68
+        },
+        {
+          "iteration": 40,
+          "games": 10240,
+          "positions": 518095,
+          "train_secs": 405.6323127470001,
+          "wall_secs": 464.042318875,
+          "scores": [
+            23.958332,
+            13.541667,
+            16.666668
+          ],
+          "value_loss": 0.2301879,
+          "policy_kl": 0.22487566,
+          "sims_per_sec": 94159.75
+        },
+        {
+          "iteration": 48,
+          "games": 12288,
+          "positions": 620210,
+          "train_secs": 487.1055625810002,
+          "wall_secs": 555.1243385,
+          "scores": [
+            14.583333,
+            19.791668,
+            7.2916665
+          ],
+          "value_loss": 0.22926366,
+          "policy_kl": 0.2221038,
+          "sims_per_sec": 91284.26
+        },
+        {
+          "iteration": 56,
+          "games": 14336,
+          "positions": 722376,
+          "train_secs": 568.6309936220003,
+          "wall_secs": 646.700972916,
+          "scores": [
+            29.166666,
+            30.208334,
+            18.75
+          ],
+          "value_loss": 0.22786476,
+          "policy_kl": 0.21546175,
+          "sims_per_sec": 91240.08
+        },
+        {
+          "iteration": 60,
+          "games": 15360,
+          "positions": 773391,
+          "train_secs": 609.3171773310004,
+          "wall_secs": 697.450390333,
+          "scores": [
+            19.791668,
+            34.375,
+            12.5
+          ],
+          "value_loss": 0.22638698,
+          "policy_kl": 0.21261689,
+          "sims_per_sec": 94250.17
+        }
+      ],
+      "created_unix": 1794737688
+    },
+    {
+      "id": 4,
+      "spec": {
+        "name": "UTTT block net (candle Metal, LayerNorm fixed)",
+        "game": "uttt",
+        "net": "block",
+        "backend": "candle",
+        "device": "gpu",
+        "hp": {
+          "games_per_iteration": 256,
+          "simulations_per_move": 64,
+          "self_play_threads": 0,
+          "opening_moves": 8,
+          "dirichlet_alpha": 0.3,
+          "dirichlet_epsilon": 0.25,
+          "c_init": 1.25,
+          "c_base": 19652.0,
+          "value_q_weight": 0.5,
+          "train_steps": 200,
+          "batch_size": 256,
+          "learning_rate": 0.002,
+          "weight_decay": 0.0001,
+          "buffer_capacity": 300000,
+          "eval_games": 48,
+          "eval_sims": 0,
+          "eval_threads": 0
+        },
+        "budget_minutes": 10.0,
+        "max_iterations": 0,
+        "eval_every": 8,
+        "eval_sims": 100,
+        "eval_games": 48,
+        "infer_batch": 256,
+        "opponents": [],
+        "init_checkpoint": ""
+      },
+      "status": {
+        "state": "Done"
+      },
+      "opponents": [
+        "MCTS-200 rollouts",
+        "Minimax d=1",
+        "Minimax d=2"
+      ],
+      "device_label": "candle Metal · block net",
+      "points": [
+        {
+          "iteration": 0,
+          "games": 0,
+          "positions": 0,
+          "train_secs": 0.0,
+          "wall_secs": 13.6862215,
+          "scores": [
+            4.166667,
+            12.5,
+            6.25
+          ],
+          "value_loss": 0.0,
+          "policy_kl": 0.0,
+          "sims_per_sec": 0.0
+        },
+        {
+          "iteration": 8,
+          "games": 2048,
+          "positions": 102309,
+          "train_secs": 139.150326083,
+          "wall_secs": 166.124102083,
+          "scores": [
+            59.375,
+            73.95833,
+            54.166668
+          ],
+          "value_loss": 0.19884332,
+          "policy_kl": 0.18728258,
+          "sims_per_sec": 61114.875
+        },
+        {
+          "iteration": 16,
+          "games": 4096,
+          "positions": 208056,
+          "train_secs": 278.55802466600005,
+          "wall_secs": 318.658021875,
+          "scores": [
+            86.45833,
+            90.625,
+            81.25
+          ],
+          "value_loss": 0.18966192,
+          "policy_kl": 0.19729906,
+          "sims_per_sec": 61573.992
+        },
+        {
+          "iteration": 24,
+          "games": 6144,
+          "positions": 315003,
+          "train_secs": 417.6248093340001,
+          "wall_secs": 469.897384458,
+          "scores": [
+            94.79167,
+            94.79167,
+            81.25
+          ],
+          "value_loss": 0.18341608,
+          "policy_kl": 0.20637959,
+          "sims_per_sec": 61913.9
+        },
+        {
+          "iteration": 32,
+          "games": 8192,
+          "positions": 421350,
+          "train_secs": 555.8257506680001,
+          "wall_secs": 620.701702083,
+          "scores": [
+            93.75,
+            95.83333,
+            83.33333
+          ],
+          "value_loss": 0.1778771,
+          "policy_kl": 0.20967281,
+          "sims_per_sec": 62971.203
+        },
+        {
+          "iteration": 35,
+          "games": 8960,
+          "positions": 461241,
+          "train_secs": 607.166485834,
+          "wall_secs": 684.033993708,
+          "scores": [
+            91.66667,
+            95.83333,
+            92.70833
+          ],
+          "value_loss": 0.17478295,
+          "policy_kl": 0.2083103,
+          "sims_per_sec": 64191.36
+        }
+      ],
+      "created_unix": 1794738537
+    },
+    {
+      "id": 5,
+      "spec": {
+        "name": "continue exp4 (smoke)",
+        "game": "uttt",
+        "net": "block",
+        "backend": "tch",
+        "device": "gpu",
+        "hp": {
+          "games_per_iteration": 256,
+          "simulations_per_move": 64,
+          "self_play_threads": 0,
+          "opening_moves": 8,
+          "dirichlet_alpha": 0.3,
+          "dirichlet_epsilon": 0.25,
+          "c_init": 1.25,
+          "c_base": 19652.0,
+          "value_q_weight": 0.5,
+          "train_steps": 200,
+          "batch_size": 256,
+          "learning_rate": 0.002,
+          "weight_decay": 0.0001,
+          "buffer_capacity": 300000,
+          "eval_games": 48,
+          "eval_sims": 0,
+          "eval_threads": 0
+        },
+        "budget_minutes": 0.4,
+        "max_iterations": 0,
+        "eval_every": 2,
+        "eval_sims": 100,
+        "eval_games": 8,
+        "infer_batch": 256,
+        "opponents": [
+          {
+            "kind": "minimax",
+            "depth": 3
+          },
+          {
+            "kind": "alphazero",
+            "checkpoint": "uttt_exp4_block.safetensors",
+            "net": "block",
+            "sims": 100
+          }
+        ],
+        "init_checkpoint": "uttt_exp4_block.safetensors"
+      },
+      "status": {
+        "state": "Done"
+      },
+      "opponents": [
+        "Minimax d=3",
+        "AZ uttt_exp4_block @100"
+      ],
+      "device_label": "tch MPS · block net · from uttt_exp4_block.safetensors",
+      "points": [
+        {
+          "iteration": 0,
+          "games": 0,
+          "positions": 0,
+          "train_secs": 0.0,
+          "wall_secs": 26.768106084,
+          "scores": [
+            87.5,
+            50.0
+          ],
+          "value_loss": 0.0,
+          "policy_kl": 0.0,
+          "sims_per_sec": 0.0
+        },
+        {
+          "iteration": 2,
+          "games": 512,
+          "positions": 26560,
+          "train_secs": 22.668289876,
+          "wall_secs": 77.983701292,
+          "scores": [
+            100.0,
+            62.5
+          ],
+          "value_loss": 0.17222492,
+          "policy_kl": 0.22273462,
+          "sims_per_sec": 137999.34
+        },
+        {
+          "iteration": 3,
+          "games": 768,
+          "positions": 39571,
+          "train_secs": 29.749289167999997,
+          "wall_secs": 112.699107417,
+          "scores": [
+            100.0,
+            50.0
+          ],
+          "value_loss": 0.16630019,
+          "policy_kl": 0.22354516,
+          "sims_per_sec": 140555.02
+        }
+      ],
+      "created_unix": 1794743239
+    }
+  ]
+}

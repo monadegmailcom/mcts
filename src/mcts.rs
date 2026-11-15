@@ -59,8 +59,16 @@ impl MctsPayload {
 }
 
 /// Strategy trait for scoring child nodes during tree descent (compile-time monomorphized).
+///
+/// Selection at a parent first computes [`Self::Parent`] once (quantities shared by all
+/// siblings, e.g. the exploration factor), then scores each child against it.
 pub trait SelectionPolicy: Copy {
-    fn score(&self, child: &MctsPayload, parent_visits: u32) -> f32;
+    /// Per-parent quantities computed once before the parent's children are scored.
+    type Parent: Copy;
+
+    fn parent<M>(&self, parent_visits: u32, children: &[Node<M, MctsPayload>]) -> Self::Parent;
+
+    fn score(&self, child: &MctsPayload, parent: Self::Parent) -> f32;
 }
 
 /// Classical Upper Confidence Bound for Trees (UCT).
@@ -89,28 +97,89 @@ impl Default for Uct {
 }
 
 impl SelectionPolicy for Uct {
+    /// `ln(N_parent)`.
+    type Parent = f32;
+
     #[inline]
-    fn score(&self, child: &MctsPayload, parent_visits: u32) -> f32 {
+    fn parent<M>(&self, parent_visits: u32, _children: &[Node<M, MctsPayload>]) -> f32 {
+        (parent_visits as f32).ln()
+    }
+
+    #[inline]
+    fn score(&self, child: &MctsPayload, ln_parent_visits: f32) -> f32 {
         if child.visits == 0 {
             return f32::INFINITY;
         }
         let exploit = child.q_value();
-        let explore =
-            self.exploration * ((parent_visits as f32).ln() / (child.visits as f32)).sqrt();
+        let explore = self.exploration * (ln_parent_visits / (child.visits as f32)).sqrt();
         exploit + explore
+    }
+}
+
+/// First-play urgency: the `Q` that [`Puct`] assumes for a child that has not been visited yet.
+///
+/// It decides how wide the search is: an optimistic value makes it try every move before going
+/// deeper, a pessimistic one makes it follow the policy prior narrowly. Matters most with few
+/// simulations and many legal moves. Values are payoffs in `[-1, 1]`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Fpu {
+    /// A fixed value. `Absolute(0.0)` ("assume a draw") is the AlphaGo Zero / AlphaZero choice;
+    /// it widens the search in losing positions and narrows it in winning ones.
+    Absolute(f32),
+    /// The parent's value minus `reduction * sqrt(sum of the priors of the visited children)`
+    /// (Leela Chess Zero, KataGo): an untried move is assumed a bit worse than the position, and
+    /// more so once the moves the network likes have been explored. The parent's value is the
+    /// visit-weighted mean `Q` of its visited children, from the choosing player's view.
+    Relative(f32),
+}
+
+impl Default for Fpu {
+    fn default() -> Self {
+        Self::Absolute(0.0)
+    }
+}
+
+impl Fpu {
+    /// Clamps the value to a sane range (`[-1, 1]` absolute, `[0, 2]` relative reduction).
+    pub fn sanitized(self) -> Self {
+        match self {
+            Self::Absolute(v) => Self::Absolute(v.clamp(-1.0, 1.0)),
+            Self::Relative(r) => Self::Relative(r.clamp(0.0, 2.0)),
+        }
+    }
+
+    /// The `Q` for unvisited children of a parent with these `children`.
+    fn unvisited_q<M>(self, children: &[Node<M, MctsPayload>]) -> f32 {
+        match self {
+            Self::Absolute(v) => v,
+            Self::Relative(reduction) => {
+                let (mut visits, mut value_sum, mut visited_prior) = (0u32, 0.0f32, 0.0f32);
+                for c in children.iter().filter(|c| c.payload.visits > 0) {
+                    visits += c.payload.visits;
+                    value_sum += c.payload.value_sum;
+                    visited_prior += c.payload.prior;
+                }
+                if visits == 0 {
+                    // Nothing visited yet: every child gets the same `Q`, so its value is irrelevant.
+                    return 0.0;
+                }
+                value_sum / visits as f32 - reduction * visited_prior.sqrt()
+            }
+        }
     }
 }
 
 /// Predictor + Upper Confidence Bound for Trees (AlphaZero PUCT).
 ///
 /// Formula (matching `alphazero.h`):
-/// `Q(s, a) + P(s, a) * (ln((N_p + c_base + 1) / c_base) + c_init) * sqrt(N_p) / (1 + N_c)`
+/// `Q(s, a) + P(s, a) * (ln((N_p + c_base + 1) / c_base) + c_init) * sqrt(N_p) / (1 + N_c)`,
+/// with `Q` of unvisited children given by [`Fpu`].
 #[derive(Clone, Copy, Debug)]
 pub struct Puct {
     pub c_base: f32,
     pub c_init: f32,
-    /// First-Play Urgency (value estimate used for unvisited children `visits == 0`).
-    pub fpu: f32,
+    pub fpu: Fpu,
 }
 
 impl Puct {
@@ -118,14 +187,23 @@ impl Puct {
         Self {
             c_base,
             c_init,
-            fpu: 0.0,
+            fpu: Fpu::Absolute(0.0),
         }
     }
 
-    pub const fn with_fpu(mut self, fpu: f32) -> Self {
+    pub const fn with_fpu(mut self, fpu: Fpu) -> Self {
         self.fpu = fpu;
         self
     }
+}
+
+/// Quantities [`Puct`] shares across the children of one parent.
+#[derive(Clone, Copy, Debug)]
+pub struct PuctParent {
+    /// `(ln((N_p + c_base + 1) / c_base) + c_init) * sqrt(N_p)`.
+    explore: f32,
+    /// `Q` assumed for unvisited children.
+    unvisited_q: f32,
 }
 
 impl Default for Puct {
@@ -135,18 +213,21 @@ impl Default for Puct {
 }
 
 impl SelectionPolicy for Puct {
+    type Parent = PuctParent;
+
     #[inline]
-    fn score(&self, child: &MctsPayload, parent_visits: u32) -> f32 {
-        let parent_v = parent_visits as f32;
-        let c = (((parent_v + self.c_base + 1.0) / self.c_base).ln() + self.c_init)
-            * parent_v.sqrt()
-            / ((child.visits + 1) as f32);
-        let q = if child.visits == 0 {
-            self.fpu
-        } else {
-            child.q_value()
-        };
-        q + c * child.prior
+    fn parent<M>(&self, parent_visits: u32, children: &[Node<M, MctsPayload>]) -> PuctParent {
+        let n = parent_visits as f32;
+        PuctParent {
+            explore: (((n + self.c_base + 1.0) / self.c_base).ln() + self.c_init) * n.sqrt(),
+            unvisited_q: self.fpu.unvisited_q(children),
+        }
+    }
+
+    #[inline]
+    fn score(&self, child: &MctsPayload, parent: PuctParent) -> f32 {
+        let q = if child.visits == 0 { parent.unvisited_q } else { child.q_value() };
+        q + parent.explore * child.prior / ((child.visits + 1) as f32)
     }
 }
 
@@ -612,10 +693,11 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
         let children = arena.children(parent_id);
         let base = arena.get(parent_id).first_child().index();
 
+        let parent = self.selector.parent(parent_visits, children);
         let mut best_offset = 0;
         let mut best_score = f32::NEG_INFINITY;
         for (offset, child) in children.iter().enumerate() {
-            let score = self.selector.score(&child.payload, parent_visits);
+            let score = self.selector.score(&child.payload, parent);
             if score > best_score {
                 best_score = score;
                 best_offset = offset;
@@ -822,5 +904,57 @@ mod tests {
         let expected_p0 = std::f32::consts::E / (std::f32::consts::E + 1.0);
         assert!((children[0].payload.prior - expected_p0).abs() < 1e-6);
         assert!((children[1].payload.prior - (1.0 - expected_p0)).abs() < 1e-6);
+    }
+
+    fn payload(visits: u32, value_sum: f32, prior: f32) -> MctsPayload {
+        MctsPayload { visits, value_sum, prior }
+    }
+
+    #[test]
+    fn fpu_values_for_unvisited_children() {
+        let mut arena = crate::tree::TreeArena::<u8, MctsPayload>::with_capacity(4);
+        let root = arena.init_root(0, MctsPayload::default());
+        // Two visited children (priors 0.5 + 0.25, mean Q = (2.0 + 1.0) / 6 = 0.5), one unvisited.
+        let children = arena.expand_from_iter(
+            root,
+            [(0u8, payload(4, 2.0, 0.5)), (1u8, payload(2, 1.0, 0.25)), (2u8, payload(0, 0.0, 0.25))],
+        );
+        assert_eq!(Fpu::Absolute(-0.3).unvisited_q(children), -0.3);
+        let relative = Fpu::Relative(0.2).unvisited_q(children);
+        assert!((relative - (0.5 - 0.2 * 0.75f32.sqrt())).abs() < 1e-6);
+        // Nothing visited yet: all siblings share the same Q, so selection goes by prior alone.
+        let fresh = [Node::new(0u8, payload(0, 0.0, 0.7)), Node::new(1u8, payload(0, 0.0, 0.3))];
+        assert_eq!(Fpu::Relative(0.2).unvisited_q(&fresh), 0.0);
+    }
+
+    #[test]
+    fn fpu_controls_search_width() {
+        // One visited child with mean value `q` (prior 0.9) and an unvisited sibling (prior 0.1)
+        // whose exploration bonus alone is too small to be picked. Returns whether the search
+        // would try the unvisited move next.
+        let tries_new_move = |fpu: Fpu, q: f32| {
+            let mut arena = crate::tree::TreeArena::<u8, MctsPayload>::with_capacity(4);
+            let root = arena.init_root(0, MctsPayload::default());
+            let children = arena.expand_from_iter(root, [(0u8, payload(5, 5.0 * q, 0.9)), (1u8, payload(0, 0.0, 0.1))]);
+            let puct = Puct::default().with_fpu(fpu);
+            let parent = puct.parent(5, children);
+            puct.score(&children[1].payload, parent) > puct.score(&children[0].payload, parent)
+        };
+        // Optimistic absolute FPU always widens.
+        assert!(tries_new_move(Fpu::Absolute(1.0), 0.6));
+        // Absolute "draw" FPU deepens in a winning position but widens in a losing one ...
+        assert!(!tries_new_move(Fpu::Absolute(0.0), 0.6));
+        assert!(tries_new_move(Fpu::Absolute(0.0), -0.6));
+        // ... while relative FPU behaves the same in both.
+        assert!(!tries_new_move(Fpu::Relative(0.25), 0.6));
+        assert!(!tries_new_move(Fpu::Relative(0.25), -0.6));
+    }
+
+    #[test]
+    fn fpu_json_and_sanitizing() {
+        assert_eq!(serde_json::to_string(&Fpu::Relative(0.25)).unwrap(), r#"{"relative":0.25}"#);
+        assert_eq!(serde_json::from_str::<Fpu>(r#"{"absolute":-0.5}"#).unwrap(), Fpu::Absolute(-0.5));
+        assert_eq!(Fpu::Absolute(3.0).sanitized(), Fpu::Absolute(1.0));
+        assert_eq!(Fpu::Relative(-1.0).sanitized(), Fpu::Relative(0.0));
     }
 }

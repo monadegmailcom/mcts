@@ -342,7 +342,7 @@ fn main() {
     // 7. Game-Parallel AlphaZero Self-Play on Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`,
     //    64 games, 4 workers x 16 concurrent games/worker, 100 PUCT sims/move, zero virtual loss)
     let uttt_nn = FnBatchEvaluator(
-        |states: &[[f32; 324]], policies: &mut [[f32; 81]], values: &mut [[f32; 2]]| {
+        |states: &[[f32; mcts::games::ultimate_ttt::INPUT_SIZE]], policies: &mut [[f32; 81]], values: &mut [[f32; 2]]| {
             for ((s, p), v) in states.iter().zip(policies.iter_mut()).zip(values.iter_mut()) {
                 p.fill(0.0);
                 let my_marks: f32 = s[0..81].iter().sum();

@@ -1,0 +1,249 @@
+//! Single games for the Browser Lab's Play tab.
+//!
+//! The browser keeps the move list and sends it with every request, so the server holds no
+//! per-game state: it replays the moves from the start position and returns the board to draw
+//! and, optionally, one engine's analysis of that position — the move the engine plays and, for
+//! search engines, per-move statistics for the heat map (search share, network prior, win rate).
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use rand::prelude::{IndexedRandom, SeedableRng, SmallRng};
+use serde::{Deserialize, Serialize};
+
+use crate::alphazero::{AlphaZeroConfig, AlphaZeroGame, AlphaZeroPlayer};
+use crate::backend::NetEvaluator;
+use crate::game::{Game, GameStatus};
+use crate::inference::InferenceService;
+use crate::mcts::{PlayoutEvaluator, Uct};
+use crate::minimax::{HeuristicEvaluator, MinimaxPlayer};
+use crate::opponents::OpponentSpec;
+use crate::player::Player;
+use crate::root_parallel::{AggregatedRootChild, RootParallelBudget, RootParallelConfig, RootParallelPlayer};
+
+/// Inference service over a two-player game's network.
+pub type NetService<const G: usize, const P: usize> = InferenceService<NetEvaluator<G, P, 2>, G, P, 2>;
+
+/// What the Play tab needs from a two-player board game beyond [`AlphaZeroGame`]. Cells are
+/// addressed by policy index, so the network's outputs map directly onto the board.
+pub trait PlayableGame<const G: usize, const P: usize>: AlphaZeroGame<G, P, 2> {
+    type Heuristic: HeuristicEvaluator<Self, 2> + Copy + Send + Sync;
+
+    fn start() -> Game<Self, 2>;
+
+    /// Leaf evaluation for Minimax.
+    fn heuristic() -> Self::Heuristic;
+
+    /// Owner of every cell in policy-index order: `0` empty, `1` first player, `2` second player.
+    fn cells(game: &Game<Self, 2>) -> Vec<u8>;
+
+    /// Status of each sub-board for boards made of sub-boards (`0` open, `1`/`2` won by that
+    /// player, `3` drawn); empty for plain boards.
+    fn blocks(_game: &Game<Self, 2>) -> Vec<u8> {
+        Vec::new()
+    }
+}
+
+/// `POST /api/play` body.
+#[derive(Debug, Deserialize)]
+pub struct PlayRequest {
+    pub game: String,
+    /// Moves played so far, as cells (policy indices).
+    #[serde(default)]
+    pub moves: Vec<usize>,
+    /// Engine to analyse the position with (`None`: board only).
+    #[serde(default)]
+    pub engine: Option<OpponentSpec>,
+    #[serde(default)]
+    pub seed: u64,
+}
+
+/// The position to draw.
+#[derive(Debug, Serialize)]
+pub struct Board {
+    pub cells: Vec<u8>,
+    pub blocks: Vec<u8>,
+    /// Legal cells for the side to move (empty when the game is over).
+    pub legal: Vec<usize>,
+    /// Side to move: `1` (X) or `2` (O).
+    pub to_move: u8,
+    /// `"x"`, `"o"` or `"draw"` once the game is over.
+    pub result: Option<&'static str>,
+}
+
+/// One engine's view of a position.
+#[derive(Debug, Serialize)]
+pub struct Analysis {
+    pub engine: String,
+    /// The cell the engine plays.
+    pub chosen: usize,
+    /// Per-move search statistics, most visited first (search engines only).
+    pub moves: Vec<MoveStat>,
+    /// Search value for the side to move in `[-1, 1]` (search engines only).
+    pub value: Option<f32>,
+    pub simulations: u64,
+    pub millis: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MoveStat {
+    pub cell: usize,
+    /// Network prior (AlphaZero only).
+    pub prior: Option<f32>,
+    pub visits: u64,
+    /// Mean search value of the move for the side to move in `[-1, 1]` (`0` if unvisited).
+    pub q: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlayResponse {
+    pub board: Board,
+    pub analysis: Option<Analysis>,
+}
+
+/// Replays `moves` from the start position.
+pub fn replay<R: PlayableGame<G, P>, const G: usize, const P: usize>(moves: &[usize]) -> Result<Game<R, 2>, String> {
+    moves.iter().try_fold(R::start(), |game, &cell| {
+        if game.status().is_terminal() {
+            return Err("the game is already over".to_string());
+        }
+        let mv = game
+            .valid_moves()
+            .find(|&mv| R::move_to_policy_index(mv) == cell)
+            .ok_or_else(|| format!("cell {cell} is not a legal move"))?;
+        Ok(game.apply(mv))
+    })
+}
+
+pub fn board<R: PlayableGame<G, P>, const G: usize, const P: usize>(game: &Game<R, 2>) -> Board {
+    let result = match game.status() {
+        GameStatus::Ongoing => None,
+        GameStatus::Terminal([a, b]) if a > b => Some("x"),
+        GameStatus::Terminal([a, b]) if b > a => Some("o"),
+        GameStatus::Terminal(_) => Some("draw"),
+    };
+    Board {
+        cells: R::cells(game),
+        blocks: R::blocks(game),
+        legal: if result.is_none() { game.valid_moves().map(R::move_to_policy_index).collect() } else { Vec::new() },
+        to_move: game.current_player().raw() + 1,
+        result,
+    }
+}
+
+/// Lets `engine` search the (ongoing) `game`. `network` must be given for an AlphaZero engine.
+pub fn analyse<R: PlayableGame<G, P>, const G: usize, const P: usize>(
+    game: &Game<R, 2>,
+    engine: &OpponentSpec,
+    network: Option<&NetService<G, P>>,
+    seed: u64,
+) -> Result<Analysis, String> {
+    let start = Instant::now();
+    let (chosen, root, has_priors) = match engine {
+        OpponentSpec::Random => {
+            let moves: Vec<_> = game.valid_moves().collect();
+            (*moves.choose(&mut SmallRng::seed_from_u64(seed)).ok_or("no legal move")?, Vec::new(), false)
+        }
+        OpponentSpec::Minimax { depth } => {
+            (MinimaxPlayer::new(game.clone(), R::heuristic(), *depth, seed).choose_move(), Vec::new(), false)
+        }
+        OpponentSpec::Mcts { sims, exploration } => {
+            let config = RootParallelConfig::new(RootParallelBudget::SimulationsPerThread(*sims), seed);
+            let root = RootParallelPlayer::new(game.clone(), R::SENTINEL_MOVE, Uct::new(*exploration), 1, config, |_, s| {
+                PlayoutEvaluator::new(s)
+            })
+            .evaluate_root();
+            (most_visited(&root), root, false)
+        }
+        OpponentSpec::AlphaZero { sims, trees, .. } => {
+            let network = network.ok_or("no network for the AlphaZero engine")?;
+            let config = AlphaZeroConfig::new(*trees, *sims, seed).with_dirichlet(0.3, 0.0);
+            let root = AlphaZeroPlayer::new(game.clone(), network, config).evaluate_root();
+            (most_visited(&root), root, true)
+        }
+    };
+
+    let simulations: u64 = root.iter().map(|c| c.visits).sum();
+    let value = (simulations > 0).then(|| (root.iter().map(|c| c.value_sum).sum::<f64>() / simulations as f64) as f32);
+    let mut moves: Vec<MoveStat> = root
+        .iter()
+        .map(|c| MoveStat {
+            cell: R::move_to_policy_index(c.mv),
+            prior: has_priors.then_some(c.prior),
+            visits: c.visits,
+            q: c.q_value() as f32,
+        })
+        .collect();
+    moves.sort_by_key(|m| std::cmp::Reverse(m.visits));
+    Ok(Analysis {
+        engine: engine.label(),
+        chosen: R::move_to_policy_index(chosen),
+        moves,
+        value,
+        simulations,
+        millis: start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+fn most_visited<M: Copy>(root: &[AggregatedRootChild<M>]) -> M {
+    root.iter().max_by_key(|c| c.visits).expect("an ongoing game has a legal move").mv
+}
+
+/// Answers a Play request for game `R`. `network` resolves an AlphaZero engine's
+/// `(checkpoint, net preset)` to an inference service.
+pub fn respond<R: PlayableGame<G, P>, const G: usize, const P: usize>(
+    req: &PlayRequest,
+    network: impl FnOnce(&str, &str) -> Result<Arc<NetService<G, P>>, String>,
+) -> Result<PlayResponse, String> {
+    let game = replay::<R, G, P>(&req.moves)?;
+    let analysis = match &req.engine {
+        Some(engine) if game.status().is_ongoing() => {
+            let engine = engine.clone().sanitized();
+            let net = match &engine {
+                OpponentSpec::AlphaZero { checkpoint, net, .. } => Some(network(checkpoint, net)?),
+                _ => None,
+            };
+            Some(analyse(&game, &engine, net.as_deref(), req.seed)?)
+        }
+        _ => None,
+    };
+    Ok(PlayResponse { board: board(&game), analysis })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::games::tic_tac_toe::TicTacToe;
+    use crate::games::ultimate_ttt::UltimateTicTacToe;
+
+    #[test]
+    fn replay_and_board() {
+        // X takes the top row while O plays the middle row: X wins on its third move.
+        let game = replay::<TicTacToe, 27, 9>(&[0, 3, 1, 4, 2]).unwrap();
+        let b = board(&game);
+        assert_eq!(b.cells, [1, 1, 1, 2, 2, 0, 0, 0, 0]);
+        assert_eq!((b.result, b.legal.len()), (Some("x"), 0));
+        assert!(replay::<TicTacToe, 27, 9>(&[0, 0]).is_err(), "occupied cell");
+        assert!(replay::<TicTacToe, 27, 9>(&[0, 3, 1, 4, 2, 5]).is_err(), "game over");
+
+        // UTTT: the first move (centre cell of the top-left sub-board) sends O to the centre sub-board.
+        let game = replay::<UltimateTicTacToe, { crate::games::ultimate_ttt::INPUT_SIZE }, 81>(&[10]).unwrap();
+        let b = board(&game);
+        assert_eq!((b.cells[10], b.to_move, b.blocks.len()), (1, 2, 9));
+        assert!(b.legal.iter().all(|&c| (3..6).contains(&(c / 9)) && (3..6).contains(&(c % 9))));
+    }
+
+    #[test]
+    fn search_engines_report_heat_map_statistics() {
+        let game = replay::<TicTacToe, 27, 9>(&[0, 4]).unwrap();
+        let mcts = OpponentSpec::Mcts { sims: 400, exploration: 1.414 };
+        let a = analyse(&game, &mcts, None, 7).unwrap();
+        assert_eq!(a.moves.len(), 7);
+        assert_eq!(a.simulations, a.moves.iter().map(|m| m.visits).sum::<u64>());
+        assert_eq!(a.chosen, a.moves[0].cell, "plays the most visited move");
+        assert!(a.moves.iter().all(|m| m.prior.is_none()));
+        // Minimax only reports its move.
+        let a = analyse(&game, &OpponentSpec::Minimax { depth: 2 }, None, 7).unwrap();
+        assert!(a.moves.is_empty() && a.value.is_none());
+    }
+}

@@ -1,0 +1,439 @@
+<!-- TAB 4: EXPERIMENTS (spliced into the dashboard by telemetry.rs) -->
+<div id="tab-experiments" class="hidden">
+  <div class="card" style="margin-bottom:14px;">
+    <h2><span>🧪 Comparable Training Runs</span></h2>
+    <p class="hint" style="margin:0;">
+      Each run trains a <b>fresh network from scratch</b> (own replay buffer) for a training-time budget and is
+      evaluated every few iterations with a <b>fixed protocol</b>: the same AlphaZero simulations, openings and
+      opponents for every run. So the curves answer "how strong does this setup get per minute of training /
+      per self-play game?". Training time counts self-play + SGD only, never evaluation. Runs execute one at a
+      time and only while live training is paused; live training waits until the current run ends (stop it in the table to train live sooner).
+      For fair timing, avoid running arena matches meanwhile. Results are saved to <code>lab_experiments.json</code>.
+    </p>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2><span>➕ New Run</span><button class="btn" onclick="expAdd()">Add to Queue</button></h2>
+      <div class="knobs-grid">
+        <div class="knob-item"><label>Name (optional)</label><input id="exp-name" placeholder="auto"></div>
+        <div class="knob-item"><label>Game</label><select id="exp-game" onchange="expGameChanged()"></select></div>
+        <div class="knob-item" title="Network architecture presets defined by the game module (AlphaZeroGame::net_presets).">
+          <label>Network</label><select id="exp-net"></select></div>
+        <div class="knob-item" title="Continue from a saved network instead of fresh random weights. It must have the selected network architecture.">
+          <label>Start From</label><select id="exp-init"></select></div>
+        <div class="knob-item"><label>NN Backend</label><select id="exp-backend" onchange="expBackendChanged()"></select></div>
+        <div class="knob-item"><label>Device</label>
+          <select id="exp-device"><option value="gpu" id="exp-device-gpu">GPU</option><option value="cpu">CPU</option></select></div>
+        <div class="knob-item" title="Training time (self-play + SGD) after which the run ends; evaluation time is not counted.">
+          <label>Budget (training minutes)</label><input type="number" id="exp-budget" value="20" min="0.5" step="1"></div>
+        <div class="knob-item" title="0 = no cap"><label>Max Iterations (0 = ∞)</label><input type="number" id="exp-maxiter" value="0" min="0"></div>
+        <div class="knob-item"><label>Evaluate Every (iterations)</label><input type="number" id="exp-evalevery" value="5" min="1"></div>
+        <div class="knob-item" title="AlphaZero simulations per move in evaluation games — keep identical across runs you compare.">
+          <label>Eval Sims / Move</label><input type="number" id="exp-evalsims" value="100" min="1"></div>
+        <div class="knob-item" title="Games per opponent per evaluation (openings are played with colors swapped).">
+          <label>Eval Games / Opponent</label><input type="number" id="exp-evalgames" value="48" min="2" step="2"></div>
+        <div class="knob-item" title="Maximum positions per batched NN call during self-play. GPUs need large batches (Mac GPU: ~3.5x more positions/s at 256 than at 64).">
+          <label>Inference Batch</label><input type="number" id="exp-inferbatch" value="256" min="1" step="32"></div>
+      </div>
+      <div style="margin-top:10px;">
+        <label class="hint">Evaluation opponents (same for every run you want to compare)</label>
+        <div id="exp-opps"></div>
+      </div>
+      <div style="margin-top:10px;">
+        <label class="hint" style="display:flex; justify-content:space-between; align-items:center;">
+          <span>Hyperparameters (all knobs, JSON — edit any value to create a variant)</span>
+          <span>
+            <button class="btn secondary" style="padding:3px 8px;font-size:0.74rem;" onclick="expFillHp('defaults')">Game Defaults</button>
+            <button class="btn secondary" style="padding:3px 8px;font-size:0.74rem;" onclick="expFillHp('live')">Current Live Knobs</button>
+          </span>
+        </label>
+        <textarea id="exp-hp" rows="12" spellcheck="false" style="width:100%; box-sizing:border-box; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; font-family:monospace; font-size:0.78rem; padding:6px;"></textarea>
+        <div id="exp-form-error" style="color:var(--rose); font-size:0.8rem;"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <h2>
+        <span>📋 Queue &amp; Results</span>
+        <span>
+          <button class="btn green" id="exp-queue-btn" onclick="expToggleQueue()">▶ Run Queue</button>
+        </span>
+      </h2>
+      <div id="exp-queue-status" class="hint" style="margin-bottom:6px;">—</div>
+      <div style="overflow-x:auto;">
+        <table class="exp-table" style="width:100%; border-collapse:collapse; font-size:0.78rem;">
+          <thead><tr style="color:var(--muted); text-align:left;">
+            <th></th><th>Run</th><th>Setup</th><th>Status</th><th>Iter</th><th>Games</th><th>Train min</th><th>Games/min</th><th>Last scores</th><th></th>
+          </tr></thead>
+          <tbody id="exp-rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>
+      <span>📈 Strength Curves</span>
+      <span style="font-size:0.78rem; display:flex; gap:8px; align-items:center;">
+        Game <select id="exp-chart-game" onchange="expDrawChart()"></select>
+        vs <select id="exp-chart-opp" onchange="expDrawChart()"></select>
+        x-axis <select id="exp-chart-x" onchange="expDrawChart()">
+          <option value="train">training minutes</option>
+          <option value="games">self-play games</option>
+          <option value="iteration">iteration</option>
+        </select>
+      </span>
+    </h2>
+    <p class="hint">Score = (wins + ½ draws) / games in % against the chosen evaluation opponent (fixed openings, colors swapped). Click a run's colour dot in the table to hide/show it.</p>
+    <canvas id="exp-chart" width="1100" height="320" style="width:100%;"></canvas>
+    <div id="exp-legend" class="legend" style="flex-wrap:wrap;"></div>
+  </div>
+</div>
+
+<style>
+  .exp-table td, .exp-table th { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .exp-dot { display:inline-block; width:11px; height:11px; border-radius:50%; cursor:pointer; }
+  .exp-dot.off { opacity: 0.2; }
+  .exp-status-Running { color: var(--green); }
+  .exp-status-Failed { color: var(--rose); }
+  .exp-status-Queued { color: var(--amber); }
+  .opp-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:5px 0; border-bottom:1px solid var(--border); font-size:0.8rem; }
+  .opp-row select, .opp-row input { background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:3px 5px; font-family:inherit; font-size:0.8rem; }
+  .opp-row input { width:70px; }
+  .opp-field { color: var(--muted); }
+</style>
+
+<script>
+let expData = null;
+let expFormGame = null;
+const expHidden = new Set();
+const EXP_COLORS = ['#38bdf8', '#fbbf24', '#34d399', '#fb7185', '#a78bfa', '#f472b6', '#22d3ee', '#a3e635', '#fb923c', '#e879f9'];
+
+function expColor(id) { return EXP_COLORS[(id - 1) % EXP_COLORS.length]; }
+
+async function expRefresh(force) {
+  const tab = document.getElementById('tab-experiments');
+  if (!force && (!tab || tab.classList.contains('hidden'))) return;
+  try {
+    const res = await fetch('/api/experiments');
+    expData = await res.json();
+    expRender();
+  } catch (e) {}
+}
+
+async function expPost(body) {
+  const res = await fetch('/api/experiments', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+  });
+  expData = await res.json();
+  expRender();
+}
+
+function expRender() {
+  if (!expData) return;
+  // Form selects (once / when the game list changes).
+  const gameSel = document.getElementById('exp-game');
+  const chartGame = document.getElementById('exp-chart-game');
+  if (!gameSel.options.length) {
+    for (const [key, g] of Object.entries(expData.games)) {
+      gameSel.add(new Option(g.title, key));
+      chartGame.add(new Option(g.title, key));
+    }
+    gameSel.value = expData.active_game;
+    // Chart the game of the most recent run (if any) so existing results show up immediately.
+    const lastRun = expData.store.runs[expData.store.runs.length - 1];
+    chartGame.value = lastRun ? lastRun.spec.game : expData.active_game;
+    const be = document.getElementById('exp-backend');
+    expData.backends.forEach(b => be.add(new Option(b.name === 'tch' ? 'tch (libtorch)' : 'candle', b.name)));
+    be.value = expData.backends.some(b => b.name === 'tch') ? 'tch' : 'candle';
+    expBackendChanged();
+    expGameChanged();
+    if (typeof stateData !== 'undefined' && stateData && stateData.eval_opponents) {
+      oppRender('live-opps', stateData.eval_opponents, stateData.active_game);
+    }
+  }
+
+  const store = expData.store;
+  const running = store.runs.find(r => r.status.state === 'Running');
+  const queued = store.runs.filter(r => r.status.state === 'Queued').length;
+  const qBtn = document.getElementById('exp-queue-btn');
+  qBtn.textContent = store.queue_running ? '⏸ Pause Queue' : '▶ Run Queue';
+  qBtn.className = 'btn ' + (store.queue_running ? 'amber' : 'green');
+  let status = store.queue_running ? 'Queue running' : 'Queue paused';
+  status += ` · ${queued} queued`;
+  if (running) status += ` · now: <b>${running.spec.name}</b> — ${running.phase || 'starting…'}`;
+  if (store.queue_running && expData.live_training) status += ' · <span style="color:var(--amber)">waiting: live training is active (pause it to run experiments)</span>';
+  document.getElementById('exp-queue-status').innerHTML = status;
+
+  const rows = store.runs.slice().reverse().map(r => {
+    const last = r.points[r.points.length - 1];
+    const trainMin = last ? last.train_secs / 60 : 0;
+    const gpm = last && last.train_secs > 0 ? (last.games / (last.train_secs / 60)).toFixed(0) : '—';
+    const scores = last ? r.opponents.map((o, i) => `${o.split(' ')[0]} ${last.scores[i].toFixed(0)}%`).join('<br>') : '—';
+    const st = r.status.state + (r.status.message ? `: ${r.status.message}` : '');
+    const spec = r.spec;
+    const actions = [];
+    if (r.status.state === 'Running') actions.push(`<button class="btn danger" style="padding:2px 6px;font-size:0.72rem;" onclick="expPost({action:'stop', id:${r.id}})">Stop</button>`);
+    else {
+      if (r.status.state !== 'Queued') actions.push(`<button class="btn secondary" style="padding:2px 6px;font-size:0.72rem;" onclick="expPost({action:'requeue', id:${r.id}})">Re-run</button>`);
+      actions.push(`<button class="btn secondary" style="padding:2px 6px;font-size:0.72rem;" onclick="expDelete(${r.id})">Delete</button>`);
+    }
+    actions.push(`<button class="btn secondary" style="padding:2px 6px;font-size:0.72rem;" onclick="expDuplicate(${r.id})" title="Copy this run's settings into the form">Copy</button>`);
+    return `<tr>
+      <td><span class="exp-dot ${expHidden.has(r.id) ? 'off' : ''}" style="background:${expColor(r.id)}" onclick="expToggleLine(${r.id})"></span></td>
+      <td><b>${spec.name}</b><br><span class="hint">#${r.id} · ${spec.budget_minutes} min budget</span></td>
+      <td>${spec.game} · ${spec.net}<br>${r.device_label || (spec.backend + ' ' + spec.device)}<br><span class="hint">${spec.hp.games_per_iteration}g×${spec.hp.simulations_per_move}s, ${spec.hp.train_steps}×${spec.hp.batch_size}, lr ${spec.hp.learning_rate}</span></td>
+      <td class="exp-status-${r.status.state}">${st}</td>
+      <td>${last ? last.iteration : 0}</td>
+      <td>${last ? last.games : 0}</td>
+      <td>${trainMin.toFixed(1)}</td>
+      <td>${gpm}</td>
+      <td>${scores}</td>
+      <td style="white-space:nowrap;">${actions.join(' ')}</td>
+    </tr>`;
+  });
+  document.getElementById('exp-rows').innerHTML = rows.join('') || '<tr><td colspan="10" class="hint">No runs yet — define one on the left and add it to the queue.</td></tr>';
+  expDrawChart();
+}
+
+function expGameChanged() {
+  const game = document.getElementById('exp-game').value;
+  const g = expData.games[game];
+  const netSel = document.getElementById('exp-net');
+  netSel.innerHTML = '';
+  g.presets.forEach(p => netSel.add(new Option(p, p)));
+  const init = document.getElementById('exp-init');
+  init.innerHTML = '<option value="">— fresh random weights —</option>' + g.checkpoints.map(c => `<option value="${c}">${c}</option>`).join('');
+  if (expFormGame !== game) {
+    expFormGame = game;
+    expFillHp('defaults');
+    oppRender('exp-opps', g.default_opponents, game);
+  }
+}
+
+function expBackendChanged() {
+  const b = expData.backends.find(x => x.name === document.getElementById('exp-backend').value);
+  document.getElementById('exp-device-gpu').textContent = b && b.gpu ? `GPU (${b.gpu})` : 'GPU (none → CPU)';
+}
+
+function expFillHp(which) {
+  const g = expData.games[document.getElementById('exp-game').value];
+  document.getElementById('exp-hp').value = JSON.stringify(g[which], null, 2);
+}
+
+async function expAdd() {
+  const err = document.getElementById('exp-form-error');
+  let hp;
+  try { hp = JSON.parse(document.getElementById('exp-hp').value); }
+  catch (e) { err.textContent = 'Hyperparameter JSON is invalid: ' + e.message; return; }
+  err.textContent = '';
+  const num = (id) => parseFloat(document.getElementById(id).value);
+  const spec = {
+    name: document.getElementById('exp-name').value.trim(),
+    game: document.getElementById('exp-game').value,
+    net: document.getElementById('exp-net').value,
+    backend: document.getElementById('exp-backend').value,
+    device: document.getElementById('exp-device').value,
+    hp,
+    budget_minutes: num('exp-budget'),
+    max_iterations: parseInt(document.getElementById('exp-maxiter').value, 10) || 0,
+    eval_every: parseInt(document.getElementById('exp-evalevery').value, 10) || 5,
+    eval_sims: parseInt(document.getElementById('exp-evalsims').value, 10) || 100,
+    eval_games: parseInt(document.getElementById('exp-evalgames').value, 10) || 48,
+    infer_batch: parseInt(document.getElementById('exp-inferbatch').value, 10) || 256,
+    opponents: oppRead('exp-opps'),
+    init_checkpoint: document.getElementById('exp-init').value,
+  };
+  if (!spec.opponents.length) { err.textContent = 'Add at least one evaluation opponent.'; return; }
+  document.getElementById('exp-name').value = '';
+  await expPost({ action: 'add', spec });
+}
+
+function expDuplicate(id) {
+  const r = expData.store.runs.find(x => x.id === id);
+  if (!r) return;
+  const s = r.spec;
+  document.getElementById('exp-game').value = s.game;
+  expFormGame = s.game;
+  expGameChanged();
+  document.getElementById('exp-net').value = s.net;
+  document.getElementById('exp-backend').value = s.backend;
+  expBackendChanged();
+  document.getElementById('exp-device').value = s.device;
+  document.getElementById('exp-budget').value = s.budget_minutes;
+  document.getElementById('exp-maxiter').value = s.max_iterations;
+  document.getElementById('exp-evalevery').value = s.eval_every;
+  document.getElementById('exp-evalsims').value = s.eval_sims;
+  document.getElementById('exp-evalgames').value = s.eval_games;
+  document.getElementById('exp-inferbatch').value = s.infer_batch;
+  oppRender('exp-opps', s.opponents && s.opponents.length ? s.opponents : expData.games[s.game].default_opponents, s.game);
+  document.getElementById('exp-init').value = s.init_checkpoint || '';
+  document.getElementById('exp-hp').value = JSON.stringify(s.hp, null, 2);
+  document.getElementById('exp-name').value = s.name + ' (copy)';
+}
+
+async function expDelete(id) {
+  if (confirm('Delete this run and its results?')) await expPost({ action: 'delete', id });
+}
+
+async function expToggleQueue() {
+  await expPost({ action: expData.store.queue_running ? 'pause_queue' : 'run_queue' });
+}
+
+function expToggleLine(id) {
+  if (expHidden.has(id)) expHidden.delete(id); else expHidden.add(id);
+  expRender();
+}
+
+function expDrawChart() {
+  if (!expData) return;
+  const game = document.getElementById('exp-chart-game').value;
+  const runs = expData.store.runs.filter(r => r.spec.game === game && r.points.length);
+  // Opponent selector: union of opponent labels of this game's runs, plus their average.
+  const oppSel = document.getElementById('exp-chart-opp');
+  const labels = [...new Set(runs.flatMap(r => r.opponents))];
+  const want = ['avg', ...labels].join('|');
+  if (oppSel.dataset.labels !== want) {
+    const prev = oppSel.value;
+    oppSel.innerHTML = '';
+    oppSel.add(new Option('average of opponents', 'avg'));
+    labels.forEach(l => oppSel.add(new Option(l, l)));
+    oppSel.dataset.labels = want;
+    if ([...oppSel.options].some(o => o.value === prev)) oppSel.value = prev;
+  }
+  const opp = oppSel.value || 'avg';
+  const xKey = document.getElementById('exp-chart-x').value;
+  const xOf = (p) => xKey === 'train' ? p.train_secs / 60 : (xKey === 'games' ? p.games : p.iteration);
+  const yOf = (r, p) => {
+    if (opp === 'avg') return p.scores.reduce((a, b) => a + b, 0) / Math.max(1, p.scores.length);
+    const i = r.opponents.indexOf(opp);
+    return i >= 0 ? p.scores[i] : null;
+  };
+  const series = runs.filter(r => !expHidden.has(r.id)).map(r => ({
+    color: expColor(r.id), name: r.spec.name,
+    pts: r.points.map(p => [xOf(p), yOf(r, p)]).filter(([, y]) => y !== null),
+  }));
+
+  const c = document.getElementById('exp-chart');
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  const padL = 44, padR = 16, padT = 12, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  let maxX = 0;
+  series.forEach(s => s.pts.forEach(([x]) => { if (x > maxX) maxX = x; }));
+  if (maxX <= 0) maxX = 1;
+  const X = (x) => padL + plotW * (x / maxX);
+  const Y = (y) => padT + plotH * (1 - y / 100);
+  ctx.font = '11px monospace';
+  ctx.strokeStyle = '#1e293b';
+  ctx.fillStyle = '#64748b';
+  for (let i = 0; i <= 4; i++) {
+    const y = Y(i * 25);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(`${i * 25}%`, 6, y + 4);
+  }
+  for (let i = 0; i <= 5; i++) {
+    const xv = maxX * i / 5;
+    ctx.fillText(xKey === 'train' ? xv.toFixed(1) : Math.round(xv).toString(), X(xv) - 10, H - 10);
+  }
+  ctx.fillText(xKey === 'train' ? 'training minutes' : (xKey === 'games' ? 'self-play games' : 'iteration'), W - padR - 130, H - 10);
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = '#475569';
+  ctx.beginPath(); ctx.moveTo(padL, Y(50)); ctx.lineTo(W - padR, Y(50)); ctx.stroke();
+  ctx.setLineDash([]);
+  series.forEach(s => {
+    ctx.strokeStyle = s.color; ctx.fillStyle = s.color; ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    s.pts.forEach(([x, y], i) => { if (i === 0) ctx.moveTo(X(x), Y(y)); else ctx.lineTo(X(x), Y(y)); });
+    ctx.stroke();
+    s.pts.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(X(x), Y(y), 3, 0, 2 * Math.PI); ctx.fill(); });
+  });
+  document.getElementById('exp-legend').innerHTML = series.map(s => `<span style="color:${s.color}">● ${s.name}</span>`).join('');
+}
+
+// ---- Opponent editor (used by the live-training page and the experiment form) ----
+const OPP_KINDS = { random: 'Random', mcts: 'MCTS (random playouts)', minimax: 'Minimax (heuristic)', alphazero: 'AlphaZero checkpoint' };
+
+function oppDefaults(kind, game) {
+  const g = expData && expData.games[game];
+  switch (kind) {
+    case 'mcts': return { kind, sims: 200, exploration: 1.414 };
+    case 'minimax': return { kind, depth: 2 };
+    case 'alphazero': return { kind, checkpoint: g && g.checkpoints[0] || '', net: g && g.presets[0] || 'default', sims: 100, trees: 1 };
+    default: return { kind: 'random' };
+  }
+}
+
+// `extraCheckpoints` are offered before the saved files (the Play tab adds the live network).
+function oppParamsHtml(o, game, extraCheckpoints = []) {
+  const g = expData && expData.games[game];
+  const num = (cls, label, v, step, title) =>
+    `<label class="opp-field" title="${title}">${label} <input type="number" class="${cls}" value="${v}" step="${step}" min="0"></label>`;
+  switch (o.kind) {
+    case 'mcts':
+      return num('opp-sims', 'sims', o.sims, 50, 'Simulations per move (each ends in a random playout)')
+        + num('opp-c', 'c', o.exploration, 0.1, 'UCT exploration constant');
+    case 'minimax':
+      return num('opp-depth', 'depth', o.depth, 1, 'Search depth in plies (uses the game heuristic at the leaves)');
+    case 'alphazero': {
+      const ckpts = [...extraCheckpoints, ...(g ? g.checkpoints : [])];
+      const opts = (ckpts.includes(o.checkpoint) || !o.checkpoint ? ckpts : [o.checkpoint, ...ckpts])
+        .map(c => `<option ${c === o.checkpoint ? 'selected' : ''}>${c}</option>`).join('');
+      const nets = (g ? g.presets : [o.net]).map(n => `<option ${n === o.net ? 'selected' : ''}>${n}</option>`).join('');
+      return `<label class="opp-field" title="Saved .safetensors network (working directory)">file <select class="opp-ckpt">${opts || '<option value="">(no checkpoints)</option>'}</select></label>`
+        + `<label class="opp-field" title="Architecture the checkpoint was trained with">net <select class="opp-net">${nets}</select></label>`
+        + num('opp-sims', 'sims', o.sims, 25, 'PUCT simulations per move in each tree')
+        + num('opp-trees', 'trees', o.trees || 1, 1, 'Root-parallel trees: each searches sims simulations, their visit counts are summed to choose the move. On a GPU more trees cost little extra time (one batch).');
+    }
+    default: return '<span class="hint">uniformly random legal moves</span>';
+  }
+}
+
+function oppRowHtml(o, game) {
+  const kinds = Object.entries(OPP_KINDS).map(([k, l]) => `<option value="${k}" ${k === o.kind ? 'selected' : ''}>${l}</option>`).join('');
+  return `<div class="opp-row"><select class="opp-kind" onchange="oppKindChanged(this)">${kinds}</select>`
+    + `<span class="opp-params">${oppParamsHtml(o, game)}</span>`
+    + `<button class="btn secondary" style="padding:2px 7px;font-size:0.72rem;" title="Remove" onclick="this.parentElement.remove()">✕</button></div>`;
+}
+
+function oppRender(containerId, list, game) {
+  const c = document.getElementById(containerId);
+  if (!c) return;
+  c.dataset.game = game;
+  c.innerHTML = `<div class="opp-rows">${(list || []).map(o => oppRowHtml(o, game)).join('')}</div>`
+    + `<button class="btn secondary" style="padding:3px 9px;font-size:0.74rem;margin-top:4px;" onclick="oppAdd('${containerId}')">+ Add opponent</button>`;
+}
+
+function oppAdd(containerId) {
+  const c = document.getElementById(containerId);
+  c.querySelector('.opp-rows').insertAdjacentHTML('beforeend', oppRowHtml(oppDefaults('mcts', c.dataset.game), c.dataset.game));
+}
+
+function oppKindChanged(sel) {
+  const game = sel.closest('[data-game]').dataset.game;
+  sel.parentElement.querySelector('.opp-params').innerHTML = oppParamsHtml(oppDefaults(sel.value, game), game);
+}
+
+function oppRead(containerId) {
+  const c = document.getElementById(containerId);
+  if (!c) return [];
+  return [...c.querySelectorAll('.opp-row')].map(oppReadRow).filter(o => o.kind !== 'alphazero' || o.checkpoint);
+}
+
+// Reads one engine from an element holding an `.opp-kind` select and the fields of `oppParamsHtml`.
+function oppReadRow(row) {
+  const kind = row.querySelector('.opp-kind').value;
+  const v = (cls) => row.querySelector('.' + cls);
+  switch (kind) {
+    case 'mcts': return { kind, sims: parseInt(v('opp-sims').value, 10) || 200, exploration: parseFloat(v('opp-c').value) || 1.414 };
+    case 'minimax': return { kind, depth: parseInt(v('opp-depth').value, 10) || 1 };
+    case 'alphazero': return { kind, checkpoint: v('opp-ckpt').value, net: v('opp-net').value, sims: parseInt(v('opp-sims').value, 10) || 100, trees: parseInt(v('opp-trees').value, 10) || 1 };
+    default: return { kind };
+  }
+}
+
+setInterval(() => expRefresh(false), 2000);
+expRefresh(true);
+</script>

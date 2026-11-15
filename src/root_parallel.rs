@@ -92,6 +92,8 @@ struct RootWorker<R: GameRules<N>, const N: usize, S: SelectionPolicy, E: LeafEv
 #[derive(Clone, Copy, Debug)]
 pub struct AggregatedRootChild<M> {
     pub mv: M,
+    /// Prior `P(s, a)` from the first tree (identical across trees unless root noise is on).
+    pub prior: f32,
     pub visits: u64,
     pub value_sum: f64,
 }
@@ -189,6 +191,7 @@ where
             .iter()
             .map(|c| AggregatedRootChild {
                 mv: c.mv,
+                prior: c.payload.prior,
                 visits: 0,
                 value_sum: 0.0,
             })

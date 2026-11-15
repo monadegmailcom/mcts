@@ -1,0 +1,12 @@
+[package]
+name = "tch_bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone crate (not part of the mcts workspace): libtorch via tch-rs.
+# Build: LIBTORCH=/path/to/libtorch cargo run --release
+[workspace]
+
+[dependencies]
+tch = "=0.22.0"

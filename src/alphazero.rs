@@ -32,14 +32,13 @@ use rand::prelude::{Rng, SeedableRng, SmallRng};
 use rand_distr::{Distribution, Gamma};
 
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
-use crate::games::rubiks_cube::{self, RubiksCube};
-use crate::games::tic_tac_toe::{self, Symbol as TttSymbol, TicTacToe};
-use crate::games::twist_puzzle::{self, TwistPuzzle};
-use crate::games::ultimate_ttt::{self, UltimateTicTacToe};
+use crate::hyperparams::AlphaZeroHyperparams;
+use crate::nn::AlphaZeroNetConfig;
+use crate::training::Symmetry;
 use crate::inference::{BatchEvaluator, InferenceClient, InferenceService};
 use crate::matchup::{PollableSlot, run_parallel_games};
 use crate::mcts::{
-    LeafEvaluator, MctsPayload, MctsSearch, Puct, assign_masked_softmax_priors,
+    Fpu, LeafEvaluator, MctsPayload, MctsSearch, Puct, assign_masked_softmax_priors,
 };
 use crate::player::Player;
 use crate::root_parallel::{
@@ -50,6 +49,13 @@ use crate::tree::{Node, NodeId, TreeArena};
 
 /// Trait bridging a [`GameRules<N>`] implementation to a neural network with flattened state
 /// input size `G` and policy logit output size `P`.
+///
+/// A game implements the three required items (sentinel move, policy indexing, state encoding)
+/// next to its rules in its own module (`crate::games::*`). Everything else has a generic default
+/// that works for any game and may be overridden per game:
+/// - [`Self::net_config`]: network architecture (default: residual MLP over the flat encoding);
+/// - [`Self::symmetries`]: exact symmetries used for data augmentation (default: none);
+/// - [`Self::hyperparams`]: self-play / training / evaluation defaults.
 pub trait AlphaZeroGame<const G: usize, const P: usize, const N: usize>:
     GameRules<N> + Sized
 {
@@ -61,84 +67,26 @@ pub trait AlphaZeroGame<const G: usize, const P: usize, const N: usize>:
 
     /// Encodes `game` from `game.current_player()`'s perspective into a flattened `[f32; G]` tensor.
     fn encode_state(game: &Game<Self, N>, out: &mut [f32; G]);
-}
 
-impl AlphaZeroGame<27, 9, 2> for TicTacToe {
-    const SENTINEL_MOVE: Self::Move = tic_tac_toe::NO_MOVE;
-
-    #[inline]
-    fn move_to_policy_index(mv: Self::Move) -> usize {
-        mv as usize
+    /// Network architecture for this game.
+    fn net_config() -> AlphaZeroNetConfig {
+        AlphaZeroNetConfig::generic_mlp()
     }
 
-    /// Encodes 3 planes of `3x3 = 9` floats (`27` floats total; matches `games/tic_tac_toe.cpp:50-79`):
-    /// - Plane 0 (`0..9`): `1.0` where `current_player` has a piece.
-    /// - Plane 1 (`9..18`): `1.0` where the opponent has a piece.
-    /// - Plane 2 (`18..27`): `1.0` if `current_player == PLAYER1`, else `0.0`.
-    fn encode_state(game: &Game<Self, 2>, out: &mut [f32; 27]) {
-        out.fill(0.0);
-        let me = game.current_player();
-        let my_sym = TttSymbol::from_player(me);
-        let opp_sym = TttSymbol::from_player(me.next());
-
-        for (idx, &cell) in game.state().iter().enumerate() {
-            if cell == my_sym {
-                out[idx] = 1.0;
-            } else if cell == opp_sym {
-                out[9 + idx] = 1.0;
-            }
-        }
-
-        if me == PlayerIndex::<2>::PLAYER1 {
-            out[18..27].fill(1.0);
-        }
-    }
-}
-
-impl AlphaZeroGame<{ ultimate_ttt::INPUT_SIZE }, { ultimate_ttt::POLICY_SIZE }, 2>
-    for UltimateTicTacToe
-{
-    const SENTINEL_MOVE: Self::Move = ultimate_ttt::NO_MOVE;
-
-    #[inline]
-    fn move_to_policy_index(mv: Self::Move) -> usize {
-        mv.to_policy_index()
+    /// Exact symmetries of the encoding and policy (each must commute with the rules); the
+    /// replay buffer applies a random one to every sampled position.
+    fn symmetries() -> Vec<Symmetry> {
+        Vec::new()
     }
 
-    #[inline]
-    fn encode_state(game: &Game<Self, 2>, out: &mut [f32; ultimate_ttt::INPUT_SIZE]) {
-        ultimate_ttt::encode_alphazero_planes(game, out);
-    }
-}
-
-impl AlphaZeroGame<{ rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1> for RubiksCube {
-    const SENTINEL_MOVE: Self::Move = rubiks_cube::NO_MOVE;
-
-    #[inline]
-    fn move_to_policy_index(mv: Self::Move) -> usize {
-        mv as usize
+    /// Recommended self-play, training and evaluation hyperparameters.
+    fn hyperparams() -> AlphaZeroHyperparams {
+        AlphaZeroHyperparams::GENERIC
     }
 
-    #[inline]
-    fn encode_state(game: &Game<Self, 1>, out: &mut [f32; rubiks_cube::INPUT_SIZE]) {
-        rubiks_cube::encode_one_hot(game.state(), out);
-    }
-}
-
-impl AlphaZeroGame<81, 8, 1> for TwistPuzzle {
-    const SENTINEL_MOVE: Self::Move = twist_puzzle::NO_MOVE;
-
-    #[inline]
-    fn move_to_policy_index(mv: Self::Move) -> usize {
-        mv as usize
-    }
-
-    #[inline]
-    fn encode_state(game: &Game<Self, 1>, out: &mut [f32; 81]) {
-        out.fill(0.0);
-        for (pos, &tile) in game.state().board.iter().enumerate() {
-            out[pos * 9 + (tile as usize)] = 1.0;
-        }
+    /// Named alternative architectures offered for experiments (the first is the default).
+    fn net_presets() -> Vec<(&'static str, AlphaZeroNetConfig)> {
+        vec![("default", Self::net_config()), ("mlp", AlphaZeroNetConfig::generic_mlp())]
     }
 }
 
@@ -297,10 +245,7 @@ where
             assign_masked_softmax_priors(children, |mv| {
                 resp.policy_logits[R::move_to_policy_index(mv)]
             });
-            Poll::Ready(relative_to_absolute_values(
-                game.current_player(),
-                &resp.value,
-            ))
+            Poll::Ready(relative_to_absolute_values(game.current_player(), &resp.value))
         } else {
             Poll::Pending
         }
@@ -352,6 +297,8 @@ pub struct AlphaZeroConfig {
     pub c_base: f32,
     /// PUCT exploration constant `c_init` (default `1.25`).
     pub c_init: f32,
+    /// PUCT first-play urgency: `Q` assumed for unvisited children (default `Absolute(0.0)`).
+    pub fpu: Fpu,
     /// Symmetric Dirichlet parameter `alpha` for per-tree root exploration noise.
     pub dirichlet_alpha: f32,
     /// Weight `epsilon` of Dirichlet noise blended into each tree's root priors (`0.0` disables).
@@ -370,6 +317,7 @@ impl AlphaZeroConfig {
             opening_moves: 0,
             c_base: 19_652.0,
             c_init: 1.25,
+            fpu: Fpu::Absolute(0.0),
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.15,
             arena_capacity_per_tree: 0,
@@ -391,6 +339,11 @@ impl AlphaZeroConfig {
     pub const fn with_puct(mut self, c_base: f32, c_init: f32) -> Self {
         self.c_base = c_base;
         self.c_init = c_init;
+        self
+    }
+
+    pub const fn with_fpu(mut self, fpu: Fpu) -> Self {
+        self.fpu = fpu;
         self
     }
 
@@ -459,7 +412,7 @@ where
             inner: RootParallelPlayer::new(
                 game,
                 R::SENTINEL_MOVE,
-                Puct::new(config.c_base, config.c_init),
+                Puct::new(config.c_base, config.c_init).with_fpu(config.fpu),
                 num_trees,
                 rp_config,
                 |_t, eval_seed| {
@@ -524,9 +477,35 @@ pub struct TrainingPosition<const G: usize, const P: usize, const N: usize> {
     pub state: [f32; G],
     /// Normalized MCTS root visit distribution `pi(a | s)` over all `0..P` actions.
     pub policy: [f32; P],
-    /// Terminal game outcome `[f32; N]` rotated into the acting player's relative order
-    /// (`value[0]` is the acting player's terminal payoff).
+    /// Value target `[f32; N]` in the acting player's relative order (`value[0]` is the acting
+    /// player's): the terminal outcome, optionally blended with the search value
+    /// (see [`SelfPlayConfig::value_q_weight`]).
     pub value: [f32; N],
+}
+
+/// How the weight of the search value `q` in the value target varies over a game
+/// (see [`SelfPlayConfig::value_q_weight`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueQSchedule {
+    /// Every position uses the full weight.
+    #[default]
+    Constant,
+    /// The full weight on the first position, falling linearly to `0` on the last. The outcome
+    /// `z` is noisiest where many moves are still to come and nearly certain at the end; note
+    /// that early-position `q` is also the most self-referential (the search rarely reaches
+    /// terminal states from there), so whether this helps is an empirical question.
+    LinearToEnd,
+}
+
+impl ValueQSchedule {
+    /// Weight of `q` for position `index` (0-based) of a game with `len` recorded positions.
+    pub fn weight(self, max_weight: f32, index: usize, len: usize) -> f32 {
+        match self {
+            Self::Constant => max_weight,
+            Self::LinearToEnd => max_weight * len.saturating_sub(index + 1) as f32 / len.saturating_sub(1).max(1) as f32,
+        }
+    }
 }
 
 /// Hyperparameters for Game-Parallel AlphaZero Self-Play (combines `alphazero::params::Mcts`
@@ -546,12 +525,21 @@ pub struct SelfPlayConfig {
     pub c_base: f32,
     /// PUCT exploration constant `c_init` (default `1.25`).
     pub c_init: f32,
+    /// PUCT first-play urgency: `Q` assumed for unvisited children (default `Absolute(0.0)`).
+    pub fpu: Fpu,
     /// Symmetric Dirichlet parameter `alpha` for root exploration noise.
     pub dirichlet_alpha: f32,
     /// Weight `epsilon` of Dirichlet noise blended into root priors (default `0.25`; `0.0` disables).
     pub dirichlet_epsilon: f32,
     /// Node capacity per game's generational arena (`0` uses `simulations_per_move * 16`).
     pub arena_capacity: usize,
+    /// Weight `w` of the root search value `q` in the value target: `(1 - w) * z + w * q`
+    /// (`z` = final game outcome). Early in training `z` is extremely noisy (near-random games),
+    /// while `q` reflects the search's tactical findings; `0.0` (default) is pure AlphaZero.
+    /// Only applied for `N <= 2` (for `N = 2` the opponent's target is `-q`).
+    pub value_q_weight: f32,
+    /// How `value_q_weight` varies over the positions of a game (default: constant).
+    pub value_q_schedule: ValueQSchedule,
     /// Deterministic base seed.
     pub seed: u64,
 }
@@ -565,11 +553,24 @@ impl SelfPlayConfig {
             opening_moves: 4,
             c_base: 19_652.0,
             c_init: 1.25,
+            fpu: Fpu::Absolute(0.0),
             dirichlet_alpha: 0.3,
             dirichlet_epsilon: 0.25,
             arena_capacity: 0,
+            value_q_weight: 0.0,
+            value_q_schedule: ValueQSchedule::Constant,
             seed,
         }
+    }
+
+    pub const fn with_value_q_weight(mut self, weight: f32) -> Self {
+        self.value_q_weight = weight;
+        self
+    }
+
+    pub const fn with_value_q_schedule(mut self, schedule: ValueQSchedule) -> Self {
+        self.value_q_schedule = schedule;
+        self
     }
 
     pub const fn with_workers(mut self, num_workers: usize) -> Self {
@@ -596,6 +597,11 @@ impl SelfPlayConfig {
 
     pub const fn with_arena_capacity(mut self, arena_capacity: usize) -> Self {
         self.arena_capacity = arena_capacity;
+        self
+    }
+
+    pub const fn with_fpu(mut self, fpu: Fpu) -> Self {
+        self.fpu = fpu;
         self
     }
 
@@ -661,6 +667,8 @@ struct PendingTurn<const G: usize, const P: usize, const N: usize> {
     actor: PlayerIndex<N>,
     state: [f32; G],
     policy: [f32; P],
+    /// Visit-weighted root value estimate for `actor` after the search.
+    root_q: f32,
 }
 
 struct CompletedSelfPlayGame<const G: usize, const P: usize, const N: usize> {
@@ -681,6 +689,8 @@ where
     evaluator: NnEvaluator<'a, E, G, P, N>,
     simulations_per_move: usize,
     opening_moves: usize,
+    value_q_weight: f32,
+    value_q_schedule: ValueQSchedule,
     move_count: usize,
     pending_turns: Vec<PendingTurn<G, P, N>>,
     root_entropy_stats: Statistics,
@@ -697,7 +707,7 @@ where
         config: &SelfPlayConfig,
         slot_seed: u64,
     ) -> Self {
-        let puct = Puct::new(config.c_base, config.c_init);
+        let puct = Puct::new(config.c_base, config.c_init).with_fpu(config.fpu);
         let search = MctsSearch::new(
             game,
             R::SENTINEL_MOVE,
@@ -713,6 +723,8 @@ where
             evaluator,
             simulations_per_move: config.simulations_per_move,
             opening_moves: config.opening_moves,
+            value_q_weight: if N <= 2 { config.value_q_weight.clamp(0.0, 1.0) } else { 0.0 },
+            value_q_schedule: config.value_q_schedule,
             move_count: 0,
             pending_turns: Vec::with_capacity(64),
             root_entropy_stats: Statistics::new(),
@@ -753,6 +765,7 @@ where
             actor: self.search.root_game().current_player(),
             state: encoded_root,
             policy: policy_target,
+            root_q: self.search.root_value_estimate(),
         });
 
         self.move_count += 1;
@@ -776,13 +789,26 @@ where
     fn poll_step(&mut self) -> Poll<Self::Output> {
         loop {
             if let GameStatus::Terminal(final_abs_payoffs) = self.search.root_game().status() {
+                let len = self.pending_turns.len();
+                let (max_w, schedule) = (self.value_q_weight, self.value_q_schedule);
                 let positions = self
                     .pending_turns
                     .drain(..)
-                    .map(|turn| TrainingPosition {
-                        state: turn.state,
-                        policy: turn.policy,
-                        value: absolute_to_relative_values(turn.actor, &final_abs_payoffs),
+                    .enumerate()
+                    .map(|(index, turn)| {
+                        let mut value = absolute_to_relative_values(turn.actor, &final_abs_payoffs);
+                        let w = schedule.weight(max_w, index, len);
+                        if w > 0.0 {
+                            for (k, v) in value.iter_mut().enumerate() {
+                                let q = if k == 0 { turn.root_q } else { -turn.root_q };
+                                *v = (1.0 - w) * *v + w * q;
+                            }
+                        }
+                        TrainingPosition {
+                            state: turn.state,
+                            policy: turn.policy,
+                            value,
+                        }
                     })
                     .collect();
                 return Poll::Ready(CompletedSelfPlayGame {
@@ -941,6 +967,19 @@ fn unique_winner_index<const N: usize>(payoffs: &[f32; N]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::games::rubiks_cube::{RubiksGame, RubiksState};
+
+    #[test]
+    fn value_q_schedule_weights() {
+        let w = |schedule: ValueQSchedule, i| schedule.weight(0.8, i, 5);
+        assert_eq!((0..5).map(|i| w(ValueQSchedule::Constant, i)).collect::<Vec<_>>(), [0.8; 5]);
+        assert_eq!((0..5).map(|i| w(ValueQSchedule::LinearToEnd, i)).collect::<Vec<_>>(), [0.8, 0.6, 0.4, 0.2, 0.0]);
+        // A one-position game: that position is the last one.
+        assert_eq!(ValueQSchedule::LinearToEnd.weight(0.8, 0, 1), 0.0);
+        // JSON form, and hyperparameters saved before the schedule existed load as constant.
+        assert_eq!(serde_json::to_string(&ValueQSchedule::LinearToEnd).unwrap(), r#""linear_to_end""#);
+        let hp: AlphaZeroHyperparams = serde_json::from_str(r#"{"value_q_weight":0.5}"#).unwrap();
+        assert_eq!((hp.value_q_weight, hp.value_q_schedule), (0.5, ValueQSchedule::Constant));
+    }
     use crate::games::tic_tac_toe::{EMPTY_STATE, TttGame, TttHeuristic};
     use crate::inference::FnBatchEvaluator;
     use crate::mcts::LeafStep;
@@ -971,7 +1010,7 @@ mod tests {
 
         // Also directly test that after 1 simulation + Dirichlet noise via `poll_simulations`,
         // priors are non-uniform and sum to 1.0 (catching the C++ Move-1 overwrite bug).
-        let mut search = MctsSearch::new(game, tic_tac_toe::NO_MOVE, Puct::default(), 512, 99);
+        let mut search = MctsSearch::new(game, crate::games::tic_tac_toe::NO_MOVE, Puct::default(), 512, 99);
         let mut nn_eval = NnEvaluator::new(&service, 99).with_dirichlet(0.3, 0.25);
         search.run_simulations(1, &mut nn_eval);
 

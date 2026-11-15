@@ -17,8 +17,10 @@ use std::fmt;
 
 use rand::prelude::{Rng, RngExt};
 
+use crate::alphazero::AlphaZeroGame;
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::minimax::HeuristicEvaluator;
+use crate::nn::AlphaZeroNetConfig;
 
 /// Quarter-turn move index `0..12`:
 /// `0: U, 1: U', 2: D, 3: D', 4: L, 5: L', 6: R, 7: R', 8: F, 9: F', 10: B, 11: B'`.
@@ -483,6 +485,33 @@ pub fn encode_one_hot(state: &RubiksState, out: &mut [f32; INPUT_SIZE]) {
     out.fill(0.0);
     for (idx, &color) in state.stickers.iter().enumerate() {
         out[idx * NUM_FACES + (color as usize)] = 1.0;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// AlphaZero integration
+// ---------------------------------------------------------------------------------------------
+
+impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 1> for RubiksCube {
+    const SENTINEL_MOVE: Self::Move = NO_MOVE;
+
+    #[inline]
+    fn move_to_policy_index(mv: Self::Move) -> usize {
+        mv as usize
+    }
+
+    #[inline]
+    fn encode_state(game: &Game<Self, 1>, out: &mut [f32; INPUT_SIZE]) {
+        encode_one_hot(game.state(), out);
+    }
+
+    /// Wider residual MLP over the one-hot sticker encoding (`G = 324, P = 12, N = 1`).
+    fn net_config() -> AlphaZeroNetConfig {
+        AlphaZeroNetConfig::ResMlp {
+            hidden_dim: 256,
+            num_res_blocks: 4,
+            head_hidden: 128,
+        }
     }
 }
 

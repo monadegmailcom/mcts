@@ -6,13 +6,20 @@
 //! - Zero-`unsafe` two-generation compact arena (`tree`) with 20-byte nodes and root-to-leaf state reconstruction.
 
 pub mod alphazero;
+pub mod experiments;
+pub mod backend;
 pub mod game;
 pub mod games;
+pub mod hyperparams;
 pub mod inference;
 pub mod matchup;
 pub mod mcts;
 pub mod minimax;
 pub mod nn;
+pub mod opponents;
+pub mod play;
+#[cfg(feature = "tch")]
+pub mod nn_tch;
 pub mod player;
 pub mod root_parallel;
 pub mod statistics;

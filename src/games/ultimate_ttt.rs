@@ -13,7 +13,12 @@
 
 use std::fmt;
 
+use crate::alphazero::AlphaZeroGame;
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
+use crate::hyperparams::AlphaZeroHyperparams;
+use crate::nn::AlphaZeroNetConfig;
+use crate::play::PlayableGame;
+use crate::training::Symmetry;
 use crate::games::tic_tac_toe::{
     EMPTY_STATE as EMPTY_SMALL_STATE, Symbol, TicTacToe, TttHeuristic, TttState, WIN_LINES,
 };
@@ -30,9 +35,9 @@ pub const NO_MOVE: UtttMove = UtttMove {
 
 /// Number of spatial cells / policy logits (`9 x 9 = 81`).
 pub const POLICY_SIZE: usize = 81;
-/// Number of 9x9 feature planes for AlphaZero (`my_pieces`, `opp_pieces`, `valid_sub_board`, `p1_turn`).
-pub const INPUT_PLANES: usize = 4;
-/// Flattened neural network input tensor length (`4 * 81 = 324`).
+/// Number of 9x9 feature planes for AlphaZero (see [`encode_alphazero_planes`]).
+pub const INPUT_PLANES: usize = 7;
+/// Flattened neural network input tensor length (`7 * 81 = 567`).
 pub const INPUT_SIZE: usize = INPUT_PLANES * POLICY_SIZE;
 
 /// A move in Ultimate Tic-Tac-Toe (`2` bytes): sub-board `big_move` (`0..9`) and cell `small_move` (`0..9`).
@@ -380,24 +385,45 @@ impl HeuristicEvaluator<UltimateTicTacToe, 2> for UtttHeuristic {
     }
 }
 
-/// Encodes `game` into the 4x9x9 (`324` floats) relative feature representation for AlphaZero
-/// (port of `uttt::alphazero::Player::serialize_state` in `games/ultimate_ttt.cpp`):
-/// - Plane 0 (`0..81`): `1.0` where `game.current_player()` holds a cell.
-/// - Plane 1 (`81..162`): `1.0` where the opponent holds a cell.
-/// - Plane 2 (`162..243`): `1.0` on cells belonging to playable sub-board(s) for this turn.
-/// - Plane 3 (`243..324`): `1.0` everywhere if `current_player == PLAYER1`, else `0.0`.
+/// Encodes `game` into the 7x9x9 (`567` floats) relative feature representation for AlphaZero:
+/// - Plane 0: `1.0` where `game.current_player()` holds a cell.
+/// - Plane 1: `1.0` where the opponent holds a cell.
+/// - Plane 2: `1.0` on every currently legal move (empty cell of a playable sub-board).
+/// - Plane 3: `1.0` on all 9 cells of each sub-board won by the current player.
+/// - Plane 4: `1.0` on all 9 cells of each sub-board won by the opponent.
+/// - Plane 5: `1.0` on all 9 cells of each drawn (full, undecided) sub-board.
+/// - Plane 6: `1.0` everywhere if `current_player == PLAYER1`, else `0.0`.
+///
+/// Planes 3–5 expose the macro board directly: without them the network has to rediscover
+/// "three in a row inside a 3x3 block" from raw pieces before it can reason about the macro game,
+/// which makes value learning far slower.
 pub fn encode_alphazero_planes(game: &UtttGame, out: &mut [f32; INPUT_SIZE]) {
     out.fill(0.0);
     let state = game.state();
     let current_player = game.current_player();
     let my_sym = Symbol::from_player(current_player);
     let opp_sym = Symbol::from_player(current_player.toggle());
+    let (my_win, opp_win) = if current_player == PlayerIndex::PLAYER1 {
+        (SubBoardStatus::Player1Win, SubBoardStatus::Player2Win)
+    } else {
+        (SubBoardStatus::Player2Win, SubBoardStatus::Player1Win)
+    };
 
     for big in 0..9u8 {
         let small_board = &state.small_states[big as usize];
+        let big_status = state.big_state[big as usize];
         let sub_playable = state.outcome == SubBoardStatus::Ongoing
-            && state.big_state[big as usize] == SubBoardStatus::Ongoing
+            && big_status == SubBoardStatus::Ongoing
             && (state.next_big_move == NO_BIG_MOVE || state.next_big_move == big);
+        let status_plane = if big_status == my_win {
+            Some(3)
+        } else if big_status == opp_win {
+            Some(4)
+        } else if big_status == SubBoardStatus::Draw {
+            Some(5)
+        } else {
+            None
+        };
 
         for small in 0..9u8 {
             let spatial = UtttMove::new(big, small).to_policy_index();
@@ -406,17 +432,20 @@ pub fn encode_alphazero_planes(game: &UtttGame, out: &mut [f32; INPUT_SIZE]) {
                 out[spatial] = 1.0;
             } else if cell == opp_sym {
                 out[81 + spatial] = 1.0;
+            } else if sub_playable {
+                out[2 * 81 + spatial] = 1.0;
             }
-            if sub_playable {
-                out[162 + spatial] = 1.0;
+            if let Some(plane) = status_plane {
+                out[plane * 81 + spatial] = 1.0;
             }
         }
     }
 
     if current_player == PlayerIndex::PLAYER1 {
-        out[243..324].fill(1.0);
+        out[6 * 81..7 * 81].fill(1.0);
     }
 }
+
 
 /// Formats an Ultimate Tic-Tac-Toe position for terminal display.
 pub fn format_board(game: &UtttGame) -> String {
@@ -472,6 +501,127 @@ pub fn format_board(game: &UtttGame) -> String {
     }
     out.push_str(")\n");
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// AlphaZero integration
+// ---------------------------------------------------------------------------------------------
+
+/// Block network: one shared encoder per `3x3` sub-board plus a global MLP (the default; learns
+/// as much per game as [`net_resnet`] at a fraction of its compute).
+pub const fn net_block() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::BlockNet {
+        in_planes: INPUT_PLANES,
+        board_height: 9,
+        board_width: 9,
+        block_height: 3,
+        block_width: 3,
+        local_dim: 64,
+        hidden_dim: 256,
+        num_res_blocks: 3,
+        head_hidden: 64,
+    }
+}
+
+/// Convolutional ResNet over the `9x9` grid.
+pub const fn net_resnet() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::ResNet2d {
+        in_channels: INPUT_PLANES,
+        board_height: 9,
+        board_width: 9,
+        channels: 64,
+        num_res_blocks: 4,
+        policy_channels: 8,
+        value_channels: 4,
+        fc_hidden: 128,
+    }
+}
+
+/// Flat residual MLP over the whole encoding (no spatial structure; a baseline).
+pub const fn net_mlp() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::ResMlp {
+        hidden_dim: 128,
+        num_res_blocks: 2,
+        head_hidden: 96,
+    }
+}
+
+impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 2> for UltimateTicTacToe {
+    const SENTINEL_MOVE: Self::Move = NO_MOVE;
+
+    #[inline]
+    fn move_to_policy_index(mv: Self::Move) -> usize {
+        mv.to_policy_index()
+    }
+
+    #[inline]
+    fn encode_state(game: &Game<Self, 2>, out: &mut [f32; INPUT_SIZE]) {
+        encode_alphazero_planes(game, out);
+    }
+
+    fn net_config() -> AlphaZeroNetConfig {
+        net_block()
+    }
+
+    fn net_presets() -> Vec<(&'static str, AlphaZeroNetConfig)> {
+        vec![("block", net_block()), ("resnet", net_resnet()), ("mlp", net_mlp())]
+    }
+
+    /// The 8 dihedral symmetries of Ultimate Tic-Tac-Toe for replay-buffer augmentation.
+    ///
+    /// Rotating/reflecting the whole 9x9 grid applies the same transform to the macro board and to
+    /// every sub-board, which preserves the "cell `k` sends the opponent to sub-board `k`" rule, so all
+    /// 8 transforms are exact symmetries of the game (and of [`encode_alphazero_planes`]).
+    fn symmetries() -> Vec<Symmetry> {
+        Symmetry::dihedral_grid(INPUT_PLANES, 9)
+    }
+
+    /// Many cheap games per iteration (value learning is limited by the number of distinct games),
+    /// enough SGD steps to see each new position ~4 times (`256 games * ~50 positions * 4 / 256`),
+    /// a replay buffer holding ~6k games, and a value target blended with the search value
+    /// (`qw = 0.5`, meant to damp the noise of early, near-random game outcomes; compare against
+    /// `qw = 0` in the Experiments tab before relying on it).
+    fn hyperparams() -> AlphaZeroHyperparams {
+        AlphaZeroHyperparams {
+            games_per_iteration: 256,
+            simulations_per_move: 64,
+            opening_moves: 8,
+            value_q_weight: 0.5,
+            train_steps: 200,
+            batch_size: 256,
+            learning_rate: 2.0e-3,
+            buffer_capacity: 300_000,
+            eval_games: 48,
+            eval_sims: 0,
+            ..AlphaZeroHyperparams::GENERIC
+        }
+    }
+}
+
+impl PlayableGame<INPUT_SIZE, POLICY_SIZE> for UltimateTicTacToe {
+    type Heuristic = UtttHeuristic;
+
+    fn start() -> UtttGame {
+        UtttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE)
+    }
+
+    fn heuristic() -> UtttHeuristic {
+        UtttHeuristic::default()
+    }
+
+    fn cells(game: &UtttGame) -> Vec<u8> {
+        let state = game.state();
+        (0..81)
+            .map(|idx| {
+                let mv = UtttMove::from_policy_index(idx);
+                state.small_states[mv.big_move as usize][mv.small_move as usize] as u8
+            })
+            .collect()
+    }
+
+    fn blocks(game: &UtttGame) -> Vec<u8> {
+        game.state().big_state.iter().map(|&s| s as u8).collect()
+    }
 }
 
 #[cfg(test)]
@@ -587,5 +737,80 @@ mod tests {
             mcts_vs_rand.wins[0], 12,
             "expected 300-sim UCT MCTS to win 12/12 vs RandomPlayer in UTTT, got {mcts_vs_rand:?}"
         );
+    }
+
+    #[test]
+    fn dihedral_symmetries_commute_with_rules_and_encoding() {
+        use rand::prelude::{IndexedRandom, SeedableRng, SmallRng};
+        let syms = <UltimateTicTacToe as AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 2>>::symmetries();
+        assert_eq!(syms.len(), 8);
+        let mut rng = SmallRng::seed_from_u64(7);
+        let mut moves = Vec::new();
+        let mut moves_t = Vec::new();
+        for sym in &syms {
+            // policy_src maps destination cell -> source cell; invert to map a move forward.
+            let mut fwd = [0usize; 81];
+            for (dst, &src) in sym.policy_src.iter().enumerate() {
+                fwd[src as usize] = dst;
+            }
+            let map = |mv: UtttMove| UtttMove::from_policy_index(fwd[mv.to_policy_index()]);
+            for _ in 0..20 {
+                let mut g = UtttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+                let mut gt = g;
+                while g.status().is_ongoing() {
+                    g.write_valid_moves(&mut moves);
+                    gt.write_valid_moves(&mut moves_t);
+                    let mut mapped: Vec<usize> =
+                        moves.iter().map(|&m| map(m).to_policy_index()).collect();
+                    let mut actual: Vec<usize> =
+                        moves_t.iter().map(|m| m.to_policy_index()).collect();
+                    mapped.sort_unstable();
+                    actual.sort_unstable();
+                    assert_eq!(mapped, actual, "legal moves must map under the symmetry");
+
+                    let mut enc = [0.0f32; INPUT_SIZE];
+                    let mut enc_t = [0.0f32; INPUT_SIZE];
+                    encode_alphazero_planes(&g, &mut enc);
+                    encode_alphazero_planes(&gt, &mut enc_t);
+                    for (i, &src) in sym.state_src.iter().enumerate() {
+                        assert_eq!(enc_t[i], enc[src as usize], "encoding must commute");
+                    }
+
+                    let &mv = moves.choose(&mut rng).unwrap();
+                    g = g.apply(mv);
+                    gt = gt.apply(map(mv));
+                }
+                assert_eq!(g.status(), gt.status());
+            }
+        }
+    }
+
+    #[test]
+    fn block_net_layout_matches_uttt_move_indexing() {
+        use crate::nn::BlockLayout;
+        use candle_core::{Device, Tensor};
+        let planes = 2;
+        let layout = BlockLayout { planes, rows: 3, cols: 3, bh: 3, bw: 3 };
+        let data: Vec<f32> = (0..planes * 81).map(|i| i as f32).collect();
+        let xs = Tensor::from_slice(&data, (1, planes * 81), &Device::Cpu).unwrap();
+        let tokens = layout.tokens(&xs).unwrap().to_vec3::<f32>().unwrap();
+        for big in 0..9u8 {
+            for plane in 0..planes {
+                for small in 0..9u8 {
+                    let expected = plane * 81 + UtttMove::new(big, small).to_policy_index();
+                    assert_eq!(tokens[0][big as usize][plane * 9 + small as usize], expected as f32);
+                }
+            }
+        }
+        // Round trip: logits laid out per (big, small) must land on `to_policy_index`.
+        let per_sub: Vec<f32> = (0..81).map(|i| i as f32).collect();
+        let p = Tensor::from_slice(&per_sub, (1, 9, 9), &Device::Cpu).unwrap();
+        let grid = layout.logits_to_grid(&p).unwrap().to_vec2::<f32>().unwrap();
+        for big in 0..9u8 {
+            for small in 0..9u8 {
+                let idx = UtttMove::new(big, small).to_policy_index();
+                assert_eq!(grid[0][idx], (big as usize * 9 + small as usize) as f32);
+            }
+        }
     }
 }

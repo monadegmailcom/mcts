@@ -22,62 +22,122 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::prelude::{SeedableRng, SmallRng};
+use rand::prelude::{IndexedRandom, SeedableRng, SmallRng};
 
 use mcts::alphazero::{
-    AlphaZeroConfig, AlphaZeroPlayer, SelfPlayConfig, run_self_play, run_self_play_with_initializer,
+    AlphaZeroConfig, AlphaZeroGame, AlphaZeroPlayer, SelfPlayConfig, run_self_play,
+    run_self_play_with_initializer,
 };
-use mcts::game::PlayerIndex;
+use mcts::game::{Game, GameRules, PlayerIndex};
 use mcts::games::rubiks_cube::{RubiksGame, RubiksState};
-use mcts::games::tic_tac_toe::{EMPTY_STATE, TicTacToe, TttGame, TttHeuristic};
-use mcts::games::ultimate_ttt::{
-    EMPTY_STATE as UTTT_EMPTY_STATE, UltimateTicTacToe, UtttGame, UtttHeuristic,
-};
+use mcts::games::tic_tac_toe::{TicTacToe, TttGame};
+use mcts::games::ultimate_ttt::{INPUT_SIZE as UTTT_INPUT_SIZE, UltimateTicTacToe, UtttGame};
 use mcts::inference::InferenceService;
-use mcts::matchup::{RandomPlayer, run_multi_match};
+use mcts::matchup::{RandomPlayer, run_multi_match_with_openings};
+use mcts::experiments::{ExperimentPoint, ExperimentSpec, RunStatus, score_pct};
+use mcts::hyperparams::AlphaZeroHyperparams;
+use mcts::mcts::{MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
 use mcts::minimax::MinimaxPlayer;
-use mcts::nn::{AlphaZeroNetConfig, CandleBatchEvaluator, default_device, discover_devices};
+use mcts::backend::{Backend, NetEvaluator, NnDevice};
+use mcts::nn::AlphaZeroNetConfig;
 use mcts::player::Player;
-use mcts::telemetry::{IterationTelemetry, LabGame, LiveKnobs, TelemetryHub, TrainingCommand};
+use mcts::opponents::OpponentSpec;
+use mcts::play::PlayableGame;
+use mcts::telemetry::{
+    ArenaResult, DeviceChoice, IterationTelemetry, LabGame, LiveKnobs, SystemSettings, TelemetryHub,
+    TrainingCommand, default_eval_opponents,
+};
 use mcts::training::{AlphaZeroTrainer, ReplayBuffer};
 
+/// What the Browser Lab needs on top of [`PlayableGame`] to train and evaluate a two-player game.
+/// Start position and Minimax heuristic come from [`PlayableGame`]; network, symmetries and
+/// hyperparameter defaults from the game's [`AlphaZeroGame`] implementation.
+trait LabGameSpec<const G: usize, const P: usize>: PlayableGame<G, P> + Sync + 'static {
+    const LAB: LabGame;
+    /// Short id used in checkpoint file names and logs (`ttt`, `uttt`).
+    const TAG: &'static str;
+    /// Base seed for self-play and evaluation of this game.
+    const SEED: u64;
+    /// Starting positions for the arena; each is played once per seat (`2 * len` games). Must be
+    /// deterministic so numbers are comparable across iterations.
+    fn eval_openings(count: usize) -> Vec<Game<Self, 2>>;
+}
+
+impl LabGameSpec<27, 9> for TicTacToe {
+    const LAB: LabGame = LabGame::Ttt;
+    const TAG: &'static str = "ttt";
+    const SEED: u64 = 1000;
+    /// Always the empty board: Minimax plays perfectly (already at depth 2), and a random opening
+    /// could hand it a won game.
+    fn eval_openings(count: usize) -> Vec<TttGame> {
+        vec![Self::start(); count.max(1)]
+    }
+}
+
+impl LabGameSpec<{ UTTT_INPUT_SIZE }, 81> for UltimateTicTacToe {
+    const LAB: LabGame = LabGame::Uttt;
+    const TAG: &'static str = "uttt";
+    const SEED: u64 = 5000;
+    /// Seeded random 2-ply openings: from the empty board, deterministic engines (argmax
+    /// AlphaZero, Minimax) would replay the same couple of games, making arena numbers pure noise.
+    /// Prefix-stable: asking for more openings only appends new positions.
+    fn eval_openings(count: usize) -> Vec<UtttGame> {
+        random_openings(Self::start(), count.max(1), 2, 4242)
+    }
+}
+
+/// `count` positions reached by `plies` uniformly random moves from `root` (seeded).
+fn random_openings<R: GameRules<2>>(root: Game<R, 2>, count: usize, plies: usize, seed: u64) -> Vec<Game<R, 2>> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut moves = Vec::new();
+    (0..count)
+        .map(|_| {
+            let mut g = root.clone();
+            for _ in 0..plies {
+                g.write_valid_moves(&mut moves);
+                match moves.choose(&mut rng) {
+                    Some(&mv) => g = g.apply(mv),
+                    None => break,
+                }
+            }
+            g
+        })
+        .collect()
+}
+
+/// One lab iteration for any [`LabGameSpec`]: self-play -> SGD -> arena evaluation -> checkpoint.
 #[allow(clippy::too_many_arguments)]
-fn run_ttt_iteration(
+fn run_iteration<S, const G: usize, const P: usize>(
     iter: usize,
     hub: &TelemetryHub,
-    trainer: &mut AlphaZeroTrainer<27, 9, 2>,
-    service: &Arc<InferenceService<CandleBatchEvaluator<27, 9, 2>, 27, 9, 2>>,
-    buffer: &mut ReplayBuffer<27, 9, 2>,
+    trainer: &mut AlphaZeroTrainer<G, P, 2>,
+    service: &Arc<InferenceService<NetEvaluator<G, P, 2>, G, P, 2>>,
+    buffer: &mut ReplayBuffer<G, P, 2>,
     max_batch_size: usize,
     rng: &mut SmallRng,
-) -> candle_core::Result<()> {
-    let knobs = hub.knobs_for(LabGame::Ttt);
+) -> candle_core::Result<()>
+where
+    S: LabGameSpec<G, P>,
+    S::State: Sync,
+{
+    let game = S::LAB;
+    let tag = S::TAG.to_uppercase();
+    let knobs = hub.knobs_for(game);
     trainer.set_learning_rate(knobs.learning_rate);
+    trainer.set_weight_decay(knobs.weight_decay);
+    buffer.set_capacity(knobs.buffer_capacity);
     service.reset_stats();
+    let root = S::start();
 
-    let root = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
-
-    // 1. Self-Play Phase
-    hub.set_phase_for(
-        LabGame::Ttt,
-        iter,
-        format!(
-            "Iter #{iter}: Self-Play ({} games × {} sims)...",
-            knobs.games_per_iteration, knobs.simulations_per_move
-        ),
+    // 1. Self-play
+    let sp_phase = format!(
+        "Iter #{iter}: Self-Play ({} games × {} sims)...",
+        knobs.games_per_iteration, knobs.simulations_per_move
     );
+    println!("⏳ [{tag:<4} #{iter:>3}] {sp_phase}");
+    hub.set_phase_for(game, iter, sp_phase);
     let sp_start = Instant::now();
-    let sp_cfg = SelfPlayConfig::new(
-        knobs.games_per_iteration,
-        knobs.simulations_per_move,
-        1000 + (iter as u64) * 97,
-    )
-    .with_workers(4)
-    .with_opening_moves(4)
-    .with_puct(19_652.0, knobs.c_init)
-    .with_dirichlet(0.3, knobs.dirichlet_epsilon);
-
-    let sp_res = run_self_play(&root, service, &sp_cfg);
+    let sp_res = run_self_play(&root, service, &knobs.self_play_config(S::SEED + iter as u64 * 131));
     let self_play_ms = (sp_start.elapsed().as_secs_f64() * 1000.0) as f32;
     buffer.extend(&sp_res.positions);
 
@@ -88,52 +148,29 @@ fn run_ttt_iteration(
     let approx_sims = (sp_res.positions.len() * knobs.simulations_per_move) as f32;
     let simulations_per_sec = approx_sims / (self_play_ms / 1000.0).max(1e-6);
 
-    // 2. SGD Training Phase
+    // 2. SGD training
     hub.set_phase_for(
-        LabGame::Ttt,
+        game,
         iter,
-        format!("Iter #{iter}: SGD Training ({} steps)...", knobs.train_steps),
+        format!("Iter #{iter}: SGD Training ({} steps, buffer={})...", knobs.train_steps, buffer.len()),
     );
     let train_start = Instant::now();
-    let metrics = trainer.train_epoch(
-        buffer,
-        service,
-        knobs.batch_size,
-        knobs.train_steps,
-        rng,
-    )?;
+    let metrics = trainer.train_epoch(buffer, service, knobs.batch_size, knobs.train_steps, rng)?;
     let train_ms = (train_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
-    // 3. Arena Evaluation Phase
-    hub.set_phase_for(
-        LabGame::Ttt,
-        iter,
-        format!("Iter #{iter}: Arena Evaluation (vs Random, MM2, MM5)..."),
-    );
+    // 3. Arena evaluation against the configured opponents (argmax AlphaZero, no noise)
     let eval_start = Instant::now();
-    let svc_ref = service.as_ref();
-    let f_az = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
-        Box::new(AlphaZeroPlayer::new(
-            *g,
-            svc_ref,
-            AlphaZeroConfig::new(1, 96, seed)
-                .with_puct(19_652.0, knobs.c_init)
-                .with_dirichlet(0.3, 0.0),
-        ))
-    };
-    let f_rnd = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
-        Box::new(RandomPlayer::new(*g, seed))
-    };
-    let f_mm2 = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
-        Box::new(MinimaxPlayer::new(*g, TttHeuristic, 2, seed))
-    };
-    let f_mm5 = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2> + '_> {
-        Box::new(MinimaxPlayer::new(*g, TttHeuristic, 5, seed))
-    };
-
-    let vs_rnd = run_multi_match(&root, [&f_az, &f_rnd], 40, 2, 500 + iter as u64);
-    let vs_mm2 = run_multi_match(&root, [&f_az, &f_mm2], 40, 2, 600 + iter as u64);
-    let vs_mm5 = run_multi_match(&root, [&f_az, &f_mm5], 40, 2, 700 + iter as u64);
+    let openings = S::eval_openings(knobs.eval_games.div_ceil(2));
+    let arena = play_opponents::<S, G, P>(
+        service,
+        &openings,
+        knobs.eval_simulations(),
+        &knobs,
+        &hub.eval_opponents_for(game),
+        hub.system_settings().train_device(),
+        S::SEED + 500_000 + iter as u64 * 10,
+        |p| hub.set_phase_for(game, iter, format!("Iter #{iter}: Arena {p}...")),
+    );
     let eval_ms = (eval_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
     let rec = IterationTelemetry {
@@ -146,9 +183,7 @@ fn run_ttt_iteration(
         game_moves_mean: sp_res.game_moves_stats.mean(),
         self_play_wins: sp_res.wins,
         self_play_draws: sp_res.draws,
-        vs_random: [vs_rnd.wins[0], vs_rnd.draws, vs_rnd.wins[1]],
-        vs_mm2: [vs_mm2.wins[0], vs_mm2.draws, vs_mm2.wins[1]],
-        vs_mm5: [vs_mm5.wins[0], vs_mm5.draws, vs_mm5.wins[1]],
+        arena,
         buffer_len: buffer.len(),
         buffer_capacity: buffer.capacity(),
         batch_size_mean: batch_stats.mean(),
@@ -164,228 +199,241 @@ fn run_ttt_iteration(
         eval_ms,
     };
 
+    let arena_txt: Vec<String> =
+        rec.arena.iter().map(|a| format!("vs {} {}W-{}D-{}L", a.label, a.wdl[0], a.wdl[1], a.wdl[2])).collect();
     println!(
-        "[TTT  #{iter:>3}] Loss {:>5.3} | KL {:>6.4} | MSE {:>6.4} | vs Rnd {:>2}W-{:>2}D-{:>2}L | vs MM2 {:>2}W-{:>2}D-{:>2}L | vs MM5 {:>2}W-{:>2}D-{:>2}L | Dedup {:>4.1}% | {:>7.0} sims/s",
+        "[{tag:<4} #{iter:>3}] Loss {:>5.3} | KL {:>6.4} | MSE {:>6.4} | {} | Dedup {:>4.1}% | {:>7.0} sims/s",
         rec.total_loss,
         rec.policy_kl,
         rec.value_loss,
-        rec.vs_random[0],
-        rec.vs_random[1],
-        rec.vs_random[2],
-        rec.vs_mm2[0],
-        rec.vs_mm2[1],
-        rec.vs_mm2[2],
-        rec.vs_mm5[0],
-        rec.vs_mm5[1],
-        rec.vs_mm5[2],
+        arena_txt.join(" | "),
         rec.dedup_saved_pct,
         rec.simulations_per_sec,
     );
 
-    trainer.save_checkpoint("ttt_alphazero.safetensors")?;
-    let auto_every = hub.auto_save_every_for(LabGame::Ttt);
+    trainer.save_checkpoint(format!("{}_alphazero.safetensors", S::TAG))?;
+    let auto_every = hub.auto_save_every_for(game);
     if auto_every > 0 && iter.is_multiple_of(auto_every) {
-        let snap = format!("ttt_iter_{iter:03}.safetensors");
+        let snap = format!("{}_iter_{iter:03}.safetensors", S::TAG);
         trainer.save_checkpoint(&snap)?;
-        println!("📸 Auto-saved TTT checkpoint: {snap}");
+        println!("📸 Auto-saved {tag} checkpoint: {snap}");
     }
 
-    hub.record_iteration_for(LabGame::Ttt, rec);
-    let paused_now = hub.knobs_for(LabGame::Ttt).paused;
+    hub.record_iteration_for(game, rec);
+    let paused_now = hub.knobs_for(game).paused;
     hub.set_phase_for(
-        LabGame::Ttt,
+        game,
         iter,
-        if paused_now {
-            format!("Paused after Iter #{iter}")
-        } else {
-            format!("Completed Iter #{iter}")
-        },
+        if paused_now { format!("Paused after Iter #{iter}") } else { format!("Completed Iter #{iter}") },
     );
     Ok(())
 }
 
+type LabService<const G: usize, const P: usize> = InferenceService<NetEvaluator<G, P, 2>, G, P, 2>;
+
+/// Plays argmax AlphaZero (`eval_sims` per move, no noise) on `service` against each opponent from
+/// the fixed `openings` (colors swapped). An AlphaZero opponent's checkpoint is loaded on `device`;
+/// if that fails, the opponent is reported with 0 games and the error in its label.
 #[allow(clippy::too_many_arguments)]
-fn run_uttt_iteration(
-    iter: usize,
-    hub: &TelemetryHub,
-    trainer: &mut AlphaZeroTrainer<324, 81, 2>,
-    service: &Arc<InferenceService<CandleBatchEvaluator<324, 81, 2>, 324, 81, 2>>,
-    buffer: &mut ReplayBuffer<324, 81, 2>,
-    max_batch_size: usize,
-    rng: &mut SmallRng,
-) -> candle_core::Result<()> {
-    let knobs = hub.knobs_for(LabGame::Uttt);
-    trainer.set_learning_rate(knobs.learning_rate);
-    service.reset_stats();
-
-    let root = UtttGame::new(PlayerIndex::PLAYER1, UTTT_EMPTY_STATE);
-    let h = UtttHeuristic::default();
-
-    // 1. Self-Play Phase
-    println!(
-        "⏳ [UTTT #{iter:>3}] Self-Play ({} games × {} sims/move)...",
-        knobs.games_per_iteration, knobs.simulations_per_move
-    );
-    hub.set_phase_for(
-        LabGame::Uttt,
-        iter,
-        format!(
-            "Iter #{iter}: Self-Play ({} games × {} sims)...",
-            knobs.games_per_iteration, knobs.simulations_per_move
-        ),
-    );
-    let sp_start = Instant::now();
-    let sp_cfg = SelfPlayConfig::new(
-        knobs.games_per_iteration,
-        knobs.simulations_per_move,
-        5000 + (iter as u64) * 131,
-    )
-    .with_workers(4)
-    .with_opening_moves(6)
-    .with_puct(19_652.0, knobs.c_init)
-    .with_dirichlet(0.3, knobs.dirichlet_epsilon);
-
-    let sp_res = run_self_play(&root, service, &sp_cfg);
-    let self_play_ms = (sp_start.elapsed().as_secs_f64() * 1000.0) as f32;
-    buffer.extend(&sp_res.positions);
-
-    let batch_stats = service.batch_size_stats();
-    let uniq_batch_stats = service.unique_batch_size_stats();
-    let dedup_saved_pct = service.dedup_savings_ratio() * 100.0;
-    let infer_stats = service.inference_time_stats();
-    let approx_sims = (sp_res.positions.len() * knobs.simulations_per_move) as f32;
-    let simulations_per_sec = approx_sims / (self_play_ms / 1000.0).max(1e-6);
-
-    // 2. SGD Training Phase
-    hub.set_phase_for(
-        LabGame::Uttt,
-        iter,
-        format!(
-            "Iter #{iter}: SGD Training ({} steps, buffer={})...",
-            knobs.train_steps,
-            buffer.len()
-        ),
-    );
-    let train_start = Instant::now();
-    let metrics = trainer.train_epoch(
-        buffer,
-        service,
-        knobs.batch_size,
-        knobs.train_steps,
-        rng,
-    )?;
-    let train_ms = (train_start.elapsed().as_secs_f64() * 1000.0) as f32;
-
-    // 3. Arena Evaluation Phase (vs Random, Minimax d=1, Minimax d=2)
-    let eval_start = Instant::now();
-    let svc_ref = service.as_ref();
-    let eval_sims = knobs.simulations_per_move.clamp(20, 64);
-    let f_az = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
-        Box::new(AlphaZeroPlayer::new(
-            *g,
-            svc_ref,
-            AlphaZeroConfig::new(1, eval_sims, seed)
-                .with_puct(19_652.0, knobs.c_init)
-                .with_dirichlet(0.3, 0.0),
-        ))
-    };
-    let f_rnd = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
-        Box::new(RandomPlayer::new(*g, seed))
-    };
-    let f_mm1 = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
-        Box::new(MinimaxPlayer::new(*g, h, 1, seed))
-    };
-    let f_mm2 = |g: &UtttGame, seed: u64| -> Box<dyn Player<UltimateTicTacToe, 2> + '_> {
-        Box::new(MinimaxPlayer::new(*g, h, 2, seed))
-    };
-
-    hub.set_phase_for(
-        LabGame::Uttt,
-        iter,
-        format!("Iter #{iter}: Arena Eval (1/3 vs Random)..."),
-    );
-    let vs_rnd = run_multi_match(&root, [&f_az, &f_rnd], 12, 4, 2500 + iter as u64);
-
-    hub.set_phase_for(
-        LabGame::Uttt,
-        iter,
-        format!("Iter #{iter}: Arena Eval (2/3 vs Minimax d=1)..."),
-    );
-    let vs_mm1 = run_multi_match(&root, [&f_az, &f_mm1], 12, 4, 2600 + iter as u64);
-
-    hub.set_phase_for(
-        LabGame::Uttt,
-        iter,
-        format!("Iter #{iter}: Arena Eval (3/3 vs Minimax d=2)..."),
-    );
-    let vs_mm2 = run_multi_match(&root, [&f_az, &f_mm2], 12, 4, 2700 + iter as u64);
-    let eval_ms = (eval_start.elapsed().as_secs_f64() * 1000.0) as f32;
-
-    let rec = IterationTelemetry {
-        iteration: iter,
-        total_loss: metrics.total_loss,
-        policy_loss: metrics.policy_loss,
-        policy_kl: metrics.policy_kl,
-        value_loss: metrics.value_loss,
-        root_entropy_mean: sp_res.root_entropy_stats.mean(),
-        game_moves_mean: sp_res.game_moves_stats.mean(),
-        self_play_wins: sp_res.wins,
-        self_play_draws: sp_res.draws,
-        vs_random: [vs_rnd.wins[0], vs_rnd.draws, vs_rnd.wins[1]],
-        vs_mm2: [vs_mm1.wins[0], vs_mm1.draws, vs_mm1.wins[1]],
-        vs_mm5: [vs_mm2.wins[0], vs_mm2.draws, vs_mm2.wins[1]],
-        buffer_len: buffer.len(),
-        buffer_capacity: buffer.capacity(),
-        batch_size_mean: batch_stats.mean(),
-        batch_size_std: batch_stats.stddev(),
-        batch_size_max: batch_stats.max(),
-        unique_batch_mean: uniq_batch_stats.mean(),
-        dedup_saved_pct,
-        max_batch_size,
-        inference_us_mean: infer_stats.mean(),
-        simulations_per_sec,
-        self_play_ms,
-        train_ms,
-        eval_ms,
-    };
-
-    println!(
-        "[UTTT #{iter:>3}] Loss {:>5.3} | KL {:>6.4} | MSE {:>6.4} | vs Rnd {:>2}W-{:>2}D-{:>2}L | vs MM1 {:>2}W-{:>2}D-{:>2}L | vs MM2 {:>2}W-{:>2}D-{:>2}L | Dedup {:>4.1}% | {:>7.0} sims/s",
-        rec.total_loss,
-        rec.policy_kl,
-        rec.value_loss,
-        rec.vs_random[0],
-        rec.vs_random[1],
-        rec.vs_random[2],
-        rec.vs_mm2[0],
-        rec.vs_mm2[1],
-        rec.vs_mm2[2],
-        rec.vs_mm5[0],
-        rec.vs_mm5[1],
-        rec.vs_mm5[2],
-        rec.dedup_saved_pct,
-        rec.simulations_per_sec,
-    );
-
-    trainer.save_checkpoint("uttt_alphazero.safetensors")?;
-    let auto_every = hub.auto_save_every_for(LabGame::Uttt);
-    if auto_every > 0 && iter.is_multiple_of(auto_every) {
-        let snap = format!("uttt_iter_{iter:03}.safetensors");
-        trainer.save_checkpoint(&snap)?;
-        println!("📸 Auto-saved UTTT checkpoint: {snap}");
+fn play_opponents<S, const G: usize, const P: usize>(
+    service: &LabService<G, P>,
+    openings: &[Game<S, 2>],
+    eval_sims: usize,
+    hp: &AlphaZeroHyperparams,
+    opponents: &[OpponentSpec],
+    device: NnDevice,
+    seed: u64,
+    mut phase: impl FnMut(String),
+) -> Vec<ArenaResult>
+where
+    S: LabGameSpec<G, P>,
+    S::State: Sync,
+{
+    let threads = hp.eval_thread_count();
+    let h = S::heuristic();
+    // Opponent networks are loaded first so the player factories can borrow them.
+    let az_services: Vec<Result<Option<LabService<G, P>>, String>> = opponents
+        .iter()
+        .map(|o| match o {
+            OpponentSpec::AlphaZero { checkpoint, net, .. } => {
+                let cfg = S::net_presets().into_iter().find(|(n, _)| n == net).map(|(_, c)| c).ok_or(format!("unknown net '{net}'"))?;
+                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(checkpoint)).map_err(|e| e.to_string())?;
+                Ok(Some(InferenceService::new(ev, 256, 1)))
+            }
+            _ => Ok(None),
+        })
+        .collect();
+    let mut results = Vec::with_capacity(opponents.len());
+    for (k, (opp, az)) in opponents.iter().zip(&az_services).enumerate() {
+        let label = opp.label();
+        let svc = match az {
+            Ok(svc) => svc.as_ref(),
+            Err(e) => {
+                println!("⚠️  Opponent '{label}' unavailable: {e}");
+                results.push(ArenaResult { label: format!("{label} (⚠ {e})"), wdl: [0, 0, 0] });
+                continue;
+            }
+        };
+        phase(format!("eval {}/{} vs {label}", k + 1, opponents.len()));
+        // Defined per opponent: both factories passed together must share one borrow lifetime.
+        let f_az = |g: &Game<S, 2>, seed: u64| -> Box<dyn Player<S, 2> + '_> {
+            Box::new(AlphaZeroPlayer::new(
+                g.clone(),
+                service,
+                AlphaZeroConfig::new(1, eval_sims, seed)
+                    .with_puct(hp.c_base, hp.c_init)
+                    .with_fpu(hp.fpu)
+                    .with_dirichlet(0.3, 0.0),
+            ))
+        };
+        let opp = opp.clone();
+        let f_opp = move |g: &Game<S, 2>, seed: u64| -> Box<dyn Player<S, 2> + '_> {
+            match &opp {
+                OpponentSpec::Random => Box::new(RandomPlayer::new(g.clone(), seed)),
+                OpponentSpec::Mcts { sims, exploration } => Box::new(MctsPlayer::new(
+                    g.clone(),
+                    S::SENTINEL_MOVE,
+                    Uct::new(*exploration),
+                    PlayoutEvaluator::new(seed ^ 0x55),
+                    MctsConfig::new(*sims, seed).with_arena_capacity(sims * 16),
+                )),
+                OpponentSpec::Minimax { depth } => Box::new(MinimaxPlayer::new(g.clone(), h, *depth, seed)),
+                OpponentSpec::AlphaZero { sims, trees, .. } => Box::new(AlphaZeroPlayer::new(
+                    g.clone(),
+                    svc.expect("opponent network loaded above"),
+                    AlphaZeroConfig::new(*trees, *sims, seed).with_dirichlet(0.3, 0.0),
+                )),
+            }
+        };
+        let r = run_multi_match_with_openings(openings, [&f_az, &f_opp], threads, seed + 1 + k as u64);
+        results.push(ArenaResult { label, wdl: [r.wins[0], r.draws, r.wins[1]] });
     }
+    results
+}
 
-    hub.record_iteration_for(LabGame::Uttt, rec);
-    let paused_now = hub.knobs_for(LabGame::Uttt).paused;
-    hub.set_phase_for(
-        LabGame::Uttt,
-        iter,
-        if paused_now {
-            format!("Paused after Iter #{iter}")
-        } else {
-            format!("Completed Iter #{iter}")
-        },
-    );
+/// Trains a fresh network for experiment `id` until its budget is used up (or it is stopped),
+/// evaluating at iteration 0, every `eval_every` iterations and at the end.
+fn run_experiment<S, const G: usize, const P: usize>(
+    hub: &TelemetryHub,
+    id: u64,
+    spec: &ExperimentSpec,
+) -> candle_core::Result<RunStatus>
+where
+    S: LabGameSpec<G, P>,
+    S::State: Sync,
+{
+    let backend = Backend::parse(&spec.backend).filter(|b| b.is_available()).unwrap_or(Backend::Candle);
+    let dev = if spec.device == "cpu" { NnDevice::cpu(backend) } else { NnDevice::best(backend) };
+    let (net_name, cfg) = S::net_presets()
+        .into_iter()
+        .find(|(n, _)| *n == spec.net)
+        .unwrap_or_else(|| S::net_presets()[0]);
+    let hp = spec.hp;
+    let mut trainer = AlphaZeroTrainer::<G, P, 2>::new(cfg, hp.learning_rate, hp.weight_decay, dev)?;
+    if !spec.init_checkpoint.is_empty() {
+        trainer
+            .load_checkpoint(&spec.init_checkpoint)
+            .map_err(|e| candle_core::Error::Msg(format!("cannot load '{}' into the {net_name} net: {e}", spec.init_checkpoint)))?;
+    }
+    let service = trainer.build_inference_service(spec.infer_batch, &dev.replicas(1))?;
+    let mut buffer = ReplayBuffer::<G, P, 2>::new(hp.buffer_capacity).with_symmetries(S::symmetries());
+    let mut rng = SmallRng::seed_from_u64(S::SEED ^ (id * 7919));
+    let opponents = if spec.opponents.is_empty() { default_eval_opponents(S::LAB) } else { spec.opponents.clone() };
+    let start_from = if spec.init_checkpoint.is_empty() { String::new() } else { format!(" · from {}", spec.init_checkpoint) };
+    hub.experiment_started(id, opponents.iter().map(OpponentSpec::label).collect(), format!("{dev} · {net_name} net{start_from}"));
+    println!("🧪 Experiment #{id} '{}' on {dev} ({net_name} net, {} min budget)", spec.name, spec.budget_minutes);
+
+    let openings = S::eval_openings(spec.eval_games.div_ceil(2));
+    let start = Instant::now();
+    let (mut train_secs, mut games, mut positions) = (0.0f64, 0usize, 0usize);
+    let (mut value_loss, mut policy_kl, mut sims_per_sec) = (0.0f32, 0.0f32, 0.0f32);
+    let evaluate = |iter: usize, train_secs: f64, games: usize, positions: usize, vl: f32, kl: f32, sps: f32| {
+        let scores: Vec<f32> =
+            play_opponents::<S, G, P>(&service, &openings, spec.eval_sims, &hp, &opponents, dev, 9_000 + iter as u64 * 10, |p| {
+                hub.experiment_phase(id, format!("iter {iter}: {p}"));
+            })
+            .iter()
+            .map(|a| score_pct(a.wdl[0], a.wdl[1], a.wdl.iter().sum()))
+            .collect();
+        println!("🧪 #{id} iter {iter:>3} | {:>5.1} train-min | {games:>6} games | scores {scores:?}", train_secs / 60.0);
+        hub.experiment_point(id, ExperimentPoint {
+            iteration: iter,
+            games,
+            positions,
+            train_secs,
+            wall_secs: start.elapsed().as_secs_f64(),
+            scores,
+            value_loss: vl,
+            policy_kl: kl,
+            sims_per_sec: sps,
+        });
+    };
+    evaluate(0, 0.0, 0, 0, 0.0, 0.0, 0.0);
+
+    let budget_secs = spec.budget_minutes * 60.0;
+    let mut iter = 0usize;
+    let mut last_eval = 0usize;
+    let status = loop {
+        if hub.experiment_should_stop(id) {
+            break RunStatus::Stopped;
+        }
+        if train_secs >= budget_secs || (spec.max_iterations > 0 && iter >= spec.max_iterations) {
+            break RunStatus::Done;
+        }
+        iter += 1;
+        hub.experiment_phase(id, format!("iter {iter}: self-play + training ({:.1}/{} min)", train_secs / 60.0, spec.budget_minutes));
+        let t = Instant::now();
+        service.reset_stats();
+        let sp = run_self_play(&S::start(), &service, &hp.self_play_config(S::SEED + 31 * id + iter as u64 * 131));
+        let sp_secs = t.elapsed().as_secs_f64();
+        buffer.extend(&sp.positions);
+        let m = trainer.train_epoch(&buffer, &service, hp.batch_size, hp.train_steps, &mut rng)?;
+        train_secs += t.elapsed().as_secs_f64();
+        games += sp.total_games;
+        positions += sp.positions.len();
+        (value_loss, policy_kl) = (m.value_loss, m.policy_kl);
+        sims_per_sec = (sp.positions.len() * hp.simulations_per_move) as f32 / sp_secs.max(1e-6) as f32;
+        if iter.is_multiple_of(spec.eval_every) {
+            evaluate(iter, train_secs, games, positions, value_loss, policy_kl, sims_per_sec);
+            last_eval = iter;
+        }
+    };
+    if last_eval != iter {
+        evaluate(iter, train_secs, games, positions, value_loss, policy_kl, sims_per_sec);
+    }
+    let ckpt = format!("{}_exp{id}_{net_name}.safetensors", S::TAG);
+    trainer.save_checkpoint(&ckpt)?;
+    println!("🧪 Experiment #{id} finished: {status:?} (weights: {ckpt})");
+    Ok(status)
+}
+
+fn device_label(train: NnDevice, infer: &[NnDevice], infer_batch: usize) -> String {
+    format!("{train} · {} inference worker(s) · batch {infer_batch}", infer.len())
+}
+
+type LiveService<const G: usize, const P: usize, const N: usize> =
+    Arc<InferenceService<NetEvaluator<G, P, N>, G, P, N>>;
+
+/// Moves a live model onto new devices: copies the weights into a fresh trainer on `train_dev`
+/// (the AdamW moment estimates restart) and builds a new inference service around it.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_model<const G: usize, const P: usize, const N: usize>(
+    tag: &str,
+    trainer: &mut AlphaZeroTrainer<G, P, N>,
+    service: &mut LiveService<G, P, N>,
+    lr: f64,
+    weight_decay: f64,
+    train_dev: NnDevice,
+    infer_devs: &[NnDevice],
+    infer_batch: usize,
+) -> candle_core::Result<()> {
+    let tmp = std::env::temp_dir().join(format!("mcts_lab_{tag}_{}.safetensors", std::process::id()));
+    trainer.save_checkpoint(&tmp)?;
+    let mut fresh = AlphaZeroTrainer::<G, P, N>::new(*trainer.net_config(), lr, weight_decay, train_dev)?;
+    fresh.load_checkpoint(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    *service = Arc::new(fresh.build_inference_service(infer_batch, infer_devs)?);
+    *trainer = fresh;
     Ok(())
 }
 
@@ -395,15 +443,29 @@ fn main() -> candle_core::Result<()> {
     let bind_addr =
         std::env::var("MCTS_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
-    let train_device = default_device();
-    let infer_devices = discover_devices(8);
-    let device_label = format!("{train_device:?} ({} worker(s))", infer_devices.len());
+    // Backend: `--backend=candle|tch` (or `MCTS_BACKEND`); default libtorch when compiled in.
+    let backend = std::env::args()
+        .find_map(|a| a.strip_prefix("--backend=").map(str::to_string))
+        .or_else(|| std::env::var("MCTS_BACKEND").ok())
+        .and_then(|b| Backend::parse(&b))
+        .filter(|b| b.is_available())
+        .unwrap_or(if Backend::Tch.is_available() { Backend::Tch } else { Backend::Candle });
+    let mut system = SystemSettings {
+        backend,
+        device: DeviceChoice::Gpu,
+        infer_batch: 64,
+        infer_workers: 8,
+    };
+    let (train_device, infer_devices) = system.devices();
+    system.infer_workers = infer_devices.len();
+    let label = device_label(train_device, &infer_devices, system.infer_batch);
 
     println!("=== Pure-Rust AlphaZero Training Pipeline & Live Lab ===");
-    println!("Training device:  {train_device:?}");
+    println!("Training device:  {train_device}  (backends compiled in: {:?})", Backend::available());
     println!(
-        "Inference devices ({} workers): {infer_devices:?}",
-        infer_devices.len()
+        "Inference devices: {} worker(s) on {}",
+        infer_devices.len(),
+        infer_devices[0]
     );
 
     let iterations = 15usize;
@@ -412,7 +474,11 @@ fn main() -> candle_core::Result<()> {
     // so training only runs when the user clicks Start / Resume / Step in the Browser Lab.
     initial_knobs.paused = interactive_lab;
 
-    let hub = TelemetryHub::new(device_label, iterations, initial_knobs);
+    let hub = TelemetryHub::new(label, iterations, initial_knobs);
+    if interactive_lab {
+        hub.enable_experiment_store("lab_experiments.json");
+    }
+    hub.set_system_info(system);
     match hub.spawn_http_server(&bind_addr) {
         Ok(addr) => println!("🌐 Live Browser Lab & Multi-Match Arena listening on: http://{addr}"),
         Err(err) => {
@@ -427,55 +493,87 @@ fn main() -> candle_core::Result<()> {
     }
     println!();
 
-    let max_batch_size = 64usize;
+    let mut max_batch_size = system.infer_batch;
 
     // 1. Initialize Tic-Tac-Toe (`G=27, P=9, N=2`) Trainer & Live Inference Service
-    let ttt_net_cfg = AlphaZeroNetConfig::tic_tac_toe_mlp();
+    let ttt_net_cfg = <TicTacToe as AlphaZeroGame<27, 9, 2>>::net_config();
     let mut ttt_trainer = AlphaZeroTrainer::<27, 9, 2>::new(
         ttt_net_cfg,
         initial_knobs.learning_rate,
         1e-4,
-        train_device.clone(),
+        train_device,
     )?;
     if interactive_lab && Path::new("ttt_alphazero.safetensors").exists() {
         ttt_trainer.load_checkpoint("ttt_alphazero.safetensors")?;
         println!("📦 Loaded existing TTT checkpoint into live model: ttt_alphazero.safetensors");
     }
-    let ttt_service = Arc::new(ttt_trainer.build_inference_service(max_batch_size, &infer_devices)?);
+    let mut ttt_service = Arc::new(ttt_trainer.build_inference_service(max_batch_size, &infer_devices)?);
     hub.attach_ttt_service(Arc::clone(&ttt_service), ttt_net_cfg, infer_devices.clone());
-    let mut ttt_buffer = ReplayBuffer::<27, 9, 2>::new(16_384);
+    let mut ttt_buffer = ReplayBuffer::<27, 9, 2>::new(initial_knobs.buffer_capacity)
+        .with_symmetries(<TicTacToe as AlphaZeroGame<27, 9, 2>>::symmetries());
 
     // 2. Initialize Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`) Trainer & Live Inference Service
-    let uttt_net_cfg = AlphaZeroNetConfig::ultimate_ttt_mlp();
-    let mut uttt_trainer = AlphaZeroTrainer::<324, 81, 2>::new(
+    // Sub-board network: one shared encoder per 3x3 sub-board + global residual MLP. Learns the
+    // UTTT policy far faster than a flat MLP (shared weights across the 9 identical sub-boards)
+    // while running at MLP speed (candle's convolutions are ~30x slower for the ResNet).
+    let uttt_net_cfg = <UltimateTicTacToe as AlphaZeroGame<{ UTTT_INPUT_SIZE }, 81, 2>>::net_config();
+    let mut uttt_trainer = AlphaZeroTrainer::<{ UTTT_INPUT_SIZE }, 81, 2>::new(
         uttt_net_cfg,
         2.0e-3,
         1e-4,
-        train_device.clone(),
+        train_device,
     )?;
     if interactive_lab && Path::new("uttt_alphazero.safetensors").exists() {
-        uttt_trainer.load_checkpoint("uttt_alphazero.safetensors")?;
-        println!("📦 Loaded existing UTTT checkpoint into live model: uttt_alphazero.safetensors");
+        match uttt_trainer.load_checkpoint("uttt_alphazero.safetensors") {
+            Ok(()) => println!(
+                "📦 Loaded existing UTTT checkpoint into live model: uttt_alphazero.safetensors"
+            ),
+            Err(e) => println!(
+                "⚠️  Ignoring incompatible UTTT checkpoint uttt_alphazero.safetensors (starting fresh): {e}"
+            ),
+        }
     }
-    let uttt_service =
+    let mut uttt_service =
         Arc::new(uttt_trainer.build_inference_service(max_batch_size, &infer_devices)?);
     hub.attach_uttt_service(
         Arc::clone(&uttt_service),
         uttt_net_cfg,
         infer_devices.clone(),
     );
-    let mut uttt_buffer = ReplayBuffer::<324, 81, 2>::new(32_768);
+    // The value head generalizes only across *distinct games* (all ~50 positions of a game share
+    // one outcome and nearly the same board, so a small window lets the net memorize which game a
+    // position came from). The default 300k positions keep ~6k recent games (~0.8 GB); the 8
+    // board symmetries multiply the effective data again. Resized live via the buffer knob.
+    let mut uttt_buffer =
+        ReplayBuffer::<{ UTTT_INPUT_SIZE }, 81, 2>::new(LiveKnobs::default_uttt().buffer_capacity)
+            .with_symmetries(<UltimateTicTacToe as AlphaZeroGame<{ UTTT_INPUT_SIZE }, 81, 2>>::symmetries());
 
     let mut rng = SmallRng::seed_from_u64(2026);
 
     if interactive_lab {
         println!("⏸  Browser Lab started in IDLE state at http://{bind_addr}");
         println!("   • Open http://{bind_addr} to choose Tic-Tac-Toe (3x3) or Ultimate Tic-Tac-Toe (9x9)");
-        println!("   • Use ▶ Start/Resume, ⏸ Pause, ⏭ Step (+1 Iter), or 🔄 Reset in the Browser Lab");
+        println!("   • Use ▶/⏸ Start-Pause, ⏭ Step (+1 Iter), or 🔄 Reset in the Browser Lab");
         println!("   • Press Ctrl+C in this terminal to stop the server.");
         println!();
 
         loop {
+            if let Some(new_sys) = hub.take_system_change() {
+                let (train_dev, infer_devs) = new_sys.devices();
+                let ttt_k = hub.knobs_for(LabGame::Ttt);
+                rebuild_model("ttt", &mut ttt_trainer, &mut ttt_service, ttt_k.learning_rate, ttt_k.weight_decay, train_dev, &infer_devs, new_sys.infer_batch)?;
+                hub.attach_ttt_service(Arc::clone(&ttt_service), ttt_net_cfg, infer_devs.clone());
+                let uttt_k = hub.knobs_for(LabGame::Uttt);
+                rebuild_model("uttt", &mut uttt_trainer, &mut uttt_service, uttt_k.learning_rate, uttt_k.weight_decay, train_dev, &infer_devs, new_sys.infer_batch)?;
+                hub.attach_uttt_service(Arc::clone(&uttt_service), uttt_net_cfg, infer_devs.clone());
+                max_batch_size = new_sys.infer_batch;
+                // Report what is actually in effect (e.g. Metal always uses one worker).
+                let applied = SystemSettings { infer_workers: infer_devs.len(), ..new_sys };
+                hub.set_system_info(applied);
+                let label = device_label(train_dev, &infer_devs, new_sys.infer_batch);
+                println!("🖥️  Rebuilt both models on {label}");
+                hub.set_device_label(label);
+            }
             match hub.poll_training_command() {
                 TrainingCommand::Idle => {
                     std::thread::sleep(Duration::from_millis(80));
@@ -492,11 +590,22 @@ fn main() -> candle_core::Result<()> {
                     uttt_buffer.clear();
                     println!("🔄 Reset Ultimate Tic-Tac-Toe model to fresh random weights and cleared replay buffer.");
                 }
+                TrainingCommand::RunExperiment { id, spec } => {
+                    let res = match spec.game.as_str() {
+                        "ttt" => run_experiment::<TicTacToe, 27, 9>(&hub, id, &spec),
+                        _ => run_experiment::<UltimateTicTacToe, { UTTT_INPUT_SIZE }, 81>(&hub, id, &spec),
+                    };
+                    let status = res.unwrap_or_else(|e| {
+                        println!("❌ Experiment #{id} failed: {e}");
+                        RunStatus::Failed(e.to_string())
+                    });
+                    hub.experiment_finished(id, status);
+                }
                 TrainingCommand::RunIteration {
                     game: LabGame::Ttt,
                     iteration,
                 } => {
-                    run_ttt_iteration(
+                    run_iteration::<TicTacToe, 27, 9>(
                         iteration,
                         &hub,
                         &mut ttt_trainer,
@@ -510,7 +619,7 @@ fn main() -> candle_core::Result<()> {
                     game: LabGame::Uttt,
                     iteration,
                 } => {
-                    run_uttt_iteration(
+                    run_iteration::<UltimateTicTacToe, { UTTT_INPUT_SIZE }, 81>(
                         iteration,
                         &hub,
                         &mut uttt_trainer,
@@ -527,7 +636,7 @@ fn main() -> candle_core::Result<()> {
     // Non-interactive CLI batch showcase (`cargo run --release --example train_alphazero`)
     println!("=== Part 1: Training AlphaZero on Tic-Tac-Toe (G=27, P=9, N=2) ===");
     for iter in 1..=iterations {
-        run_ttt_iteration(
+        run_iteration::<TicTacToe, 27, 9>(
             iter,
             &hub,
             &mut ttt_trainer,

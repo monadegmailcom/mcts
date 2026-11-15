@@ -489,9 +489,49 @@ where
     R: GameRules<N>,
     R::State: Sync,
 {
+    run_multi_match_impl(
+        std::slice::from_ref(initial_game),
+        factories,
+        rounds,
+        num_threads,
+        base_seed,
+    )
+}
+
+/// Runs a balanced tournament over a set of `openings`: every opening is played `N` times so
+/// that each participant occupies every seat exactly once per opening (`openings.len() * N`
+/// rounds in total).
+///
+/// Starting from diverse (e.g. randomly played) opening positions is essential for meaningful
+/// statistics with deterministic engines (argmax AlphaZero, Minimax): from the empty board they
+/// would otherwise replay the same handful of games over and over.
+pub fn run_multi_match_with_openings<'a, R, const N: usize>(
+    openings: &[Game<R, N>],
+    factories: [BoxedPlayerFactory<'a, R, N>; N],
+    num_threads: usize,
+    base_seed: u64,
+) -> MultiMatchSummary<N>
+where
+    R: GameRules<N>,
+    R::State: Sync,
+{
+    run_multi_match_impl(openings, factories, openings.len() * N, num_threads, base_seed)
+}
+
+fn run_multi_match_impl<'a, R, const N: usize>(
+    openings: &[Game<R, N>],
+    factories: [BoxedPlayerFactory<'a, R, N>; N],
+    rounds: usize,
+    num_threads: usize,
+    base_seed: u64,
+) -> MultiMatchSummary<N>
+where
+    R: GameRules<N>,
+    R::State: Sync,
+{
     const { assert!(N >= 1, "run_multi_match requires at least 1 player (N >= 1)") };
 
-    if rounds == 0 {
+    if rounds == 0 || openings.is_empty() {
         return MultiMatchSummary::empty();
     }
 
@@ -499,6 +539,7 @@ where
     let max_slots_per_worker = rounds.div_ceil(worker_count).clamp(1, 64);
 
     let build_slot = |r: usize| -> MatchSlot<'a, R, N> {
+        let initial_game = &openings[(r / N) % openings.len()];
         let seats: [Box<dyn Player<R, N> + 'a>; N] = std::array::from_fn(|seat| {
             let participant = (seat + N - (r % N)) % N;
             let seed = mix_round_seed(base_seed, r as u64, participant as u64);

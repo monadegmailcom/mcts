@@ -14,6 +14,7 @@
 
 use rand::prelude::{Rng, RngExt};
 
+use crate::alphazero::AlphaZeroGame;
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 
 pub type TwistMove = u8;
@@ -127,6 +128,28 @@ impl GameRules<1> for TwistPuzzle {
             GameStatus::Terminal([-1.0])
         } else {
             GameStatus::Ongoing
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// AlphaZero integration (all other hooks use the generic defaults)
+// ---------------------------------------------------------------------------------------------
+
+impl AlphaZeroGame<81, 8, 1> for TwistPuzzle {
+    const SENTINEL_MOVE: Self::Move = NO_MOVE;
+
+    #[inline]
+    fn move_to_policy_index(mv: Self::Move) -> usize {
+        mv as usize
+    }
+
+    /// One-hot `9 tiles x 9 positions`.
+    #[inline]
+    fn encode_state(game: &Game<Self, 1>, out: &mut [f32; 81]) {
+        out.fill(0.0);
+        for (pos, &tile) in game.state().board.iter().enumerate() {
+            out[pos * 9 + (tile as usize)] = 1.0;
         }
     }
 }

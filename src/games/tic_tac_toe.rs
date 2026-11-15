@@ -2,8 +2,13 @@
 
 use std::fmt;
 
+use crate::alphazero::AlphaZeroGame;
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
+use crate::hyperparams::AlphaZeroHyperparams;
 use crate::minimax::HeuristicEvaluator;
+use crate::nn::AlphaZeroNetConfig;
+use crate::play::PlayableGame;
+use crate::training::Symmetry;
 
 /// Marker occupancy of a single Tic-Tac-Toe square.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -188,6 +193,7 @@ impl HeuristicEvaluator<TicTacToe, 2> for TttHeuristic {
     }
 }
 
+
 /// Formats a Tic-Tac-Toe game board for terminal display.
 pub fn format_board(game: &TttGame) -> String {
     let s = game.state();
@@ -204,6 +210,110 @@ pub fn format_board(game: &TttGame) -> String {
         s[7],
         s[8],
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// AlphaZero integration
+// ---------------------------------------------------------------------------------------------
+
+/// Compact 2D ResNet for the `3x3` board (`G = 27, P = 9, N = 2`).
+pub const fn net_resnet() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::ResNet2d {
+        in_channels: 3,
+        board_height: 3,
+        board_width: 3,
+        channels: 32,
+        num_res_blocks: 2,
+        policy_channels: 8,
+        value_channels: 4,
+        fc_hidden: 64,
+    }
+}
+
+/// Small residual MLP (the default: the `3x3` board is too small to need spatial structure).
+pub const fn net_mlp() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::ResMlp {
+        hidden_dim: 64,
+        num_res_blocks: 2,
+        head_hidden: 64,
+    }
+}
+
+impl AlphaZeroGame<27, 9, 2> for TicTacToe {
+    const SENTINEL_MOVE: Self::Move = NO_MOVE;
+
+    #[inline]
+    fn move_to_policy_index(mv: Self::Move) -> usize {
+        mv as usize
+    }
+
+    /// Encodes 3 planes of `3x3 = 9` floats (`27` floats total; matches `games/tic_tac_toe.cpp:50-79`):
+    /// - Plane 0 (`0..9`): `1.0` where `current_player` has a piece.
+    /// - Plane 1 (`9..18`): `1.0` where the opponent has a piece.
+    /// - Plane 2 (`18..27`): `1.0` if `current_player == PLAYER1`, else `0.0`.
+    fn encode_state(game: &Game<Self, 2>, out: &mut [f32; 27]) {
+        out.fill(0.0);
+        let me = game.current_player();
+        let my_sym = Symbol::from_player(me);
+        let opp_sym = Symbol::from_player(me.next());
+
+        for (idx, &cell) in game.state().iter().enumerate() {
+            if cell == my_sym {
+                out[idx] = 1.0;
+            } else if cell == opp_sym {
+                out[9 + idx] = 1.0;
+            }
+        }
+
+        if me == PlayerIndex::<2>::PLAYER1 {
+            out[18..27].fill(1.0);
+        }
+    }
+
+    fn net_config() -> AlphaZeroNetConfig {
+        net_mlp()
+    }
+
+    fn net_presets() -> Vec<(&'static str, AlphaZeroNetConfig)> {
+        vec![("mlp", net_mlp()), ("resnet", net_resnet())]
+    }
+
+    /// The 8 rotations/reflections of the board (exact symmetries of the rules and encoding).
+    fn symmetries() -> Vec<Symmetry> {
+        Symmetry::dihedral_grid(3, 3)
+    }
+
+    fn hyperparams() -> AlphaZeroHyperparams {
+        AlphaZeroHyperparams {
+            games_per_iteration: 128,
+            simulations_per_move: 80,
+            opening_moves: 4,
+            train_steps: 28,
+            batch_size: 64,
+            learning_rate: 1.5e-3,
+            buffer_capacity: 16_384,
+            eval_games: 40,
+            eval_sims: 96,
+            eval_threads: 2,
+            ..AlphaZeroHyperparams::GENERIC
+        }
+    }
+}
+
+impl PlayableGame<27, 9> for TicTacToe {
+    type Heuristic = TttHeuristic;
+
+    fn start() -> TttGame {
+        TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE)
+    }
+
+    fn heuristic() -> TttHeuristic {
+        TttHeuristic
+    }
+
+    fn cells(game: &TttGame) -> Vec<u8> {
+        game.state().iter().map(|&s| s as u8).collect()
+    }
 }
 
 #[cfg(test)]

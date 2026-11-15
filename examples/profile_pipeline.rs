@@ -3,7 +3,7 @@
 //! Benchmarks the interaction between:
 //! - `self_play_workers` (CPU threads stepping MCTS trees via `run_parallel_games`)
 //! - `inference_workers` (background threads draining the lock-free `ArrayQueue` into batches)
-//! - `max_batch_size` (maximum states grouped into a single `CandleBatchEvaluator` forward pass)
+//! - `max_batch_size` (maximum states grouped into a single `NetEvaluator` forward pass)
 //!
 //! Unlike ML hyperparameters (`learning_rate`, `c_init`, `dirichlet_alpha`), system pipeline
 //! parameters only affect **throughput (`sims/sec`)** and **batch fill ratio**, so we can find
@@ -19,7 +19,7 @@ use std::time::Instant;
 use mcts::alphazero::{SelfPlayConfig, run_self_play};
 use mcts::game::PlayerIndex;
 use mcts::games::tic_tac_toe::{EMPTY_STATE, TttGame};
-use mcts::nn::{AlphaZeroNetConfig, default_device};
+use mcts::backend::{Backend, NnDevice};
 use mcts::training::AlphaZeroTrainer;
 
 #[derive(Clone, Debug)]
@@ -37,7 +37,7 @@ struct ProfileRow {
 }
 
 fn main() -> candle_core::Result<()> {
-    let device = default_device();
+    let device = NnDevice::best(Backend::Candle);
     let logical_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -48,10 +48,10 @@ fn main() -> candle_core::Result<()> {
     println!();
 
     let trainer = AlphaZeroTrainer::<27, 9, 2>::new(
-        AlphaZeroNetConfig::tic_tac_toe_mlp(),
+        mcts::games::tic_tac_toe::net_mlp(),
         2e-3,
         1e-4,
-        device.clone(),
+        device,
     )?;
     let root_game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
 
@@ -78,7 +78,7 @@ fn main() -> candle_core::Result<()> {
     let mut results: Vec<ProfileRow> = Vec::new();
 
     for &inf_workers in &inf_worker_choices {
-        let devices: Vec<_> = (0..inf_workers).map(|_| device.clone()).collect();
+        let devices: Vec<_> = (0..inf_workers).map(|_| device).collect();
         for &max_batch in &batch_choices {
             let service = trainer.build_inference_service(max_batch, &devices)?;
             for &sp_workers in &sp_worker_choices {

@@ -12,9 +12,21 @@ crossbeam-queue = "0.3.14"
 crossbeam-utils = "0.8.23"
 rand = "0.10.3"
 rand_distr = "0.6.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# libtorch backend (feature `tch`). tch 0.22 expects PyTorch/libtorch 2.9. Build with either
+#   LIBTORCH=/path/to/libtorch                       (standalone libtorch, e.g. in Docker), or
+#   LIBTORCH_USE_PYTORCH=1 + a `python` with torch on PATH (dev machines); see start_lab.sh.
+tch = { version = "0.22", optional = true }
+# Direct dependency only so build.rs receives libtorch's lib dir (`links` metadata) for the rpath.
+torch-sys = { version = "0.22", optional = true }
 
 [features]
 default = []
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# cuDNN convolutions for candle on CUDA (needs the cuDNN libraries, e.g. an nvidia/cuda *-cudnn image).
+cudnn = ["cuda", "candle-core/cudnn", "candle-nn/cudnn"]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+# libtorch backend via tch-rs (selectable at runtime next to candle).
+tch = ["dep:tch", "dep:torch-sys"]

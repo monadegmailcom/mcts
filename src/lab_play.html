@@ -1,0 +1,429 @@
+<!-- TAB 3: PLAY (spliced into the dashboard by telemetry.rs; uses the engine editor of lab_experiments.html) -->
+<div id="tab-play" class="hidden">
+<style>
+  .pl-layout { display: grid; grid-template-columns: minmax(380px, 460px) 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 960px) { .pl-layout { grid-template-columns: 1fr; } }
+  .pl-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; font-size: 0.78rem; color: var(--muted); }
+  .pl-row select, .pl-row input { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 5px; font-size: 0.76rem; }
+  .pl-row input[type=number] { width: 64px; }
+  .pl-seat { display: flex; flex: 1; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .pl-row.pl-seat-row { flex-wrap: nowrap; align-items: flex-start; }
+  .pl-seat-row > span:first-child { padding-top: 4px; min-width: 52px; }
+  .pl-seat .opp-field { display: inline-flex; gap: 3px; align-items: center; }
+  .pl-mark { font-weight: 800; width: 18px; text-align: center; }
+  .pl-mark.x, .pl-sym.x { color: var(--accent); }
+  .pl-mark.o, .pl-sym.o { color: var(--rose); }
+  .pl-seg button { background: var(--panel-alt); color: var(--muted); border: 1px solid var(--border); padding: 3px 9px; font-size: 0.74rem; cursor: pointer; }
+  .pl-seg button:first-child { border-radius: 4px 0 0 4px; }
+  .pl-seg button:last-child { border-radius: 0 4px 4px 0; }
+  .pl-seg button.active { background: var(--accent); color: #0b0f19; font-weight: 700; }
+
+  .pl-board { display: grid; gap: 7px; margin: 12px auto; width: fit-content; }
+  .pl-block { display: grid; grid-template-columns: repeat(3, var(--cell)); grid-template-rows: repeat(3, var(--cell)); gap: 3px; position: relative; padding: 3px; border-radius: 6px; border: 2px solid transparent; }
+  .pl-block.active { border-color: var(--amber); }
+  .pl-block .pl-won { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: calc(var(--cell) * 2.6); font-weight: 900; opacity: 0.55; pointer-events: none; border-radius: 6px; background: rgba(11, 15, 25, 0.55); }
+  .pl-block .pl-won.draw { color: var(--muted); font-size: calc(var(--cell) * 1.2); }
+  .pl-cell { background: var(--panel-alt); border: 1px solid var(--border); border-radius: 4px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; user-select: none; line-height: 1.05; }
+  .pl-cell.legal { cursor: pointer; }
+  .pl-cell.legal:hover { border-color: var(--accent); }
+  .pl-cell.last { box-shadow: inset 0 0 0 2px var(--amber); }
+  .pl-cell.best { box-shadow: 0 0 0 2px var(--amber); z-index: 1; }
+  .pl-sym { font-size: calc(var(--cell) * 0.55); font-weight: 800; }
+  .pl-heat { font-size: calc(var(--cell) * 0.24); color: #fff; text-shadow: 0 0 3px #000; font-weight: 700; }
+  .pl-heat small { display: block; font-weight: 400; font-size: 0.85em; color: #e2e8f0; }
+
+  .pl-winbar { display: flex; height: 18px; border-radius: 4px; overflow: hidden; font-size: 0.72rem; font-weight: 700; margin: 6px 0 10px; }
+  .pl-winbar div { display: flex; align-items: center; padding: 0 6px; white-space: nowrap; }
+  .pl-moves { display: flex; flex-wrap: wrap; gap: 4px; font-size: 0.74rem; margin-top: 6px; }
+  .pl-moves span { padding: 2px 6px; border-radius: 4px; background: var(--panel-alt); border: 1px solid var(--border); cursor: pointer; }
+  .pl-moves span.current { border-color: var(--amber); color: var(--amber); }
+  #pl-chart { width: 100%; height: 150px; display: block; }
+</style>
+  <div class="pl-layout">
+    <div class="card">
+      <h2><span>🎮 Play</span><span id="pl-status" style="font-size:0.8rem;color:var(--green)"></span></h2>
+      <p class="hint" style="margin:0 0 6px;">
+        Each side is you or an engine. Engines move on their own while ▶ is on; ⏭ makes one engine move.
+        The heat map shows how the searching engine sees each candidate move: its share of the search, the network's
+        prior (AlphaZero), or the win rate it measured. On your turns the analyst engine searches the position for the heat map.
+      </p>
+      <div class="pl-row">
+        Game <select id="pl-game" onchange="plNewGame()"><option value="ttt">Tic-Tac-Toe</option><option value="uttt">Ultimate TTT</option></select>
+        <button class="btn" onclick="plNewGame()">New game</button>
+        <button class="btn secondary" onclick="plUndo()" title="Take back moves until it is a human's turn again">↶ Undo</button>
+        <button class="btn secondary" id="pl-auto" onclick="plToggleAuto()" title="Engines move on their own">⏸</button>
+        <button class="btn secondary" onclick="plStep()" title="One engine move">⏭</button>
+      </div>
+      <div class="pl-row pl-seat-row"><span><span class="pl-mark x">X</span></span><span class="pl-seat" id="pl-seat-1" data-game="ttt"></span></div>
+      <div class="pl-row pl-seat-row"><span><span class="pl-mark o">O</span></span><span class="pl-seat" id="pl-seat-2" data-game="ttt"></span></div>
+      <div class="pl-row">
+        Heat map <span class="pl-seg" id="pl-heat-seg">
+          <button data-heat="off" onclick="plSetHeat('off')">Off</button><button data-heat="search" onclick="plSetHeat('search')">Search</button><button data-heat="prior" onclick="plSetHeat('prior')">Prior</button><button data-heat="win" onclick="plSetHeat('win')">Win %</button>
+        </span>
+        <label title="Pause between engine moves">Delay <input type="number" id="pl-delay" value="600" min="0" step="100"> ms</label>
+      </div>
+      <div class="pl-row pl-seat-row" title="Engine that analyses the position on your turns (for the heat map)"><span>Analyst</span><span class="pl-seat" id="pl-analyst" data-game="ttt"></span></div>
+      <div id="pl-board" class="pl-board"></div>
+    </div>
+
+    <div class="card">
+      <h2><span id="pl-title">Analysis</span><span id="pl-meta" style="font-size:0.75rem;color:var(--muted)"></span></h2>
+      <div class="pl-winbar" id="pl-winbar"></div>
+      <table>
+        <thead><tr><th style="text-align:left">Move</th><th>Search share</th><th>Visits</th><th>Prior</th><th>Win % (side to move)</th></tr></thead>
+        <tbody id="pl-cands"></tbody>
+      </table>
+      <h3 class="knob-section" style="margin-top:14px;">X win probability over the game</h3>
+      <canvas id="pl-chart"></canvas>
+      <h3 class="knob-section" style="margin-top:10px;">Moves <span class="hint" id="pl-viewing"></span></h3>
+      <div class="pl-moves" id="pl-moves"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Play tab. The browser owns the game (its move list); every request to /api/play replays it on
+// the server, which returns the board and, when asked, one engine's analysis of the position.
+const PL_SEAT_KINDS = { human: 'Human', ...OPP_KINDS };
+const PL = {
+  game: null,          // 'ttt' | 'uttt'
+  moves: [],           // cells played so far
+  analyses: [],        // analyses[i]: analysis of the position after i moves
+  board: null,         // board of the current position
+  view: null,          // ply being reviewed (null = current position)
+  viewBoard: null,
+  heat: 'search',
+  auto: true,
+  stepOnce: false,
+  busy: false,
+  token: 0,            // bumped by New game / Undo so stale replies are dropped
+  seed: 1,
+};
+
+const plSize = () => PL.game === 'uttt' ? 9 : 3;
+const plCellName = (cell) => {
+  const n = plSize();
+  const col = String.fromCharCode((n === 9 ? 65 : 97) + cell % n);
+  return col + (Math.floor(cell / n) + 1);
+};
+const plSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function playActivated() {
+  if (!expData) await expRefresh(true);
+  if (!PL.game) {
+    document.getElementById('pl-game').value = activeGame === 'uttt' ? 'uttt' : 'ttt';
+    plNewGame();
+  }
+}
+
+function plDefaultAz(game) {
+  const g = expData && expData.games[game];
+  // Several root-parallel trees: their positions share one network batch, so they search more
+  // in about the time of one tree.
+  return { kind: 'alphazero', checkpoint: 'live', net: g ? g.presets[0] : 'default', sims: game === 'uttt' ? 400 : 200, trees: 8 };
+}
+
+function plSeatHtml(spec, game, allowHuman) {
+  const kinds = Object.entries(PL_SEAT_KINDS).filter(([k]) => allowHuman || k !== 'human')
+    .map(([k, l]) => `<option value="${k}" ${k === spec.kind ? 'selected' : ''}>${l}</option>`).join('');
+  const params = spec.kind === 'human' ? '' : oppParamsHtml(spec, game, ['live']);
+  return `<select class="opp-kind" onchange="plSeatKindChanged(this)">${kinds}</select><span class="opp-params">${params}</span>`;
+}
+
+function plRenderSeat(id, spec, allowHuman) {
+  const el = document.getElementById(id);
+  el.dataset.game = PL.game;
+  el.dataset.human = allowHuman ? '1' : '';
+  el.innerHTML = plSeatHtml(spec, PL.game, allowHuman);
+  el.onchange = (e) => { if (!e.target.classList.contains('opp-kind')) plSeatsChanged(); };
+}
+
+function plSeatKindChanged(sel) {
+  const el = sel.closest('.pl-seat');
+  const kind = sel.value;
+  const spec = kind === 'human' ? { kind } : kind === 'alphazero' ? plDefaultAz(PL.game) : oppDefaults(kind, PL.game);
+  plRenderSeat(el.id, spec, !!el.dataset.human);
+  plSeatsChanged();
+}
+
+// Engine spec of a seat (1 = X, 2 = O), or null for a human.
+function plSeat(seat) {
+  const spec = oppReadRow(document.getElementById(`pl-seat-${seat}`));
+  return spec.kind === 'human' ? null : spec;
+}
+
+function plSeatsChanged() {
+  PL.analyses.length = Math.min(PL.analyses.length, PL.moves.length);
+  if (!PL.busy) plTick();
+}
+
+function plNewGame() {
+  const game = document.getElementById('pl-game').value;
+  if (game !== PL.game) {
+    PL.game = game;
+    plRenderSeat('pl-seat-1', { kind: 'human' }, true);
+    plRenderSeat('pl-seat-2', plDefaultAz(game), true);
+    plRenderSeat('pl-analyst', plDefaultAz(game), false);
+  }
+  PL.token++;
+  PL.moves = [];
+  PL.analyses = [];
+  PL.board = null;
+  PL.view = null;
+  PL.busy = false;
+  PL.seed = Math.floor(Math.random() * 1e9);
+  plTick();
+}
+
+async function plRequest(engine, moves) {
+  const res = await fetch('/api/play', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ game: PL.game, moves, engine, seed: PL.seed + moves.length }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+// Brings the current position up to date: fetches the board, lets the engine to move search (and
+// play when ▶ is on or ⏭ was pressed), or lets the analyst search a human's position for the heat map.
+async function plTick() {
+  const token = PL.token;
+  const ply = PL.moves.length;
+  const spec = plSeat(1 + ply % 2);
+  const engineMoves = spec !== null && (PL.auto || PL.stepOnce);
+  const wantHeat = spec === null && PL.heat !== 'off' && !PL.analyses[ply];
+  const engine = engineMoves ? spec : wantHeat ? oppReadRow(document.getElementById('pl-analyst')) : null;
+  PL.busy = true;
+  plSetStatus(engine ? `${engineMoves ? 'Thinking' : 'Analysing'}…` : '', 'var(--amber)');
+  let data;
+  try {
+    data = await plRequest(engine, PL.moves);
+  } catch (e) {
+    if (token === PL.token) { PL.busy = false; plSetStatus('⚠ ' + e.message, 'var(--rose)'); }
+    return;
+  }
+  if (token !== PL.token) return;
+  PL.board = data.board;
+  if (data.analysis) PL.analyses[ply] = data.analysis;
+  PL.busy = false;
+  plRender();
+  if (engineMoves && data.analysis) {
+    PL.stepOnce = false;
+    PL.busy = true;
+    await plSleep(parseInt(document.getElementById('pl-delay').value, 10) || 0);
+    if (token !== PL.token) return;
+    PL.busy = false;
+    PL.moves.push(data.analysis.chosen);
+    plTick();
+  }
+}
+
+function plClick(cell) {
+  if (PL.busy || PL.view !== null || !PL.board || !PL.board.legal.includes(cell)) return;
+  if (plSeat(PL.board.to_move) !== null) return;
+  PL.moves.push(cell);
+  plTick();
+}
+
+function plUndo() {
+  if (!PL.moves.length) return;
+  PL.token++;
+  PL.busy = false;
+  PL.view = null;
+  const anyHuman = plSeat(1) === null || plSeat(2) === null;
+  do { PL.moves.pop(); } while (anyHuman && PL.moves.length && plSeat(1 + PL.moves.length % 2) !== null);
+  if (!anyHuman) plSetAuto(false);
+  PL.analyses.length = PL.moves.length + 1;
+  plTick();
+}
+
+function plSetAuto(on) {
+  PL.auto = on;
+  document.getElementById('pl-auto').textContent = on ? '⏸' : '▶';
+}
+function plToggleAuto() { plSetAuto(!PL.auto); if (PL.auto && !PL.busy) plTick(); }
+function plStep() { if (!PL.busy) { PL.stepOnce = true; plTick(); } }
+
+function plSetHeat(heat) {
+  PL.heat = heat;
+  if (!PL.busy && heat !== 'off') plTick();
+  plRender();
+}
+
+async function plViewPly(ply) {
+  if (ply >= PL.moves.length) { PL.view = null; plRender(); return; }
+  try {
+    PL.viewBoard = (await plRequest(null, PL.moves.slice(0, ply))).board;
+    PL.view = ply;
+  } catch (e) { plSetStatus('⚠ ' + e.message, 'var(--rose)'); }
+  plRender();
+}
+
+function plSetStatus(text, color) {
+  const el = document.getElementById('pl-status');
+  el.textContent = text;
+  el.style.color = color || 'var(--green)';
+}
+
+// X's win probability from an analysis of the position after `ply` moves.
+function plXWin(analysis, ply) {
+  if (!analysis || analysis.value == null) return null;
+  const p = (analysis.value + 1) / 2;
+  return ply % 2 === 0 ? p : 1 - p;
+}
+
+function plHeatCell(stat, total) {
+  if (!stat) return null;
+  const share = total ? stat.visits / total : 0;
+  if (PL.heat === 'search') {
+    return { bg: `rgba(56,189,248,${0.12 + 0.8 * Math.sqrt(share)})`, label: `${Math.round(share * 100)}%` };
+  }
+  if (PL.heat === 'prior') {
+    if (stat.prior == null) return null;
+    return { bg: `rgba(167,139,250,${0.12 + 0.8 * Math.sqrt(stat.prior)})`, label: `${Math.round(stat.prior * 100)}%` };
+  }
+  if (PL.heat === 'win') {
+    if (!stat.visits) return null;
+    const w = (stat.q + 1) / 2;
+    const hue = Math.round(120 * w);  // red (losing) .. green (winning) for the side to move
+    return { bg: `hsla(${hue},70%,45%,${0.3 + 0.65 * Math.sqrt(share)})`, label: `${Math.round(w * 100)}%`, sub: `${stat.visits}` };
+  }
+  return null;
+}
+
+function plRender() {
+  if (!PL.game) return;
+  const reviewing = PL.view !== null;
+  const ply = reviewing ? PL.view : PL.moves.length;
+  const board = reviewing ? PL.viewBoard : PL.board;
+  const analysis = PL.analyses[ply];
+  plRenderBoard(board, analysis, ply);
+  plRenderAnalysis(analysis, ply, board);
+  plRenderChart(ply);
+  plRenderMoves(ply);
+  if (!PL.busy && board) {
+    if (board.result) plSetStatus(board.result === 'draw' ? 'Draw' : `${board.result.toUpperCase()} wins`, 'var(--green)');
+    else if (!reviewing) plSetStatus(`${board.to_move === 1 ? 'X' : 'O'} to move` + (plSeat(board.to_move) === null ? ' (you)' : ''), 'var(--green)');
+  }
+  document.getElementById('pl-viewing').textContent = reviewing ? `— reviewing after move ${ply} (click the last move to return)` : '';
+  for (const b of document.querySelectorAll('#pl-heat-seg button')) b.classList.toggle('active', b.dataset.heat === PL.heat);
+}
+
+function plRenderBoard(board, analysis, ply) {
+  const el = document.getElementById('pl-board');
+  if (!board) { el.innerHTML = ''; return; }
+  const n = plSize();
+  const blocksPerSide = n / 3;
+  el.style.setProperty('--cell', n === 9 ? '38px' : '96px');
+  el.style.gridTemplateColumns = `repeat(${blocksPerSide}, auto)`;
+  const stats = new Map((analysis && PL.heat !== 'off' ? analysis.moves : []).map(m => [m.cell, m]));
+  const total = analysis ? analysis.simulations : 0;
+  const legal = new Set(PL.view === null ? board.legal : []);
+  const last = ply > 0 ? PL.moves[ply - 1] : -1;
+  const best = analysis && PL.heat !== 'off' ? analysis.chosen : -1;
+  // Highlight the sub-board the side to move is sent to (not when it may choose freely).
+  const legalBlocks = new Set([...legal].map(c => Math.floor(Math.floor(c / n) / 3) * blocksPerSide + Math.floor((c % n) / 3)));
+  let html = '';
+  for (let br = 0; br < blocksPerSide; br++) {
+    for (let bc = 0; bc < blocksPerSide; bc++) {
+      const b = br * blocksPerSide + bc;
+      const cells = [];
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) cells.push((br * 3 + r) * n + bc * 3 + c);
+      const active = n === 9 && legalBlocks.size === 1 && legalBlocks.has(b);
+      let inner = '';
+      for (const cell of cells) {
+        const owner = board.cells[cell];
+        const cls = ['pl-cell'];
+        let content = '';
+        let style = '';
+        if (owner) {
+          content = `<span class="pl-sym ${owner === 1 ? 'x' : 'o'}">${owner === 1 ? 'X' : 'O'}</span>`;
+        } else {
+          const heat = plHeatCell(stats.get(cell), total);
+          if (heat) {
+            style = `background:${heat.bg}`;
+            content = `<span class="pl-heat">${heat.label}${heat.sub && n === 3 ? `<small>${heat.sub} visits</small>` : ''}</span>`;
+          }
+        }
+        if (legal.has(cell)) cls.push('legal');
+        if (cell === last) cls.push('last');
+        if (cell === best && !owner) cls.push('best');
+        inner += `<div class="${cls.join(' ')}" style="${style}" title="${plCellName(cell)}" onclick="plClick(${cell})">${content}</div>`;
+      }
+      const status = board.blocks.length ? board.blocks[b] : 0;
+      if (status) {
+        const mark = status === 1 ? 'X' : status === 2 ? 'O' : 'draw';
+        inner += `<div class="pl-won ${mark === 'draw' ? 'draw' : 'pl-sym ' + mark.toLowerCase()}">${mark === 'draw' ? '—' : mark}</div>`;
+      }
+      html += `<div class="pl-block ${active ? 'active' : ''}">${inner}</div>`;
+    }
+  }
+  el.innerHTML = html;
+}
+
+function plRenderAnalysis(analysis, ply, board) {
+  const title = document.getElementById('pl-title');
+  const meta = document.getElementById('pl-meta');
+  const bar = document.getElementById('pl-winbar');
+  const tbody = document.getElementById('pl-cands');
+  if (!analysis) {
+    title.textContent = 'Analysis';
+    meta.textContent = board && board.result ? '' : (PL.heat === 'off' ? 'heat map off' : 'no analysis for this position yet');
+    bar.innerHTML = '';
+    tbody.innerHTML = '';
+    return;
+  }
+  title.textContent = `${analysis.engine} — ${ply % 2 === 0 ? 'X' : 'O'} to move, plays ${plCellName(analysis.chosen)}`;
+  meta.textContent = analysis.simulations ? `${analysis.simulations} sims · ${analysis.millis.toFixed(0)} ms` : `${analysis.millis.toFixed(0)} ms`;
+  const x = plXWin(analysis, ply);
+  bar.innerHTML = x == null ? '<span class="hint">no win-rate estimate from this engine</span>'
+    : `<div style="width:${x * 100}%;background:var(--accent);color:#0b0f19">X ${Math.round(x * 100)}%</div>`
+      + `<div style="width:${(1 - x) * 100}%;background:var(--rose);color:#0b0f19;justify-content:flex-end">O ${Math.round((1 - x) * 100)}%</div>`;
+  const total = analysis.simulations;
+  tbody.innerHTML = analysis.moves.slice(0, 10).map(m => {
+    const share = total ? m.visits / total : 0;
+    const win = m.visits ? `${Math.round((m.q + 1) * 50)}%` : '—';
+    return `<tr${m.cell === analysis.chosen ? ' style="background:#1e293b"' : ''}>`
+      + `<td style="text-align:left">${plCellName(m.cell)}${m.cell === analysis.chosen ? ' ⭐' : ''}</td>`
+      + `<td><div class="bar-wrap"><div class="bar-fill" style="width:${share * 100}%"></div></div>${(share * 100).toFixed(1)}%</td>`
+      + `<td>${m.visits}</td><td>${m.prior == null ? '—' : (m.prior * 100).toFixed(1) + '%'}</td><td>${win}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="hint" style="text-align:left">This engine reports only its move.</td></tr>';
+}
+
+function plRenderChart(currentPly) {
+  const canvas = document.getElementById('pl-chart');
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  const plies = Math.max(PL.moves.length, 1);
+  const px = (i) => 28 + (w - 36) * i / plies;
+  const py = (p) => 8 + (h - 22) * (1 - p);
+  ctx.strokeStyle = '#263457'; ctx.fillStyle = '#94a3b8'; ctx.font = '10px sans-serif';
+  for (const p of [0, 0.5, 1]) {
+    ctx.beginPath(); ctx.moveTo(28, py(p)); ctx.lineTo(w - 8, py(p)); ctx.stroke();
+    ctx.fillText(`${p * 100}%`, 0, py(p) + 3);
+  }
+  ctx.strokeStyle = '#fbbf24';
+  ctx.beginPath(); ctx.moveTo(px(currentPly), 8); ctx.lineTo(px(currentPly), h - 14); ctx.stroke();
+  const points = PL.analyses.map((a, i) => [i, plXWin(a, i)]).filter(([, p]) => p != null);
+  ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach(([i, p], k) => k ? ctx.lineTo(px(i), py(p)) : ctx.moveTo(px(i), py(p)));
+  ctx.stroke();
+  ctx.fillStyle = '#38bdf8';
+  for (const [i, p] of points) { ctx.beginPath(); ctx.arc(px(i), py(p), 2.5, 0, 7); ctx.fill(); }
+  ctx.lineWidth = 1;
+}
+
+function plRenderMoves(currentPly) {
+  document.getElementById('pl-moves').innerHTML = PL.moves.map((cell, i) =>
+    `<span class="${i + 1 === currentPly ? 'current' : ''}" onclick="plViewPly(${i + 1})">${i + 1}. `
+    + `<b class="pl-sym ${i % 2 ? 'o' : 'x'}" style="font-size:inherit">${i % 2 ? 'O' : 'X'}</b> ${plCellName(cell)}</span>`).join('')
+    || '<span class="hint" style="border:none;background:none;cursor:default">no moves yet</span>';
+}
+</script>
