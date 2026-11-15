@@ -43,17 +43,16 @@
     <div class="card">
       <h2><span>🎮 Play</span><span id="pl-status" style="font-size:0.8rem;color:var(--green)"></span></h2>
       <p class="hint" style="margin:0 0 6px;">
-        Each side is you or an engine. Engines move on their own while ▶ is on; ⏭ makes one engine move.
-        Before an engine moves, the heat map shows what it thought of each candidate move: its share of the search,
-        the network's prior (AlphaZero) or the win rate it measured; Minimax shows its score for every move
-        (W/L = forced win/loss found).
+        Each side is you or an engine. When an engine is to move it thinks and the heat map shows what it thinks
+        of each candidate move (share of the search, the network's prior or the win rate it measured; Minimax: its
+        score per move, W/L = forced win/loss). ⏭ plays that move; ▶ keeps playing with the delay between moves.
       </p>
       <div class="pl-row">
         Game <select id="pl-game" onchange="plNewGame()"><option value="ttt">Tic-Tac-Toe</option><option value="uttt">Ultimate TTT</option></select>
         <button class="btn" onclick="plNewGame()" title="Start the game over (keeps the players)">↺ Reset</button>
         <button class="btn secondary" onclick="plUndo()" title="Take back moves until it is a human's turn again">↶ Undo</button>
-        <button class="btn secondary" id="pl-auto" onclick="plToggleAuto()" title="Engines move on their own">⏸</button>
-        <button class="btn secondary" onclick="plStep()" title="One engine move">⏭</button>
+        <button class="btn secondary" id="pl-auto" onclick="plToggleAuto()" title="Play: engines move on their own">▶</button>
+        <button class="btn secondary" onclick="plStep()" title="Single step: the engine to move plays the move shown">⏭</button>
       </div>
       <div class="pl-row pl-seat-row"><span><span class="pl-mark x">X</span></span><span class="pl-seat" id="pl-seat-1" data-game="ttt"></span></div>
       <div class="pl-row pl-seat-row"><span><span class="pl-mark o">O</span></span><span class="pl-seat" id="pl-seat-2" data-game="ttt"></span></div>
@@ -93,8 +92,7 @@ const PL = {
   view: null,          // ply being reviewed (null = current position)
   viewBoard: null,
   heat: 'search',
-  auto: true,
-  stepOnce: false,
+  auto: false,         // ▶: engines play their moves on their own
   busy: false,
   token: 0,            // bumped by Reset / Undo so stale replies are dropped
   seed: 1,
@@ -152,9 +150,12 @@ function plSeat(seat) {
   return spec.kind === 'human' ? null : spec;
 }
 
+// A changed player rethinks the current position (without moving).
 function plSeatsChanged() {
+  PL.token++;
+  PL.busy = false;
   PL.analyses.length = Math.min(PL.analyses.length, PL.moves.length);
-  if (!PL.busy) plTick();
+  plTick();
 }
 
 function plNewGame() {
@@ -171,6 +172,7 @@ function plNewGame() {
   PL.view = null;
   PL.busy = false;
   PL.seed = Math.floor(Math.random() * 1e9);
+  plSetAuto(false);
   plTick();
 }
 
@@ -184,39 +186,49 @@ async function plRequest(engine, moves) {
   return data;
 }
 
-// Shows the current position at once, then, if an engine is to move (and ▶ is on or ⏭ was
-// pressed), lets it search, shows its heat map for the delay, and plays its move.
+// Shows the current position and, if an engine is to move, lets it think and shows its heat map.
+// Its move is played by ⏭, or after the delay while ▶ is on.
 async function plTick() {
   const token = PL.token;
   const ply = PL.moves.length;
-  const mark = ply % 2 ? 'O' : 'X';
   PL.busy = true;
   try {
     const data = await plRequest(null, PL.moves);
     if (token !== PL.token) return;
     PL.board = data.board;
     const spec = plSeat(1 + ply % 2);
-    if (data.board.result || spec === null || !(PL.auto || PL.stepOnce)) {
-      PL.busy = false;
+    if (!data.board.result && spec !== null && !PL.analyses[ply]) {
       plRender();
-      return;
+      plSetStatus(`${ply % 2 ? 'O' : 'X'} is thinking…`, 'var(--amber)');
+      const { analysis } = await plRequest(spec, PL.moves);
+      if (token !== PL.token) return;
+      PL.analyses[ply] = analysis;
     }
-    PL.stepOnce = false;
-    plRender();
-    plSetStatus(`${mark} is thinking…`, 'var(--amber)');
-    const { analysis } = await plRequest(spec, PL.moves);
-    if (token !== PL.token) return;
-    PL.analyses[ply] = analysis;
-    plRender();
-    plSetStatus(`${mark} plays ${plCellName(analysis.chosen)}`, 'var(--amber)');
-    await plSleep(parseInt(document.getElementById('pl-delay').value, 10) || 0);
-    if (token !== PL.token) return;
-    PL.moves.push(analysis.chosen);
     PL.busy = false;
-    plTick();
+    plRender();
+    if (PL.auto) plAutoMove();
   } catch (e) {
     if (token === PL.token) { PL.busy = false; plSetStatus('⚠ ' + e.message, 'var(--rose)'); }
   }
+}
+
+// The engine to move plays the move it has shown.
+function plPlayShownMove() {
+  const analysis = PL.analyses[PL.moves.length];
+  if (PL.busy || PL.view !== null || !analysis || !PL.board || PL.board.result) return;
+  PL.moves.push(analysis.chosen);
+  plTick();
+}
+
+// While ▶ is on: plays the shown move after the delay.
+async function plAutoMove() {
+  const token = PL.token;
+  if (!PL.analyses[PL.moves.length]) return;
+  PL.busy = true;
+  await plSleep(parseInt(document.getElementById('pl-delay').value, 10) || 0);
+  if (token !== PL.token) return;
+  PL.busy = false;
+  if (PL.auto) plPlayShownMove();
 }
 
 function plClick(cell) {
@@ -231,19 +243,25 @@ function plUndo() {
   PL.token++;
   PL.busy = false;
   PL.view = null;
+  plSetAuto(false);
   const anyHuman = plSeat(1) === null || plSeat(2) === null;
   do { PL.moves.pop(); } while (anyHuman && PL.moves.length && plSeat(1 + PL.moves.length % 2) !== null);
-  if (!anyHuman) plSetAuto(false);
   PL.analyses.length = PL.moves.length + 1;
   plTick();
 }
 
 function plSetAuto(on) {
   PL.auto = on;
-  document.getElementById('pl-auto').textContent = on ? '⏸' : '▶';
+  const btn = document.getElementById('pl-auto');
+  btn.textContent = on ? '⏸' : '▶';
+  btn.title = on ? 'Pause' : 'Play: engines move on their own';
 }
-function plToggleAuto() { plSetAuto(!PL.auto); if (PL.auto && !PL.busy) plTick(); }
-function plStep() { if (!PL.busy) { PL.stepOnce = true; plTick(); } }
+function plToggleAuto() {
+  plSetAuto(!PL.auto);
+  if (PL.auto && !PL.busy) plAutoMove();
+  else if (!PL.auto) plRender();
+}
+function plStep() { plPlayShownMove(); }
 
 function plSetHeat(heat) {
   PL.heat = heat;
@@ -317,7 +335,11 @@ function plRender() {
   plRenderMoves(ply);
   if (!PL.busy && board) {
     if (board.result) plSetStatus(board.result === 'draw' ? 'Draw' : `${board.result.toUpperCase()} wins`, 'var(--green)');
-    else if (!reviewing) plSetStatus(`${board.to_move === 1 ? 'X' : 'O'} to move` + (plSeat(board.to_move) === null ? ' (you)' : ''), 'var(--green)');
+    else if (!reviewing) {
+      const mark = board.to_move === 1 ? 'X' : 'O';
+      const shown = plSeat(board.to_move) === null ? null : PL.analyses[ply];
+      plSetStatus(shown ? `${mark} plays ${plCellName(shown.chosen)}` + (PL.auto ? '' : ' — ⏭ to play it') : `${mark} to move (you)`, 'var(--green)');
+    }
   }
   document.getElementById('pl-viewing').textContent = reviewing ? `— reviewing after move ${ply} (click the last move to return)` : '';
   for (const b of document.querySelectorAll('#pl-heat-seg button')) b.classList.toggle('active', b.dataset.heat === PL.heat);

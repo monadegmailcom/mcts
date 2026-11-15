@@ -90,8 +90,8 @@ network of the same architecture; it carries weights only (no replay buffer or o
 The **Play** tab plays single games of Tic-Tac-Toe or Ultimate TTT. Each side is a human or an
 engine (random, Minimax, MCTS, AlphaZero with the live network or a checkpoint and any number of
 root-parallel trees, which share one network batch per step), so it covers
-engine vs. engine and playing against an engine. Before an engine moves, a heat map shows what it
-thought of every candidate move: share of the search, network prior or win rate for MCTS/AlphaZero,
+engine vs. engine and playing against an engine. When an engine is to move it thinks first and a heat
+map shows what it thinks of every candidate move (⏭ plays it, ▶ keeps playing): share of the search, network prior or win rate for MCTS/AlphaZero,
 and the score of every move for Minimax. A win-probability graph and the move list let you review the game.
 New games implement `play::PlayableGame` (start position, Minimax heuristic, evaluation openings,
 cell owners). The evaluation openings are shared by the training evaluation, experiments and arena matches.
