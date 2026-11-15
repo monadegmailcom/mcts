@@ -14,9 +14,8 @@ rand = "0.10.3"
 rand_distr = "0.6.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# libtorch backend (feature `tch`). tch 0.22 expects PyTorch/libtorch 2.9. Build with either
-#   LIBTORCH=/path/to/libtorch                       (standalone libtorch, e.g. in Docker), or
-#   LIBTORCH_USE_PYTORCH=1 + a `python` with torch on PATH (dev machines); see start_lab.sh.
+# libtorch backend (feature `tch`). tch 0.22 expects libtorch 2.9 (pinned in start_lab.sh).
+# Build with LIBTORCH=/path/to/libtorch; `start_lab.sh --tch` downloads it to ./libtorch.
 tch = { version = "0.22", optional = true }
 # Direct dependency only so build.rs receives libtorch's lib dir (`links` metadata) for the rpath.
 torch-sys = { version = "0.22", optional = true }

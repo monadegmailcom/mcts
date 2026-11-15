@@ -6,3 +6,4 @@
 /experiments/tch_bench/target/
 lab_experiments.json
 /checkpoints/
+/libtorch/

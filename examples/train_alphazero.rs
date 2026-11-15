@@ -527,8 +527,9 @@ fn main() -> candle_core::Result<()> {
         match uttt_trainer.load_checkpoint(&uttt_live_file) {
             Ok(()) => println!("📦 Loaded existing UTTT checkpoint into live model: {}", uttt_live_file.display()),
             Err(e) => println!(
-                "⚠️  Ignoring incompatible UTTT checkpoint {} (starting fresh): {e}",
-                uttt_live_file.display()
+                "⚠️  Ignoring incompatible UTTT checkpoint {} (starting fresh): {}",
+                uttt_live_file.display(),
+                e.to_string().lines().next().unwrap_or_default()
             ),
         }
     }

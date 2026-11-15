@@ -52,13 +52,21 @@ identical parameter names, so `.safetensors` checkpoints load in either one:
 | libtorch via tch-rs | `--features tch` | CPU, Apple MPS, CUDA |
 
 The backend is chosen at runtime (`NnDevice { backend, gpu }`, the lab's System panel, or
-`--backend=candle|tch`). Building with `tch` needs libtorch / PyTorch **2.9**:
+`--backend=candle|tch`). Building with `tch` needs libtorch **2.9**, the C++ library behind
+PyTorch (no Python involved). `start_lab.sh --tch` downloads the official build for the platform
+into `./libtorch` on first use (version pinned in the script); `LIBTORCH` points it elsewhere:
 
 ```bash
-# Dev machine with a PyTorch 2.9 install
-MCTS_TORCH_PYTHON=/path/to/venv/bin/python ./start_lab.sh --metal --tch
-# Linux / Docker with a standalone libtorch
-LIBTORCH=/opt/libtorch ./start_lab.sh --cuda --tch
+./start_lab.sh --metal --tch                      # macOS arm64: downloads ./libtorch
+./start_lab.sh --cuda --tch                       # Linux: CUDA build (MCTS_LIBTORCH_VARIANT, default cu128)
+LIBTORCH=/opt/libtorch ./start_lab.sh --cuda --tch  # Docker: a libtorch baked into the image
+```
+
+Plain cargo commands with `tch` need the same libtorch and the version-check bypass (tch 0.22
+asks for exactly 2.9.0; 2.9.x patch releases are compatible):
+
+```bash
+LIBTORCH=$PWD/libtorch LIBTORCH_BYPASS_VERSION_CHECK=1 cargo test --release --features metal,tch
 ```
 
 Throughput comparison: `cargo run --release --features metal,tch --example bench_nn`
