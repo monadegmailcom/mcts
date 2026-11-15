@@ -11,7 +11,7 @@
 //! - `POST /api/train_control`: Interactive training lifecycle control (`start`, `pause`, `step`,
 //!   `reset`, `set_game`, `set_targets`).
 //! - `POST /api/knobs`: Updates live training hyperparameter knobs for the active game.
-//! - `POST /api/models`: Saves the live NN to `<game>_<name>.safetensors`, takes a 1-click
+//! - `POST /api/models`: Saves the live NN to `checkpoints/<game>_<name>.safetensors`, takes a 1-click
 //!   iteration snapshot, loads a `.safetensors` checkpoint into the live model, or deletes a checkpoint.
 //! - `POST /api/calibrate`: Benchmarks actual per-move thinking times (`µs/sim`, `µs/eval`, and
 //!   per-depth Minimax `µs/move`) on the current hardware for fair equal-compute matches.
@@ -22,7 +22,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +35,7 @@ use crate::games::ultimate_ttt::{
 };
 use crate::experiments::{ExperimentPoint, ExperimentSpec, ExperimentStore, RunStatus, json_value};
 use crate::hyperparams::AlphaZeroHyperparams;
+use crate::checkpoints;
 use crate::opponents::{self, OpponentSpec};
 use crate::play::{self, NetService, PlayRequest};
 use crate::inference::InferenceService;
@@ -678,8 +678,8 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
             .find(|(name, _)| *name == net)
             .map(|(_, config)| config)
             .ok_or_else(|| format!("unknown network preset '{net}'"))?;
-        let file = sanitize_safetensors_filename(checkpoint).ok_or_else(|| format!("invalid checkpoint name '{checkpoint}'"))?;
-        let modified = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        let file = checkpoints::sanitize_name(checkpoint).ok_or_else(|| format!("invalid checkpoint name '{checkpoint}'"))?;
+        let modified = std::fs::metadata(checkpoints::path(&file)).and_then(|m| m.modified()).ok();
         let key: PlayNetworkKey = (file, net.to_string(), modified);
 
         let mut cache = self.play_networks.lock().expect("play network cache poisoned");
@@ -689,7 +689,7 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
             cache.push(entry);
             return Ok(service);
         }
-        let evaluator = NetEvaluator::standalone(&config, &self.devices, Some(&key.0))
+        let evaluator = NetEvaluator::standalone(&config, &self.devices, Some(checkpoints::path(&key.0)))
             .map_err(|e| format!("cannot load '{}' as a '{net}' network: {e}", key.0))?;
         let replicas = evaluator.num_replicas();
         let service = Arc::new(InferenceService::new(evaluator, 64, replicas));
@@ -713,12 +713,13 @@ impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
             return NetEvaluator::standalone(&self.net_config, &self.devices, None::<&str>)
                 .map_err(|e| e.to_string());
         }
-        let safe_name = sanitize_safetensors_filename(id)
+        let safe_name = checkpoints::sanitize_name(id)
             .ok_or_else(|| format!("Invalid checkpoint filename: {id}"))?;
-        if !Path::new(&safe_name).exists() {
-            return Err(format!("Checkpoint file '{safe_name}' does not exist"));
+        let path = checkpoints::path(&safe_name);
+        if !path.exists() {
+            return Err(format!("Checkpoint file '{}' does not exist", path.display()));
         }
-        NetEvaluator::standalone(&self.net_config, &self.devices, Some(&safe_name))
+        NetEvaluator::standalone(&self.net_config, &self.devices, Some(&path))
             .map_err(|e| format!("Failed to load '{safe_name}': {e}"))
     }
 }
@@ -1891,7 +1892,7 @@ fn build_uttt_player<'a>(
     }
 }
 
-/// File names of `game`'s `.safetensors` checkpoints in the working directory.
+/// File names of `game`'s checkpoints in the checkpoint folder.
 fn disk_checkpoints(game: LabGame) -> Vec<String> {
     discover_game_models(game, false, 0).into_iter().filter(|m| m.kind == "disk").map(|m| m.id).collect()
 }
@@ -1920,34 +1921,14 @@ fn discover_game_models(game: LabGame, has_live: bool, current_iter: usize) -> V
         description: format!("Untrained Random {} Weights (Iter 0 Baseline)", game.title()),
     });
 
-    if let Ok(entries) = std::fs::read_dir(".") {
-        let mut disk_files: Vec<(String, u64)> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                if !name.ends_with(".safetensors") {
-                    return None;
-                }
-                let belongs_to_uttt = name.starts_with("uttt_");
-                let matches_game = match game {
-                    LabGame::Uttt => belongs_to_uttt,
-                    LabGame::Ttt => !belongs_to_uttt,
-                };
-                if matches_game {
-                    let sz = e.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                    Some((name, sz))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        disk_files.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, sz) in disk_files {
+    for (name, size_bytes) in checkpoints::list() {
+        let belongs_to_uttt = name.starts_with("uttt_");
+        if belongs_to_uttt == (game == LabGame::Uttt) {
             list.push(ModelInfo {
                 id: name,
                 kind: "disk",
                 game: g_str,
-                size_bytes: sz,
+                size_bytes,
                 description: format!("Saved {} checkpoint on disk", game.title()),
             });
         }
@@ -1955,27 +1936,8 @@ fn discover_game_models(game: LabGame, has_live: bool, current_iter: usize) -> V
     list
 }
 
-fn sanitize_safetensors_filename(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let clean: String = trimmed
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
-        .collect();
-    if clean.is_empty() || clean.starts_with('.') || clean.contains("..") {
-        return None;
-    }
-    if clean.ends_with(".safetensors") {
-        Some(clean)
-    } else {
-        Some(format!("{clean}.safetensors"))
-    }
-}
-
 fn ensure_game_prefixed_filename(game: LabGame, raw: &str) -> Option<String> {
-    let base = sanitize_safetensors_filename(raw)?;
+    let base = checkpoints::sanitize_name(raw)?;
     let prefix = game.prefix();
     if base.starts_with("ttt_") || base.starts_with("uttt_") {
         Some(base)
@@ -2334,7 +2296,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "{\"error\":\"No live TTT model attached\"}",
                             );
                         };
-                        ctx.live_service.evaluator().save_safetensors(&filename)
+                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename))
                     }
                     LabGame::Uttt => {
                         let Some(ctx) = uttt_ctx else {
@@ -2345,7 +2307,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "{\"error\":\"No live UTTT model attached\"}",
                             );
                         };
-                        ctx.live_service.evaluator().save_safetensors(&filename)
+                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename))
                     }
                 };
                 if let Err(e) = save_res {
@@ -2360,7 +2322,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                 hub.set_phase_for(game, cur_iter, format!("Saved checkpoint {filename}"));
             }
             "load_to_live" => {
-                let Some(filename) = sanitize_safetensors_filename(&raw_target_name) else {
+                let Some(filename) = checkpoints::sanitize_name(&raw_target_name) else {
                     return write_http_response(
                         &mut stream,
                         "400 Bad Request",
@@ -2379,7 +2341,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                             );
                         };
                         ctx.live_service.pause_inference();
-                        let r = ctx.live_service.evaluator().load_safetensors(&filename);
+                        let r = ctx.live_service.evaluator().load_safetensors(checkpoints::path(&filename));
                         ctx.live_service.resume_inference();
                         r
                     }
@@ -2393,7 +2355,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                             );
                         };
                         ctx.live_service.pause_inference();
-                        let r = ctx.live_service.evaluator().load_safetensors(&filename);
+                        let r = ctx.live_service.evaluator().load_safetensors(checkpoints::path(&filename));
                         ctx.live_service.resume_inference();
                         r
                     }
@@ -2410,8 +2372,8 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                 hub.set_phase_for(game, cur_iter, format!("Loaded {filename} into Live"));
             }
             "delete" => {
-                if let Some(filename) = sanitize_safetensors_filename(&raw_target_name) {
-                    let _ = std::fs::remove_file(&filename);
+                if let Some(filename) = checkpoints::sanitize_name(&raw_target_name) {
+                    let _ = std::fs::remove_file(checkpoints::path(&filename));
                 }
             }
             _ => {}
@@ -3258,7 +3220,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <button class="btn secondary" onclick="snapshotLiveModel()">📸 Quick Snapshot</button>
       </div>
     </h2>
-    <p class="hint">Checkpoints are scoped per game (<code>ttt_*.safetensors</code> and <code>uttt_*.safetensors</code>). Select any saved checkpoint in Engine A or Engine B below to compare training stages.</p>
+    <p class="hint">Checkpoints live in the <code>checkpoints/</code> folder and are scoped per game (<code>ttt_*.safetensors</code> and <code>uttt_*.safetensors</code>). Select any saved checkpoint in Engine A or Engine B below to compare training stages.</p>
     <table>
       <thead>
         <tr>

@@ -8,6 +8,7 @@
 pub mod alphazero;
 pub mod experiments;
 pub mod backend;
+pub mod checkpoints;
 pub mod game;
 pub mod games;
 pub mod hyperparams;

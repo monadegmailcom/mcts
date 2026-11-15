@@ -6,7 +6,7 @@
 //!      have full Start / Pause / Resume / Step (+1 Iter) / Reset control from the browser.
 //!    - Supports switching live between **3x3 Tic-Tac-Toe (`G=27, P=9, N=2`)** and
 //!      **9x9 Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`)**.
-//!    - Automatically saves `<game>_iter_NNN.safetensors` checkpoints every `N` iterations so you
+//!    - Automatically saves `checkpoints/<game>_iter_NNN.safetensors` every `N` iterations so you
 //!      can pit networks from different training stages against each other or against MCTS,
 //!      Tree-Minimax, and Minimax at calibrated equal thinking time per move.
 //! 2. **Automated CLI Showcase (when run without `--serve`)**:
@@ -18,7 +18,6 @@
 //! - Apple Silicon GPU: `cargo run --release --features metal --example train_alphazero -- --serve`
 //! - NVIDIA Multi-GPU (RunPod): `cargo run --release --features cuda --example train_alphazero -- --serve`
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +38,7 @@ use mcts::hyperparams::AlphaZeroHyperparams;
 use mcts::mcts::{MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
 use mcts::minimax::MinimaxPlayer;
 use mcts::backend::{Backend, NetEvaluator, NnDevice};
+use mcts::checkpoints;
 use mcts::nn::AlphaZeroNetConfig;
 use mcts::player::Player;
 use mcts::opponents::OpponentSpec;
@@ -211,11 +211,11 @@ where
         rec.simulations_per_sec,
     );
 
-    trainer.save_checkpoint(format!("{}_alphazero.safetensors", S::TAG))?;
+    trainer.save_checkpoint(checkpoints::path(&format!("{}_alphazero.safetensors", S::TAG)))?;
     let auto_every = hub.auto_save_every_for(game);
     if auto_every > 0 && iter.is_multiple_of(auto_every) {
         let snap = format!("{}_iter_{iter:03}.safetensors", S::TAG);
-        trainer.save_checkpoint(&snap)?;
+        trainer.save_checkpoint(checkpoints::path(&snap))?;
         println!("📸 Auto-saved {tag} checkpoint: {snap}");
     }
 
@@ -257,7 +257,8 @@ where
         .map(|o| match o {
             OpponentSpec::AlphaZero { checkpoint, net, .. } => {
                 let cfg = S::net_presets().into_iter().find(|(n, _)| n == net).map(|(_, c)| c).ok_or(format!("unknown net '{net}'"))?;
-                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(checkpoint)).map_err(|e| e.to_string())?;
+                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(checkpoints::path(checkpoint)))
+                    .map_err(|e| e.to_string())?;
                 Ok(Some(InferenceService::new(ev, 256, 1)))
             }
             _ => Ok(None),
@@ -332,7 +333,7 @@ where
     let mut trainer = AlphaZeroTrainer::<G, P, 2>::new(cfg, hp.learning_rate, hp.weight_decay, dev)?;
     if !spec.init_checkpoint.is_empty() {
         trainer
-            .load_checkpoint(&spec.init_checkpoint)
+            .load_checkpoint(checkpoints::path(&spec.init_checkpoint))
             .map_err(|e| candle_core::Error::Msg(format!("cannot load '{}' into the {net_name} net: {e}", spec.init_checkpoint)))?;
     }
     let service = trainer.build_inference_service(spec.infer_batch, &dev.replicas(1))?;
@@ -402,7 +403,7 @@ where
         evaluate(iter, train_secs, games, positions, value_loss, policy_kl, sims_per_sec);
     }
     let ckpt = format!("{}_exp{id}_{net_name}.safetensors", S::TAG);
-    trainer.save_checkpoint(&ckpt)?;
+    trainer.save_checkpoint(checkpoints::path(&ckpt))?;
     println!("🧪 Experiment #{id} finished: {status:?} (weights: {ckpt})");
     Ok(status)
 }
@@ -503,9 +504,10 @@ fn main() -> candle_core::Result<()> {
         1e-4,
         train_device,
     )?;
-    if interactive_lab && Path::new("ttt_alphazero.safetensors").exists() {
-        ttt_trainer.load_checkpoint("ttt_alphazero.safetensors")?;
-        println!("📦 Loaded existing TTT checkpoint into live model: ttt_alphazero.safetensors");
+    let ttt_live_file = checkpoints::path("ttt_alphazero.safetensors");
+    if interactive_lab && ttt_live_file.exists() {
+        ttt_trainer.load_checkpoint(&ttt_live_file)?;
+        println!("📦 Loaded existing TTT checkpoint into live model: {}", ttt_live_file.display());
     }
     let mut ttt_service = Arc::new(ttt_trainer.build_inference_service(max_batch_size, &infer_devices)?);
     hub.attach_ttt_service(Arc::clone(&ttt_service), ttt_net_cfg, infer_devices.clone());
@@ -513,9 +515,6 @@ fn main() -> candle_core::Result<()> {
         .with_symmetries(<TicTacToe as AlphaZeroGame<27, 9, 2>>::symmetries());
 
     // 2. Initialize Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`) Trainer & Live Inference Service
-    // Sub-board network: one shared encoder per 3x3 sub-board + global residual MLP. Learns the
-    // UTTT policy far faster than a flat MLP (shared weights across the 9 identical sub-boards)
-    // while running at MLP speed (candle's convolutions are ~30x slower for the ResNet).
     let uttt_net_cfg = <UltimateTicTacToe as AlphaZeroGame<{ UTTT_INPUT_SIZE }, 81, 2>>::net_config();
     let mut uttt_trainer = AlphaZeroTrainer::<{ UTTT_INPUT_SIZE }, 81, 2>::new(
         uttt_net_cfg,
@@ -523,13 +522,13 @@ fn main() -> candle_core::Result<()> {
         1e-4,
         train_device,
     )?;
-    if interactive_lab && Path::new("uttt_alphazero.safetensors").exists() {
-        match uttt_trainer.load_checkpoint("uttt_alphazero.safetensors") {
-            Ok(()) => println!(
-                "📦 Loaded existing UTTT checkpoint into live model: uttt_alphazero.safetensors"
-            ),
+    let uttt_live_file = checkpoints::path("uttt_alphazero.safetensors");
+    if interactive_lab && uttt_live_file.exists() {
+        match uttt_trainer.load_checkpoint(&uttt_live_file) {
+            Ok(()) => println!("📦 Loaded existing UTTT checkpoint into live model: {}", uttt_live_file.display()),
             Err(e) => println!(
-                "⚠️  Ignoring incompatible UTTT checkpoint uttt_alphazero.safetensors (starting fresh): {e}"
+                "⚠️  Ignoring incompatible UTTT checkpoint {} (starting fresh): {e}",
+                uttt_live_file.display()
             ),
         }
     }

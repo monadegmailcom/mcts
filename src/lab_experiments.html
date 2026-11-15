@@ -382,7 +382,7 @@ function oppParamsHtml(o, game, extraCheckpoints = []) {
       const opts = (ckpts.includes(o.checkpoint) || !o.checkpoint ? ckpts : [o.checkpoint, ...ckpts])
         .map(c => `<option ${c === o.checkpoint ? 'selected' : ''}>${c}</option>`).join('');
       const nets = (g ? g.presets : [o.net]).map(n => `<option ${n === o.net ? 'selected' : ''}>${n}</option>`).join('');
-      return `<label class="opp-field" title="Saved .safetensors network (working directory)">file <select class="opp-ckpt">${opts || '<option value="">(no checkpoints)</option>'}</select></label>`
+      return `<label class="opp-field" title="Saved .safetensors network (checkpoints/ folder)">file <select class="opp-ckpt">${opts || '<option value="">(no checkpoints)</option>'}</select></label>`
         + `<label class="opp-field" title="Architecture the checkpoint was trained with">net <select class="opp-net">${nets}</select></label>`
         + num('opp-sims', 'sims', o.sims, 25, 'PUCT simulations per move in each tree')
         + num('opp-trees', 'trees', o.trees || 1, 1, 'Root-parallel trees: each searches sims simulations, their visit counts are summed to choose the move. On a GPU more trees cost little extra time (one batch).');

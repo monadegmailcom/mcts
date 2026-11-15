@@ -70,7 +70,8 @@ Throughput comparison: `cargo run --release --features metal,tch --example bench
 with all hyperparameters as knobs, an arena for matches between engines and checkpoints, and an
 **Experiments** tab that queues training runs from scratch (architecture, backend, device,
 hyperparameters, training-time budget) and plots their strength against fixed opponents per
-training minute and per self-play game. Results persist in `lab_experiments.json`.
+training minute and per self-play game. Results persist in `lab_experiments.json`. Checkpoints are kept in `checkpoints/` (or `$MCTS_CHECKPOINT_DIR`, e.g. a mounted
+volume in a container) and named `<game>_<name>.safetensors`.
 
 Evaluation opponents are configurable on the training page and per experiment: random, classical
 MCTS (simulations, exploration constant), Minimax (depth) or a saved AlphaZero checkpoint
