@@ -34,6 +34,11 @@ pub trait PlayableGame<const G: usize, const P: usize>: AlphaZeroGame<G, P, 2> {
     /// Leaf evaluation for Minimax.
     fn heuristic() -> Self::Heuristic;
 
+    /// Starting positions for evaluation matches, each played once per seat. Deterministic engines
+    /// (AlphaZero playing its best move, Minimax) would otherwise replay the same few games from
+    /// the start position. Must be deterministic so results are comparable over time.
+    fn eval_openings(count: usize) -> Vec<Game<Self, 2>>;
+
     /// Owner of every cell in policy-index order: `0` empty, `1` first player, `2` second player.
     fn cells(game: &Game<Self, 2>) -> Vec<u8>;
 

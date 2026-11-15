@@ -609,6 +609,11 @@ impl PlayableGame<INPUT_SIZE, POLICY_SIZE> for UltimateTicTacToe {
         UtttHeuristic::default()
     }
 
+    /// Seeded random 2-ply openings: rarely decisive, and the seat swap cancels what they favour.
+    fn eval_openings(count: usize) -> Vec<UtttGame> {
+        crate::matchup::random_openings(&Self::start(), count.max(1), 2, 4242)
+    }
+
     fn cells(game: &UtttGame) -> Vec<u8> {
         let state = game.state();
         (0..81)

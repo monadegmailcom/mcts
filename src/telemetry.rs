@@ -37,9 +37,9 @@ use crate::experiments::{ExperimentPoint, ExperimentSpec, ExperimentStore, RunSt
 use crate::hyperparams::AlphaZeroHyperparams;
 use crate::checkpoints;
 use crate::opponents::{self, OpponentSpec};
-use crate::play::{self, NetService, PlayRequest};
+use crate::play::{self, NetService, PlayRequest, PlayableGame};
 use crate::inference::InferenceService;
-use crate::matchup::{RandomPlayer, run_multi_match};
+use crate::matchup::{RandomPlayer, run_multi_match, run_multi_match_with_openings};
 use crate::mcts::{Fpu, MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
 use crate::minimax::{MinimaxBudget, MinimaxPlayer, TreeMinimaxPlayer};
 use crate::backend::{Backend, NetEvaluator, NnDevice};
@@ -1119,7 +1119,8 @@ impl TelemetryHub {
         max_batch_size: usize,
         seed: u64,
     ) -> Result<TttMatchRecord, String> {
-        let games = num_games.clamp(1, 5000);
+        // Each opening is played once per seat, so the game count is even.
+        let games = num_games.clamp(2, 5000).div_ceil(2) * 2;
         let workers = num_workers.clamp(1, 32);
         let batch_cap = max_batch_size.clamp(1, 512);
 
@@ -1162,10 +1163,9 @@ impl TelemetryHub {
                     build_ttt_player(cfg_b, svc_b_ref, g, s)
                 };
 
-                let root_game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+                let openings = TicTacToe::eval_openings(games / 2);
                 let start = Instant::now();
-                let outcome =
-                    run_multi_match(&root_game, [&factory_a, &factory_b], games, workers, seed);
+                let outcome = run_multi_match_with_openings(&openings, [&factory_a, &factory_b], workers, seed);
                 let duration_ms = (start.elapsed().as_secs_f64() * 1000.0) as f32;
                 summarize_match_outcome(
                     LabGame::Ttt,
@@ -1216,10 +1216,9 @@ impl TelemetryHub {
                         build_uttt_player(cfg_b, svc_b_ref, g, s)
                     };
 
-                let root_game = UtttGame::new(PlayerIndex::PLAYER1, UTTT_EMPTY_STATE);
+                let openings = UltimateTicTacToe::eval_openings(games / 2);
                 let start = Instant::now();
-                let outcome =
-                    run_multi_match(&root_game, [&factory_a, &factory_b], games, workers, seed);
+                let outcome = run_multi_match_with_openings(&openings, [&factory_a, &factory_b], workers, seed);
                 let duration_ms = (start.elapsed().as_secs_f64() * 1000.0) as f32;
                 summarize_match_outcome(
                     LabGame::Uttt,
@@ -3486,6 +3485,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <span>🏁 Run Multi-Match Tournament (<span id="match-game-label">Tic-Tac-Toe</span> — Role-Swapped 50% X / 50% O)</span>
       <button class="btn" id="run-match-btn" onclick="runArenaMatch()">⚔️ Start Multi-Match</button>
     </h2>
+    <p class="hint">Games start from the same fixed openings as the training evaluation (Ultimate TTT: random 2-move openings; Tic-Tac-Toe: the empty board), each played once per seat, so two engines that always play their best move still meet in different games.</p>
     <div class="knobs-grid" style="margin-bottom:12px;">
       <div class="knob-item">
         <label>Total Games (Role-Swapped)</label>

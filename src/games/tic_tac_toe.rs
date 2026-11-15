@@ -311,6 +311,12 @@ impl PlayableGame<27, 9> for TicTacToe {
         TttHeuristic
     }
 
+    /// Always the empty board: Minimax plays perfectly (already at depth 2), and a random opening
+    /// could hand it a won game.
+    fn eval_openings(count: usize) -> Vec<TttGame> {
+        vec![Self::start(); count.max(1)]
+    }
+
     fn cells(game: &TttGame) -> Vec<u8> {
         game.state().iter().map(|&s| s as u8).collect()
     }

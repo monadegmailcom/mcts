@@ -498,6 +498,26 @@ where
     )
 }
 
+/// `count` positions reached by `plies` uniformly random moves from `root` (seeded, so the same
+/// arguments give the same openings; asking for more only appends new ones).
+pub fn random_openings<R: GameRules<N>, const N: usize>(root: &Game<R, N>, count: usize, plies: usize, seed: u64) -> Vec<Game<R, N>> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut moves = Vec::new();
+    (0..count)
+        .map(|_| {
+            let mut game = root.clone();
+            for _ in 0..plies {
+                game.write_valid_moves(&mut moves);
+                match moves.choose(&mut rng) {
+                    Some(&mv) => game = game.apply(mv),
+                    None => break,
+                }
+            }
+            game
+        })
+        .collect()
+}
+
 /// Runs a balanced tournament over a set of `openings`: every opening is played `N` times so
 /// that each participant occupies every seat exactly once per opening (`openings.len() * N`
 /// rounds in total).

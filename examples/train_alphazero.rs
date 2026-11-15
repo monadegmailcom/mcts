@@ -21,16 +21,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rand::prelude::{IndexedRandom, SeedableRng, SmallRng};
+use rand::prelude::{SeedableRng, SmallRng};
 
 use mcts::alphazero::{
     AlphaZeroConfig, AlphaZeroGame, AlphaZeroPlayer, SelfPlayConfig, run_self_play,
     run_self_play_with_initializer,
 };
-use mcts::game::{Game, GameRules, PlayerIndex};
+use mcts::game::{Game, PlayerIndex};
 use mcts::games::rubiks_cube::{RubiksGame, RubiksState};
-use mcts::games::tic_tac_toe::{TicTacToe, TttGame};
-use mcts::games::ultimate_ttt::{INPUT_SIZE as UTTT_INPUT_SIZE, UltimateTicTacToe, UtttGame};
+use mcts::games::tic_tac_toe::TicTacToe;
+use mcts::games::ultimate_ttt::{INPUT_SIZE as UTTT_INPUT_SIZE, UltimateTicTacToe};
 use mcts::inference::InferenceService;
 use mcts::matchup::{RandomPlayer, run_multi_match_with_openings};
 use mcts::experiments::{ExperimentPoint, ExperimentSpec, RunStatus, score_pct};
@@ -58,51 +58,18 @@ trait LabGameSpec<const G: usize, const P: usize>: PlayableGame<G, P> + Sync + '
     const TAG: &'static str;
     /// Base seed for self-play and evaluation of this game.
     const SEED: u64;
-    /// Starting positions for the arena; each is played once per seat (`2 * len` games). Must be
-    /// deterministic so numbers are comparable across iterations.
-    fn eval_openings(count: usize) -> Vec<Game<Self, 2>>;
 }
 
 impl LabGameSpec<27, 9> for TicTacToe {
     const LAB: LabGame = LabGame::Ttt;
     const TAG: &'static str = "ttt";
     const SEED: u64 = 1000;
-    /// Always the empty board: Minimax plays perfectly (already at depth 2), and a random opening
-    /// could hand it a won game.
-    fn eval_openings(count: usize) -> Vec<TttGame> {
-        vec![Self::start(); count.max(1)]
-    }
 }
 
 impl LabGameSpec<{ UTTT_INPUT_SIZE }, 81> for UltimateTicTacToe {
     const LAB: LabGame = LabGame::Uttt;
     const TAG: &'static str = "uttt";
     const SEED: u64 = 5000;
-    /// Seeded random 2-ply openings: from the empty board, deterministic engines (argmax
-    /// AlphaZero, Minimax) would replay the same couple of games, making arena numbers pure noise.
-    /// Prefix-stable: asking for more openings only appends new positions.
-    fn eval_openings(count: usize) -> Vec<UtttGame> {
-        random_openings(Self::start(), count.max(1), 2, 4242)
-    }
-}
-
-/// `count` positions reached by `plies` uniformly random moves from `root` (seeded).
-fn random_openings<R: GameRules<2>>(root: Game<R, 2>, count: usize, plies: usize, seed: u64) -> Vec<Game<R, 2>> {
-    let mut rng = SmallRng::seed_from_u64(seed);
-    let mut moves = Vec::new();
-    (0..count)
-        .map(|_| {
-            let mut g = root.clone();
-            for _ in 0..plies {
-                g.write_valid_moves(&mut moves);
-                match moves.choose(&mut rng) {
-                    Some(&mv) => g = g.apply(mv),
-                    None => break,
-                }
-            }
-            g
-        })
-        .collect()
 }
 
 /// One lab iteration for any [`LabGameSpec`]: self-play -> SGD -> arena evaluation -> checkpoint.

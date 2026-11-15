@@ -93,4 +93,5 @@ root-parallel trees, which share one network batch per step), so it covers
 engine vs. engine, playing against an engine, and an analysis board. A heat map shows the searching
 engine's view of every candidate move (share of the search, network prior, or win rate); on a human's
 turn an analyst engine provides it. A win-probability graph and the move list let you review the game.
-New games implement `play::PlayableGame` (start position, Minimax heuristic, cell owners).
+New games implement `play::PlayableGame` (start position, Minimax heuristic, evaluation openings,
+cell owners). The evaluation openings are shared by the training evaluation, experiments and arena matches.
