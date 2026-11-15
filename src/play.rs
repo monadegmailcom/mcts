@@ -16,9 +16,8 @@ use crate::backend::NetEvaluator;
 use crate::game::{Game, GameStatus};
 use crate::inference::InferenceService;
 use crate::mcts::{PlayoutEvaluator, Uct};
-use crate::minimax::{HeuristicEvaluator, MinimaxPlayer};
+use crate::minimax::{HeuristicEvaluator, TERMINAL_SCORE_BASE, root_move_scores};
 use crate::opponents::OpponentSpec;
-use crate::player::Player;
 use crate::root_parallel::{AggregatedRootChild, RootParallelBudget, RootParallelConfig, RootParallelPlayer};
 
 /// Inference service over a two-player game's network.
@@ -82,7 +81,7 @@ pub struct Analysis {
     pub engine: String,
     /// The cell the engine plays.
     pub chosen: usize,
-    /// Per-move search statistics, most visited first (search engines only).
+    /// Per-move statistics, best first (empty for Random).
     pub moves: Vec<MoveStat>,
     /// Search value for the side to move in `[-1, 1]` (search engines only).
     pub value: Option<f32>,
@@ -90,14 +89,19 @@ pub struct Analysis {
     pub millis: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct MoveStat {
     pub cell: usize,
     /// Network prior (AlphaZero only).
     pub prior: Option<f32>,
+    /// Search visits (MCTS, AlphaZero).
     pub visits: u64,
-    /// Mean search value of the move for the side to move in `[-1, 1]` (`0` if unvisited).
+    /// Mean search value of the move for the side to move in `[-1, 1]` (MCTS, AlphaZero; `0` if unvisited).
     pub q: f32,
+    /// Minimax score for the side to move, in the game heuristic's units (Minimax only).
+    pub score: Option<f32>,
+    /// `"win"` or `"loss"` when Minimax proved the result of the move.
+    pub proven: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,13 +148,29 @@ pub fn analyse<R: PlayableGame<G, P>, const G: usize, const P: usize>(
     seed: u64,
 ) -> Result<Analysis, String> {
     let start = Instant::now();
-    let (chosen, root, has_priors) = match engine {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let (chosen, moves, value) = match engine {
         OpponentSpec::Random => {
             let moves: Vec<_> = game.valid_moves().collect();
-            (*moves.choose(&mut SmallRng::seed_from_u64(seed)).ok_or("no legal move")?, Vec::new(), false)
+            (*moves.choose(&mut rng).ok_or("no legal move")?, Vec::new(), None)
         }
         OpponentSpec::Minimax { depth } => {
-            (MinimaxPlayer::new(game.clone(), R::heuristic(), *depth, seed).choose_move(), Vec::new(), false)
+            let scored = root_move_scores(game, &R::heuristic(), *depth);
+            let best = scored.iter().map(|&(_, s)| s).fold(f32::NEG_INFINITY, f32::max);
+            // Random tie-break among the best moves, as `MinimaxPlayer` does.
+            let ties: Vec<_> = scored.iter().filter(|&&(_, s)| s == best).map(|&(mv, _)| mv).collect();
+            let chosen = *ties.choose(&mut rng).ok_or("no legal move")?;
+            let mut moves: Vec<MoveStat> = scored
+                .iter()
+                .map(|&(mv, score)| MoveStat {
+                    cell: R::move_to_policy_index(mv),
+                    score: Some(score),
+                    proven: (score.abs() >= TERMINAL_SCORE_BASE).then_some(if score > 0.0 { "win" } else { "loss" }),
+                    ..MoveStat::default()
+                })
+                .collect();
+            moves.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            (chosen, moves, None)
         }
         OpponentSpec::Mcts { sims, exploration } => {
             let config = RootParallelConfig::new(RootParallelBudget::SimulationsPerThread(*sims), seed);
@@ -158,36 +178,44 @@ pub fn analyse<R: PlayableGame<G, P>, const G: usize, const P: usize>(
                 PlayoutEvaluator::new(s)
             })
             .evaluate_root();
-            (most_visited(&root), root, false)
+            search_stats::<R, G, P>(&root, false)
         }
         OpponentSpec::AlphaZero { sims, trees, .. } => {
             let network = network.ok_or("no network for the AlphaZero engine")?;
             let config = AlphaZeroConfig::new(*trees, *sims, seed).with_dirichlet(0.3, 0.0);
             let root = AlphaZeroPlayer::new(game.clone(), network, config).evaluate_root();
-            (most_visited(&root), root, true)
+            search_stats::<R, G, P>(&root, true)
         }
     };
+    Ok(Analysis {
+        engine: engine.label(),
+        chosen: R::move_to_policy_index(chosen),
+        simulations: moves.iter().map(|m| m.visits).sum(),
+        moves,
+        value,
+        millis: start.elapsed().as_secs_f64() * 1000.0,
+    })
+}
 
-    let simulations: u64 = root.iter().map(|c| c.visits).sum();
-    let value = (simulations > 0).then(|| (root.iter().map(|c| c.value_sum).sum::<f64>() / simulations as f64) as f32);
+/// Move played, per-move statistics (most visited first) and root value of a finished search.
+fn search_stats<R: PlayableGame<G, P>, const G: usize, const P: usize>(
+    root: &[AggregatedRootChild<R::Move>],
+    with_priors: bool,
+) -> (R::Move, Vec<MoveStat>, Option<f32>) {
+    let visits: u64 = root.iter().map(|c| c.visits).sum();
+    let value = (visits > 0).then(|| (root.iter().map(|c| c.value_sum).sum::<f64>() / visits as f64) as f32);
     let mut moves: Vec<MoveStat> = root
         .iter()
         .map(|c| MoveStat {
             cell: R::move_to_policy_index(c.mv),
-            prior: has_priors.then_some(c.prior),
+            prior: with_priors.then_some(c.prior),
             visits: c.visits,
             q: c.q_value() as f32,
+            ..MoveStat::default()
         })
         .collect();
     moves.sort_by_key(|m| std::cmp::Reverse(m.visits));
-    Ok(Analysis {
-        engine: engine.label(),
-        chosen: R::move_to_policy_index(chosen),
-        moves,
-        value,
-        simulations,
-        millis: start.elapsed().as_secs_f64() * 1000.0,
-    })
+    (most_visited(root), moves, value)
 }
 
 fn most_visited<M: Copy>(root: &[AggregatedRootChild<M>]) -> M {
@@ -247,8 +275,11 @@ mod tests {
         assert_eq!(a.simulations, a.moves.iter().map(|m| m.visits).sum::<u64>());
         assert_eq!(a.chosen, a.moves[0].cell, "plays the most visited move");
         assert!(a.moves.iter().all(|m| m.prior.is_none()));
-        // Minimax only reports its move.
+        // Minimax scores every move; O must block X's diagonal 0-4-8 at cell 8 or lose.
+        let game = replay::<TicTacToe, 27, 9>(&[0, 1, 4]).unwrap();
         let a = analyse(&game, &OpponentSpec::Minimax { depth: 2 }, None, 7).unwrap();
-        assert!(a.moves.is_empty() && a.value.is_none());
+        assert_eq!((a.chosen, a.moves.len(), a.value), (8, 6, None));
+        assert_eq!(a.moves[0].cell, 8);
+        assert!(a.moves[1..].iter().all(|m| m.proven == Some("loss")), "every other move loses");
     }
 }

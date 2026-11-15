@@ -278,6 +278,25 @@ where
     best
 }
 
+/// Exact Negamax score of every legal move of a two-player zero-sum `game`, for the player to
+/// move, searching `depth` plies below each move (as [`MinimaxPlayer`] does). Each move is searched
+/// with a full window, so unlike inside [`MinimaxPlayer`]'s root loop no score is a mere pruning bound.
+pub fn root_move_scores<R, H>(game: &Game<R, 2>, heuristic: &H, depth: u32) -> Vec<(R::Move, f32)>
+where
+    R: GameRules<2>,
+    H: HeuristicEvaluator<R, 2>,
+{
+    let actor = game.current_player();
+    let mut calls = 0;
+    game.valid_moves()
+        .map(|mv| {
+            let next = game.apply(mv);
+            let score = negamax_ab(&next, heuristic, depth, f32::NEG_INFINITY, f32::INFINITY, &mut calls);
+            (mv, if next.current_player() == actor { score } else { -score })
+        })
+        .collect()
+}
+
 /// Recursive `N`-player `Max^n` evaluation (`N = 1` single-player lookahead, `N >= 3` multi-player).
 pub fn maxn_eval<R, const N: usize, H>(
     game: &Game<R, N>,

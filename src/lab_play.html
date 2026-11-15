@@ -44,12 +44,13 @@
       <h2><span>🎮 Play</span><span id="pl-status" style="font-size:0.8rem;color:var(--green)"></span></h2>
       <p class="hint" style="margin:0 0 6px;">
         Each side is you or an engine. Engines move on their own while ▶ is on; ⏭ makes one engine move.
-        The heat map shows how the searching engine sees each candidate move: its share of the search, the network's
-        prior (AlphaZero), or the win rate it measured. On your turns the analyst engine searches the position for the heat map.
+        Before an engine moves, the heat map shows what it thought of each candidate move: its share of the search,
+        the network's prior (AlphaZero) or the win rate it measured; Minimax shows its score for every move
+        (W/L = forced win/loss found).
       </p>
       <div class="pl-row">
         Game <select id="pl-game" onchange="plNewGame()"><option value="ttt">Tic-Tac-Toe</option><option value="uttt">Ultimate TTT</option></select>
-        <button class="btn" onclick="plNewGame()">New game</button>
+        <button class="btn" onclick="plNewGame()" title="Start the game over (keeps the players)">↺ Reset</button>
         <button class="btn secondary" onclick="plUndo()" title="Take back moves until it is a human's turn again">↶ Undo</button>
         <button class="btn secondary" id="pl-auto" onclick="plToggleAuto()" title="Engines move on their own">⏸</button>
         <button class="btn secondary" onclick="plStep()" title="One engine move">⏭</button>
@@ -62,7 +63,6 @@
         </span>
         <label title="Pause between engine moves">Delay <input type="number" id="pl-delay" value="600" min="0" step="100"> ms</label>
       </div>
-      <div class="pl-row pl-seat-row" title="Engine that analyses the position on your turns (for the heat map)"><span>Analyst</span><span class="pl-seat" id="pl-analyst" data-game="ttt"></span></div>
       <div id="pl-board" class="pl-board"></div>
     </div>
 
@@ -70,7 +70,7 @@
       <h2><span id="pl-title">Analysis</span><span id="pl-meta" style="font-size:0.75rem;color:var(--muted)"></span></h2>
       <div class="pl-winbar" id="pl-winbar"></div>
       <table>
-        <thead><tr><th style="text-align:left">Move</th><th>Search share</th><th>Visits</th><th>Prior</th><th>Win % (side to move)</th></tr></thead>
+        <thead id="pl-cands-head"></thead>
         <tbody id="pl-cands"></tbody>
       </table>
       <h3 class="knob-section" style="margin-top:14px;">X win probability over the game</h3>
@@ -96,7 +96,7 @@ const PL = {
   auto: true,
   stepOnce: false,
   busy: false,
-  token: 0,            // bumped by New game / Undo so stale replies are dropped
+  token: 0,            // bumped by Reset / Undo so stale replies are dropped
   seed: 1,
 };
 
@@ -163,7 +163,6 @@ function plNewGame() {
     PL.game = game;
     plRenderSeat('pl-seat-1', { kind: 'human' }, true);
     plRenderSeat('pl-seat-2', plDefaultAz(game), true);
-    plRenderSeat('pl-analyst', plDefaultAz(game), false);
   }
   PL.token++;
   PL.moves = [];
@@ -185,37 +184,38 @@ async function plRequest(engine, moves) {
   return data;
 }
 
-// Brings the current position up to date: fetches the board, lets the engine to move search (and
-// play when ▶ is on or ⏭ was pressed), or lets the analyst search a human's position for the heat map.
+// Shows the current position at once, then, if an engine is to move (and ▶ is on or ⏭ was
+// pressed), lets it search, shows its heat map for the delay, and plays its move.
 async function plTick() {
   const token = PL.token;
   const ply = PL.moves.length;
-  const spec = plSeat(1 + ply % 2);
-  const engineMoves = spec !== null && (PL.auto || PL.stepOnce);
-  const wantHeat = spec === null && PL.heat !== 'off' && !PL.analyses[ply];
-  const engine = engineMoves ? spec : wantHeat ? oppReadRow(document.getElementById('pl-analyst')) : null;
+  const mark = ply % 2 ? 'O' : 'X';
   PL.busy = true;
-  plSetStatus(engine ? `${engineMoves ? 'Thinking' : 'Analysing'}…` : '', 'var(--amber)');
-  let data;
   try {
-    data = await plRequest(engine, PL.moves);
-  } catch (e) {
-    if (token === PL.token) { PL.busy = false; plSetStatus('⚠ ' + e.message, 'var(--rose)'); }
-    return;
-  }
-  if (token !== PL.token) return;
-  PL.board = data.board;
-  if (data.analysis) PL.analyses[ply] = data.analysis;
-  PL.busy = false;
-  plRender();
-  if (engineMoves && data.analysis) {
+    const data = await plRequest(null, PL.moves);
+    if (token !== PL.token) return;
+    PL.board = data.board;
+    const spec = plSeat(1 + ply % 2);
+    if (data.board.result || spec === null || !(PL.auto || PL.stepOnce)) {
+      PL.busy = false;
+      plRender();
+      return;
+    }
     PL.stepOnce = false;
-    PL.busy = true;
+    plRender();
+    plSetStatus(`${mark} is thinking…`, 'var(--amber)');
+    const { analysis } = await plRequest(spec, PL.moves);
+    if (token !== PL.token) return;
+    PL.analyses[ply] = analysis;
+    plRender();
+    plSetStatus(`${mark} plays ${plCellName(analysis.chosen)}`, 'var(--amber)');
     await plSleep(parseInt(document.getElementById('pl-delay').value, 10) || 0);
     if (token !== PL.token) return;
+    PL.moves.push(analysis.chosen);
     PL.busy = false;
-    PL.moves.push(data.analysis.chosen);
     plTick();
+  } catch (e) {
+    if (token === PL.token) { PL.busy = false; plSetStatus('⚠ ' + e.message, 'var(--rose)'); }
   }
 }
 
@@ -247,7 +247,6 @@ function plStep() { if (!PL.busy) { PL.stepOnce = true; plTick(); } }
 
 function plSetHeat(heat) {
   PL.heat = heat;
-  if (!PL.busy && heat !== 'off') plTick();
   plRender();
 }
 
@@ -273,8 +272,20 @@ function plXWin(analysis, ply) {
   return ply % 2 === 0 ? p : 1 - p;
 }
 
-function plHeatCell(stat, total) {
+// Minimax scores mapped to 0..1 for colouring: proven wins 1, proven losses 0, the rest by rank of score.
+function plScoreScale(moves) {
+  const open = moves.filter(m => m.score != null && !m.proven).map(m => m.score);
+  const lo = Math.min(...open), hi = Math.max(...open);
+  return (m) => m.proven === 'win' ? 1 : m.proven === 'loss' ? 0 : hi > lo ? 0.1 + 0.8 * (m.score - lo) / (hi - lo) : 0.5;
+}
+
+function plHeatCell(stat, total, scoreScale) {
   if (!stat) return null;
+  if (stat.score != null) {  // Minimax: every mode shows its scores
+    const v = scoreScale(stat);
+    const label = stat.proven ? (stat.proven === 'win' ? 'W' : 'L') : (Math.abs(stat.score) < 10 ? stat.score.toFixed(1) : Math.round(stat.score));
+    return { bg: `hsla(${Math.round(120 * v)},70%,45%,0.85)`, label };
+  }
   const share = total ? stat.visits / total : 0;
   if (PL.heat === 'search') {
     return { bg: `rgba(56,189,248,${0.12 + 0.8 * Math.sqrt(share)})`, label: `${Math.round(share * 100)}%` };
@@ -299,7 +310,9 @@ function plRender() {
   const board = reviewing ? PL.viewBoard : PL.board;
   const analysis = PL.analyses[ply];
   plRenderBoard(board, analysis, ply);
-  plRenderAnalysis(analysis, ply, board);
+  // On a human's turn the panel keeps the engine's analysis of the move it just played.
+  const panelPly = analysis || ply === 0 ? ply : ply - 1;
+  plRenderAnalysis(PL.analyses[panelPly], panelPly, board);
   plRenderChart(ply);
   plRenderMoves(ply);
   if (!PL.busy && board) {
@@ -319,6 +332,7 @@ function plRenderBoard(board, analysis, ply) {
   el.style.gridTemplateColumns = `repeat(${blocksPerSide}, auto)`;
   const stats = new Map((analysis && PL.heat !== 'off' ? analysis.moves : []).map(m => [m.cell, m]));
   const total = analysis ? analysis.simulations : 0;
+  const scoreScale = plScoreScale(analysis ? analysis.moves : []);
   const legal = new Set(PL.view === null ? board.legal : []);
   const last = ply > 0 ? PL.moves[ply - 1] : -1;
   const best = analysis && PL.heat !== 'off' ? analysis.chosen : -1;
@@ -340,7 +354,7 @@ function plRenderBoard(board, analysis, ply) {
         if (owner) {
           content = `<span class="pl-sym ${owner === 1 ? 'x' : 'o'}">${owner === 1 ? 'X' : 'O'}</span>`;
         } else {
-          const heat = plHeatCell(stats.get(cell), total);
+          const heat = plHeatCell(stats.get(cell), total, scoreScale);
           if (heat) {
             style = `background:${heat.bg}`;
             content = `<span class="pl-heat">${heat.label}${heat.sub && n === 3 ? `<small>${heat.sub} visits</small>` : ''}</span>`;
@@ -367,10 +381,12 @@ function plRenderAnalysis(analysis, ply, board) {
   const meta = document.getElementById('pl-meta');
   const bar = document.getElementById('pl-winbar');
   const tbody = document.getElementById('pl-cands');
+  const head = document.getElementById('pl-cands-head');
   if (!analysis) {
     title.textContent = 'Analysis';
-    meta.textContent = board && board.result ? '' : (PL.heat === 'off' ? 'heat map off' : 'no analysis for this position yet');
+    meta.textContent = 'engines show their analysis here before they move';
     bar.innerHTML = '';
+    head.innerHTML = '';
     tbody.innerHTML = '';
     return;
   }
@@ -381,14 +397,22 @@ function plRenderAnalysis(analysis, ply, board) {
     : `<div style="width:${x * 100}%;background:var(--accent);color:#0b0f19">X ${Math.round(x * 100)}%</div>`
       + `<div style="width:${(1 - x) * 100}%;background:var(--rose);color:#0b0f19;justify-content:flex-end">O ${Math.round((1 - x) * 100)}%</div>`;
   const total = analysis.simulations;
+  const star = (m) => `<td style="text-align:left">${plCellName(m.cell)}${m.cell === analysis.chosen ? ' ⭐' : ''}</td>`;
+  const rowStyle = (m) => m.cell === analysis.chosen ? ' style="background:#1e293b"' : '';
+  if (analysis.moves.some(m => m.score != null)) {
+    head.innerHTML = '<tr><th style="text-align:left">Move</th><th>Minimax score (side to move)</th></tr>';
+    tbody.innerHTML = analysis.moves.slice(0, 10).map(m => `<tr${rowStyle(m)}>${star(m)}<td>`
+      + (m.proven ? `forced ${m.proven}` : m.score.toFixed(2)) + '</td></tr>').join('');
+    return;
+  }
+  head.innerHTML = '<tr><th style="text-align:left">Move</th><th>Search share</th><th>Visits</th><th>Prior</th><th>Win % (side to move)</th></tr>';
   tbody.innerHTML = analysis.moves.slice(0, 10).map(m => {
     const share = total ? m.visits / total : 0;
     const win = m.visits ? `${Math.round((m.q + 1) * 50)}%` : '—';
-    return `<tr${m.cell === analysis.chosen ? ' style="background:#1e293b"' : ''}>`
-      + `<td style="text-align:left">${plCellName(m.cell)}${m.cell === analysis.chosen ? ' ⭐' : ''}</td>`
+    return `<tr${rowStyle(m)}>${star(m)}`
       + `<td><div class="bar-wrap"><div class="bar-fill" style="width:${share * 100}%"></div></div>${(share * 100).toFixed(1)}%</td>`
       + `<td>${m.visits}</td><td>${m.prior == null ? '—' : (m.prior * 100).toFixed(1) + '%'}</td><td>${win}</td></tr>`;
-  }).join('') || '<tr><td colspan="5" class="hint" style="text-align:left">This engine reports only its move.</td></tr>';
+  }).join('') || '<tr><td colspan="5" class="hint" style="text-align:left">Random moves have no analysis.</td></tr>';
 }
 
 function plRenderChart(currentPly) {
