@@ -654,9 +654,8 @@ struct ModelContext<const G: usize, const P: usize, const N: usize> {
     play_networks: Arc<Mutex<Vec<(PlayNetworkKey, SharedService<G, P, N>)>>>,
 }
 
-/// A checkpoint file, the preset it is loaded as, and the file's modification time (a rewritten
-/// file is loaded again).
-type PlayNetworkKey = (String, String, Option<std::time::SystemTime>);
+/// A checkpoint file and its modification time (a rewritten file is loaded again).
+type PlayNetworkKey = (String, Option<std::time::SystemTime>);
 
 /// Play-tab networks kept per game (enough for both sides and the analyst).
 const PLAY_NETWORK_CACHE: usize = 4;
@@ -668,20 +667,16 @@ impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
 }
 
 impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
-    /// Network for a Play-tab AlphaZero engine: the live model, or a checkpoint file loaded with
-    /// the architecture preset it was trained with.
-    fn play_network<R: AlphaZeroGame<G, P, 2>>(&self, checkpoint: &str, net: &str) -> Result<Arc<NetService<G, P>>, String> {
+    /// Network for a Play-tab AlphaZero engine: the live model, or a checkpoint file (loaded with
+    /// the architecture recorded in it).
+    fn play_network<R: AlphaZeroGame<G, P, 2>>(&self, checkpoint: &str) -> Result<Arc<NetService<G, P>>, String> {
         if checkpoint.is_empty() || checkpoint == "live" {
             return Ok(Arc::clone(&self.live_service));
         }
-        let config = R::net_presets()
-            .into_iter()
-            .find(|(name, _)| *name == net)
-            .map(|(_, config)| config)
-            .ok_or_else(|| format!("unknown network preset '{net}'"))?;
         let file = checkpoints::sanitize_name(checkpoint).ok_or_else(|| format!("invalid checkpoint name '{checkpoint}'"))?;
-        let modified = std::fs::metadata(checkpoints::path(&file)).and_then(|m| m.modified()).ok();
-        let key: PlayNetworkKey = (file, net.to_string(), modified);
+        let path = checkpoints::path(&file);
+        let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let key: PlayNetworkKey = (file, modified);
 
         let mut cache = self.play_networks.lock().expect("play network cache poisoned");
         if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
@@ -690,12 +685,13 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
             cache.push(entry);
             return Ok(service);
         }
-        let evaluator = NetEvaluator::standalone(&config, &self.devices, Some(checkpoints::path(&key.0)))
-            .map_err(|e| format!("cannot load '{}' as a '{net}' network: {e}", key.0))?;
+        let config = checkpoints::net_config::<R, G, P, 2>(&path)?;
+        let evaluator = NetEvaluator::standalone(&config, &self.devices, Some(&path))
+            .map_err(|e| format!("cannot load '{}': {e}", key.0))?;
         let replicas = evaluator.num_replicas();
         let service = Arc::new(InferenceService::new(evaluator, 64, replicas));
         // Drop an older version of the same file, then the least recently used network.
-        cache.retain(|(k, _)| (&k.0, &k.1) != (&key.0, &key.1));
+        cache.retain(|(k, _)| k.0 != key.0);
         if cache.len() >= PLAY_NETWORK_CACHE {
             cache.remove(0);
         }
@@ -705,7 +701,26 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
 }
 
 impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
-    fn resolve_evaluator(&self, model_id: &str) -> Result<NetEvaluator<G, P, N>, String> {
+    /// Loads checkpoint `file` into the live network, if it has the live network's architecture.
+    fn load_into_live<R: AlphaZeroGame<G, P, N>>(&self, file: &str) -> Result<(), String> {
+        let path = checkpoints::path(file);
+        let config = checkpoints::net_config::<R, G, P, N>(&path)?;
+        if config != self.net_config {
+            return Err(format!(
+                "{file} holds a {} network, but the live network is a {} network",
+                checkpoints::preset_name::<R, G, P, N>(&config),
+                checkpoints::preset_name::<R, G, P, N>(&self.net_config)
+            ));
+        }
+        self.live_service.pause_inference();
+        let loaded = self.live_service.evaluator().load_safetensors(&path);
+        self.live_service.resume_inference();
+        loaded.map_err(|e| e.to_string())
+    }
+
+    /// Network for an arena engine: the live model, untrained weights of the live architecture,
+    /// or a checkpoint file (any architecture; it is recorded in the file).
+    fn resolve_evaluator<R: AlphaZeroGame<G, P, N>>(&self, model_id: &str) -> Result<NetEvaluator<G, P, N>, String> {
         let id = model_id.trim();
         if id.is_empty() || id == "live" {
             return Ok(self.live_service.evaluator().clone());
@@ -717,10 +732,8 @@ impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
         let safe_name = checkpoints::sanitize_name(id)
             .ok_or_else(|| format!("Invalid checkpoint filename: {id}"))?;
         let path = checkpoints::path(&safe_name);
-        if !path.exists() {
-            return Err(format!("Checkpoint file '{}' does not exist", path.display()));
-        }
-        NetEvaluator::standalone(&self.net_config, &self.devices, Some(&path))
+        let config = checkpoints::net_config::<R, G, P, N>(&path)?;
+        NetEvaluator::standalone(&config, &self.devices, Some(&path))
             .map_err(|e| format!("Failed to load '{safe_name}': {e}"))
     }
 }
@@ -1165,12 +1178,12 @@ impl TelemetryHub {
                         "Tic-Tac-Toe AlphaZero model context is not attached".to_string()
                     })?;
                     if a_is_az {
-                        let eval = ctx.resolve_evaluator(&cfg_a.model)?;
+                        let eval = ctx.resolve_evaluator::<TicTacToe>(&cfg_a.model)?;
                         let n_rep = eval.num_replicas();
                         svc_a = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
                     }
                     if b_is_az {
-                        let eval = ctx.resolve_evaluator(&cfg_b.model)?;
+                        let eval = ctx.resolve_evaluator::<TicTacToe>(&cfg_b.model)?;
                         let n_rep = eval.num_replicas();
                         svc_b = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
                     }
@@ -1216,12 +1229,12 @@ impl TelemetryHub {
                         "Ultimate Tic-Tac-Toe AlphaZero model context is not attached".to_string()
                     })?;
                     if a_is_az {
-                        let eval = ctx.resolve_evaluator(&cfg_a.model)?;
+                        let eval = ctx.resolve_evaluator::<UltimateTicTacToe>(&cfg_a.model)?;
                         let n_rep = eval.num_replicas();
                         svc_a = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
                     }
                     if b_is_az {
-                        let eval = ctx.resolve_evaluator(&cfg_b.model)?;
+                        let eval = ctx.resolve_evaluator::<UltimateTicTacToe>(&cfg_b.model)?;
                         let n_rep = eval.num_replicas();
                         svc_b = Some(Arc::new(InferenceService::new(eval, batch_cap, n_rep)));
                     }
@@ -1344,12 +1357,12 @@ impl TelemetryHub {
         let response = match LabGame::from_str_lossy(&req.game) {
             LabGame::Ttt => {
                 let ctx = ttt.ok_or_else(missing)?;
-                play::respond::<TicTacToe, 27, 9>(&req, |ckpt, net| ctx.play_network::<TicTacToe>(ckpt, net))?
+                play::respond::<TicTacToe, 27, 9>(&req, |ckpt| ctx.play_network::<TicTacToe>(ckpt))?
             }
             LabGame::Uttt => {
                 let ctx = uttt.ok_or_else(missing)?;
-                play::respond::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81>(&req, |ckpt, net| {
-                    ctx.play_network::<UltimateTicTacToe>(ckpt, net)
+                play::respond::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81>(&req, |ckpt| {
+                    ctx.play_network::<UltimateTicTacToe>(ckpt)
                 })?
             }
         };
@@ -1578,7 +1591,7 @@ fn calibrate_ttt(ctx: Option<&ModelContext<27, 9, 2>>) -> Result<CalibrationRepo
     let mcts_us_per_sim_4tree = (m4_res.choose_time_us[0].mean() / 200.0).max(0.05);
 
     let (az_1, az_4) = if let Some(c) = ctx {
-        let eval = c.resolve_evaluator("live")?;
+        let eval = c.resolve_evaluator::<TicTacToe>("live")?;
         let svc = InferenceService::new(eval, 32, 1);
         let svc_ref = &svc;
         let az_sims = 64usize;
@@ -1694,7 +1707,7 @@ fn calibrate_uttt(ctx: Option<&ModelContext<{ ultimate_ttt::INPUT_SIZE }, 81, 2>
     let mcts_us_per_sim_4tree = (m4_res.choose_time_us[0].mean() / 120.0).max(0.1);
 
     let (az_1, az_4) = if let Some(c) = ctx {
-        let eval = c.resolve_evaluator("live")?;
+        let eval = c.resolve_evaluator::<UltimateTicTacToe>("live")?;
         let svc = InferenceService::new(eval, 32, 1);
         let svc_ref = &svc;
         let az_sims = 32usize;
@@ -2323,7 +2336,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "{\"error\":\"No live TTT model attached\"}",
                             );
                         };
-                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename))
+                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename), &ctx.net_config)
                     }
                     LabGame::Uttt => {
                         let Some(ctx) = uttt_ctx else {
@@ -2334,7 +2347,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "{\"error\":\"No live UTTT model attached\"}",
                             );
                         };
-                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename))
+                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename), &ctx.net_config)
                     }
                 };
                 if let Err(e) = save_res {
@@ -2367,10 +2380,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "{\"error\":\"No live TTT model attached\"}",
                             );
                         };
-                        ctx.live_service.pause_inference();
-                        let r = ctx.live_service.evaluator().load_safetensors(checkpoints::path(&filename));
-                        ctx.live_service.resume_inference();
-                        r
+                        ctx.load_into_live::<TicTacToe>(&filename)
                     }
                     LabGame::Uttt => {
                         let Some(ctx) = uttt_ctx else {
@@ -2381,14 +2391,11 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "{\"error\":\"No live UTTT model attached\"}",
                             );
                         };
-                        ctx.live_service.pause_inference();
-                        let r = ctx.live_service.evaluator().load_safetensors(checkpoints::path(&filename));
-                        ctx.live_service.resume_inference();
-                        r
+                        ctx.load_into_live::<UltimateTicTacToe>(&filename)
                     }
                 };
                 if let Err(e) = load_res {
-                    let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e.to_string()));
+                    let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e));
                     return write_http_response(
                         &mut stream,
                         "500 Internal Server Error",

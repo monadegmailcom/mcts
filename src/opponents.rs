@@ -16,10 +16,11 @@ pub enum OpponentSpec {
     },
     /// Alpha-beta Minimax with the game's heuristic.
     Minimax { depth: u32 },
-    /// A saved network (`checkpoint` file, architecture preset `net`) searching `sims` per move with
-    /// one tree (matches run many games side by side, which already fills the network's batches).
+    /// A saved network (`checkpoint` file; its architecture is recorded in the file) searching
+    /// `sims` per move with one tree (matches run many games side by side, which already fills the
+    /// network's batches).
     #[serde(rename = "alphazero")]
-    AlphaZero { checkpoint: String, net: String, sims: usize },
+    AlphaZero { checkpoint: String, sims: usize },
 }
 
 const fn default_uct_c() -> f32 {
@@ -43,7 +44,7 @@ impl OpponentSpec {
         match self {
             Self::Mcts { sims, exploration } => Self::Mcts { sims: sims.clamp(1, 1_000_000), exploration: exploration.clamp(0.0, 10.0) },
             Self::Minimax { depth } => Self::Minimax { depth: depth.clamp(1, 12) },
-            Self::AlphaZero { checkpoint, net, sims } => Self::AlphaZero { checkpoint, net, sims: sims.clamp(1, 100_000) },
+            Self::AlphaZero { checkpoint, sims } => Self::AlphaZero { checkpoint, sims: sims.clamp(1, 100_000) },
             other => other,
         }
     }
@@ -70,7 +71,7 @@ mod tests {
             OpponentSpec::Random,
             OpponentSpec::Mcts { sims: 200, exploration: 1.414 },
             OpponentSpec::Minimax { depth: 2 },
-            OpponentSpec::AlphaZero { checkpoint: "uttt_exp4_block.safetensors".into(), net: "block".into(), sims: 100 },
+            OpponentSpec::AlphaZero { checkpoint: "uttt_exp4_block.safetensors".into(), sims: 100 },
         ];
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json[1]["kind"], "mcts");
@@ -80,5 +81,8 @@ mod tests {
         // Missing optional parameter falls back to its default.
         let m: OpponentSpec = serde_json::from_str(r#"{"kind":"mcts","sims":50}"#).unwrap();
         assert_eq!(m, OpponentSpec::Mcts { sims: 50, exploration: 1.414 });
+        // Lists saved while the architecture was still chosen by hand (`net`) still load.
+        let az: OpponentSpec = serde_json::from_str(r#"{"kind":"alphazero","checkpoint":"a.safetensors","net":"block","sims":50}"#).unwrap();
+        assert_eq!(az, OpponentSpec::AlphaZero { checkpoint: "a.safetensors".into(), sims: 50 });
     }
 }

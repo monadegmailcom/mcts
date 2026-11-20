@@ -205,12 +205,16 @@ impl<const G: usize, const P: usize, const N: usize> NetEvaluator<G, P, N> {
         }
     }
 
-    pub fn save_safetensors<Pth: AsRef<Path>>(&self, path: Pth) -> Result<()> {
+    /// Saves the weights to `path`, recording `net_config` (the architecture these weights belong
+    /// to) in the file's metadata.
+    pub fn save_safetensors<Pth: AsRef<Path>>(&self, path: Pth, net_config: &AlphaZeroNetConfig) -> Result<()> {
+        let path = path.as_ref();
         match self {
-            Self::Candle(e) => e.save_safetensors(path),
+            Self::Candle(e) => e.save_safetensors(path)?,
             #[cfg(feature = "tch")]
-            Self::Tch(e) => e.save_safetensors(path.as_ref()),
+            Self::Tch(e) => e.save_safetensors(path)?,
         }
+        crate::checkpoints::write_net_config(path, net_config).map_err(candle_core::Error::wrap)
     }
 
     pub fn load_safetensors<Pth: AsRef<Path>>(&self, path: Pth) -> Result<()> {

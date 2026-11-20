@@ -222,10 +222,10 @@ where
     let az_services: Vec<Result<Option<LabService<G, P>>, String>> = opponents
         .iter()
         .map(|o| match o {
-            OpponentSpec::AlphaZero { checkpoint, net, .. } => {
-                let cfg = S::net_presets().into_iter().find(|(n, _)| n == net).map(|(_, c)| c).ok_or(format!("unknown net '{net}'"))?;
-                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(checkpoints::path(checkpoint)))
-                    .map_err(|e| e.to_string())?;
+            OpponentSpec::AlphaZero { checkpoint, .. } => {
+                let path = checkpoints::path(checkpoint);
+                let cfg = checkpoints::net_config::<S, G, P, 2>(&path)?;
+                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(&path)).map_err(|e| e.to_string())?;
                 Ok(Some(InferenceService::new(ev, 256, 1)))
             }
             _ => Ok(None),
@@ -299,9 +299,16 @@ where
     let hp = spec.hp;
     let mut trainer = AlphaZeroTrainer::<G, P, 2>::new(cfg, hp.learning_rate, hp.weight_decay, dev)?;
     if !spec.init_checkpoint.is_empty() {
-        trainer
-            .load_checkpoint(checkpoints::path(&spec.init_checkpoint))
-            .map_err(|e| candle_core::Error::Msg(format!("cannot load '{}' into the {net_name} net: {e}", spec.init_checkpoint)))?;
+        let path = checkpoints::path(&spec.init_checkpoint);
+        let file_cfg = checkpoints::net_config::<S, G, P, 2>(&path).map_err(candle_core::Error::Msg)?;
+        if file_cfg != cfg {
+            return Err(candle_core::Error::Msg(format!(
+                "'{}' holds a {} network, but this run trains a {net_name} network",
+                spec.init_checkpoint,
+                checkpoints::preset_name::<S, G, P, 2>(&file_cfg)
+            )));
+        }
+        trainer.load_checkpoint(&path)?;
     }
     let service = trainer.build_inference_service(spec.infer_batch, &dev.replicas(1))?;
     let mut buffer = ReplayBuffer::<G, P, 2>::new(hp.buffer_capacity).with_symmetries(S::symmetries());
@@ -493,12 +500,17 @@ fn main() -> candle_core::Result<()> {
     )?;
     let uttt_live_file = checkpoints::path("uttt_alphazero.safetensors");
     if interactive_lab && uttt_live_file.exists() {
-        match uttt_trainer.load_checkpoint(&uttt_live_file) {
-            Ok(()) => println!("📦 Loaded existing UTTT checkpoint into live model: {}", uttt_live_file.display()),
-            Err(e) => println!(
-                "⚠️  Ignoring incompatible UTTT checkpoint {} (starting fresh): {}",
+        type Uttt = UltimateTicTacToe;
+        match checkpoints::net_config::<Uttt, { UTTT_INPUT_SIZE }, 81, 2>(&uttt_live_file) {
+            Ok(cfg) if cfg == uttt_net_cfg => {
+                uttt_trainer.load_checkpoint(&uttt_live_file)?;
+                println!("📦 Loaded existing UTTT checkpoint into live model: {}", uttt_live_file.display());
+            }
+            found => println!(
+                "⚠️  Not loading {} (starting fresh): it holds {}, the live UTTT network is a {} network",
                 uttt_live_file.display(),
-                e.to_string().lines().next().unwrap_or_default()
+                found.map_or_else(|e| e, |c| format!("a {} network", checkpoints::preset_name::<Uttt, { UTTT_INPUT_SIZE }, 81, 2>(&c))),
+                checkpoints::preset_name::<Uttt, { UTTT_INPUT_SIZE }, 81, 2>(&uttt_net_cfg)
             ),
         }
     }

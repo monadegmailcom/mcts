@@ -80,11 +80,12 @@ phase), an arena for matches between engines and checkpoints, and an
 **Experiments** tab that queues training runs from scratch (architecture, backend, device,
 hyperparameters, training-time budget) and plots their strength against fixed opponents per
 training minute and per self-play game. Results persist in `lab_experiments.json`. Checkpoints are kept in `checkpoints/` (or `$MCTS_CHECKPOINT_DIR`, e.g. a mounted
-volume in a container) and named `<game>_<name>.safetensors`.
+volume in a container) and named `<game>_<name>.safetensors`. Each records its network architecture in the safetensors
+metadata, so loading needs no architecture choice (older files are matched against the game's presets).
 
 Evaluation opponents are configurable on the training page and per experiment: random, classical
 MCTS (simulations, exploration constant), Minimax (depth) or a saved AlphaZero checkpoint
-(file, architecture, simulations). Training can continue from a saved network: **Load → Live** in
+(file, simulations). Training can continue from a saved network: **Load → Live** in
 the arena tab (training page), or *Start From* in an experiment. A checkpoint only loads into a
 network of the same architecture; it carries weights only (no replay buffer or optimizer state).
 

@@ -236,18 +236,18 @@ fn most_visited<M: Copy>(root: &[AggregatedRootChild<M>]) -> M {
     root.iter().max_by_key(|c| c.visits).expect("an ongoing game has a legal move").mv
 }
 
-/// Answers a Play request for game `R`. `network` resolves an AlphaZero engine's
-/// `(checkpoint, net preset)` to an inference service.
+/// Answers a Play request for game `R`. `network` resolves an AlphaZero engine's checkpoint
+/// (`"live"` or a file name) to an inference service.
 pub fn respond<R: PlayableGame<G, P>, const G: usize, const P: usize>(
     req: &PlayRequest,
-    network: impl FnOnce(&str, &str) -> Result<Arc<NetService<G, P>>, String>,
+    network: impl FnOnce(&str) -> Result<Arc<NetService<G, P>>, String>,
 ) -> Result<PlayResponse, String> {
     let game = replay::<R, G, P>(&req.moves)?;
     let analysis = match &req.engine {
         Some(engine) if game.status().is_ongoing() => {
             let engine = engine.clone().sanitized();
             let net = match &engine {
-                OpponentSpec::AlphaZero { checkpoint, net, .. } => Some(network(checkpoint, net)?),
+                OpponentSpec::AlphaZero { checkpoint, .. } => Some(network(checkpoint)?),
                 _ => None,
             };
             Some(analyse(&game, &engine, net.as_deref(), req.trees.clamp(1, 64), req.seed)?)

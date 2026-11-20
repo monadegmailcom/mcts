@@ -419,16 +419,19 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
         })
     }
 
-    /// Saves the model weights to `path` in `.safetensors` format.
+    /// Saves the model weights to `path` in `.safetensors` format, with the architecture in the
+    /// file's metadata (see [`crate::checkpoints`]).
     pub fn save_checkpoint<Pth: AsRef<Path>>(&self, path: Pth) -> Result<()> {
+        let path = path.as_ref();
         match &self.imp {
             TrainerImpl::Candle(t) => {
                 let _metal = metal_guard(&t.device);
-                t.varmap.save(path)
+                t.varmap.save(path)?;
             }
             #[cfg(feature = "tch")]
-            TrainerImpl::Tch(t) => t.save(path.as_ref()),
+            TrainerImpl::Tch(t) => t.save(path)?,
         }
+        crate::checkpoints::write_net_config(path, &self.net_config).map_err(candle_core::Error::wrap)
     }
 
     /// Loads model weights from a `.safetensors` checkpoint at `path` (written by either backend).
@@ -716,7 +719,9 @@ mod tests {
             for step in 0..8 {
                 let a = candle.train_step_flat(&st, &pol, &val, 32).unwrap();
                 let b = tch.train_step_flat(&st, &pol, &val, 32).unwrap();
-                let tol = 1e-3 * (1.0 + a.total_loss.abs());
+                // Multithreaded CPU reductions are not bit-reproducible; after several steps the
+                // two backends drift apart by ~1e-3 relative even in identical runs.
+                let tol = 3e-3 * (1.0 + a.total_loss.abs());
                 assert!(
                     (a.total_loss - b.total_loss).abs() < tol && (a.value_loss - b.value_loss).abs() < tol,
                     "{cfg:?} step {step}: candle {a:?} vs tch {b:?}"

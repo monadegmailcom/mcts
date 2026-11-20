@@ -148,8 +148,10 @@ pub fn discover_devices(max_workers: usize) -> Vec<Device> {
     all.iter().take(limit).cloned().collect()
 }
 
-/// Architecture configuration for [`AlphaZeroNet`].
-#[derive(Clone, Copy, Debug)]
+/// Architecture configuration for [`AlphaZeroNet`]. Checkpoints store it in their metadata
+/// (see [`crate::checkpoints`]).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AlphaZeroNetConfig {
     /// 2D Convolutional Residual Network (for spatial board games where
     /// `in_channels * board_height * board_width == G`).

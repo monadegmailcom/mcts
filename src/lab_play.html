@@ -115,10 +115,9 @@ async function playActivated() {
 }
 
 function plDefaultAz(game) {
-  const g = expData && expData.games[game];
   // Several root-parallel trees: their positions share one network batch, so they search more
   // in about the time of one tree.
-  return { kind: 'alphazero', checkpoint: 'live', net: g ? g.presets[0] : 'default', sims: game === 'uttt' ? 400 : 200, trees: 8 };
+  return { kind: 'alphazero', checkpoint: 'live', sims: game === 'uttt' ? 400 : 200, trees: 8 };
 }
 
 function plSeatHtml(spec, game, allowHuman) {
