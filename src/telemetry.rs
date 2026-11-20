@@ -816,7 +816,7 @@ impl TelemetryHub {
                 system: SystemSettings {
                     backend: Backend::Candle,
                     device: DeviceChoice::Gpu,
-                    infer_batch: 256,
+                    infer_batch: 512,
                     infer_workers: 1,
                 },
                 system_pending: false,

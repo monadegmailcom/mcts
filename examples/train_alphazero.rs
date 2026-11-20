@@ -421,9 +421,9 @@ fn main() -> candle_core::Result<()> {
     let mut system = SystemSettings {
         backend,
         device: DeviceChoice::Gpu,
-        // Large enough for all self-play games in flight: batch 64 left the GPU waiting (UTTT self-play
-        // ran 3.5x slower than with 256).
-        infer_batch: 256,
+        // A network call costs about the same for 16 or 256 positions (fixed per-call overhead), so
+        // batches should be as large as the games in flight allow: 512 serves up to 1024 games.
+        infer_batch: 512,
         infer_workers: 8,
     };
     let (train_device, infer_devices) = system.devices();

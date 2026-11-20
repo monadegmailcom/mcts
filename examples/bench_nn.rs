@@ -68,7 +68,7 @@ fn bench(net_name: &str, device: NnDevice, secs: f64) -> candle_core::Result<()>
     let mut rng = SmallRng::seed_from_u64(7);
     let mut line = format!("{:<16} {net_name:<8}", device.to_string());
 
-    for b in [64usize, 256, 1024] {
+    for b in [16usize, 64, 128, 256, 512, 1024] {
         let states: Vec<[f32; INPUT_SIZE]> = (0..b)
             .map(|_| std::array::from_fn(|_| if rng.random_bool(0.2) { 1.0 } else { 0.0 }))
             .collect();

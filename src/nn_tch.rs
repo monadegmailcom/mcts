@@ -455,13 +455,19 @@ impl TchEvaluator {
     /// Writes raw policy logits and values for `b` flat states (`states.len() == b * G`).
     pub fn evaluate_flat(&self, worker_id: usize, states: &[f32], b: usize, out_p: &mut [f32], out_v: &mut [f32]) {
         let (g, p, n) = self.dims;
-        let m = lock(&self.replicas[worker_id % self.replicas.len()]);
-        let _mps = mps_guard(m.device);
-        let _ng = tch::no_grad_guard();
-        let x = Tensor::from_slice(states).view([b as i64, g as i64]).to_device(m.device);
-        let (logits, v) = m.net.forward(&x);
-        logits.to_device(Device::Cpu).copy_data(out_p, b * p);
-        v.to_device(Device::Cpu).copy_data(out_v, b * n);
+        // Host-side copies happen outside the locks, so other users of this replica (or of the
+        // GPU) are only blocked while the device works.
+        let x = Tensor::from_slice(states).view([b as i64, g as i64]);
+        let (logits, v) = {
+            let m = lock(&self.replicas[worker_id % self.replicas.len()]);
+            let _mps = mps_guard(m.device);
+            let _ng = tch::no_grad_guard();
+            let (logits, v) = m.net.forward(&x.to_device(m.device));
+            // Device tensors are dropped before the guards (reverse declaration order).
+            (logits.to_device(Device::Cpu), v.to_device(Device::Cpu))
+        };
+        logits.copy_data(out_p, b * p);
+        v.copy_data(out_v, b * n);
     }
 }
 
