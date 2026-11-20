@@ -48,7 +48,7 @@
         score per move, W/L = forced win/loss). ⏭ plays that move; ▶ keeps playing with the delay between moves.
       </p>
       <div class="pl-row">
-        Game <select id="pl-game" onchange="plNewGame()"><option value="ttt">Tic-Tac-Toe</option><option value="uttt">Ultimate TTT</option></select>
+        Game <select id="pl-game" onchange="plNewGame()"><option value="uttt">Ultimate TTT</option><option value="ttt">Tic-Tac-Toe</option></select>
         <button class="btn" onclick="plNewGame()" title="Start the game over (keeps the players)">↺ Reset</button>
         <button class="btn secondary" onclick="plUndo()" title="Take back moves until it is a human's turn again">↶ Undo</button>
         <button class="btn secondary" id="pl-auto" onclick="plToggleAuto()" title="Play: engines move on their own">▶</button>
@@ -124,7 +124,7 @@ function plDefaultAz(game) {
 function plSeatHtml(spec, game, allowHuman) {
   const kinds = Object.entries(PL_SEAT_KINDS).filter(([k]) => allowHuman || k !== 'human')
     .map(([k, l]) => `<option value="${k}" ${k === spec.kind ? 'selected' : ''}>${l}</option>`).join('');
-  const params = spec.kind === 'human' ? '' : oppParamsHtml(spec, game, ['live']);
+  const params = spec.kind === 'human' ? '' : oppParamsHtml(spec, game, true);
   return `<select class="opp-kind" onchange="plSeatKindChanged(this)">${kinds}</select><span class="opp-params">${params}</span>`;
 }
 
@@ -176,10 +176,11 @@ function plNewGame() {
   plTick();
 }
 
-async function plRequest(engine, moves) {
+async function plRequest(spec, moves) {
+  const { trees, ...engine } = spec || {};
   const res = await fetch('/api/play', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ game: PL.game, moves, engine, seed: PL.seed + moves.length }),
+    body: JSON.stringify({ game: PL.game, moves, engine: spec ? engine : null, trees: trees || 1, seed: PL.seed + moves.length }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || res.statusText);

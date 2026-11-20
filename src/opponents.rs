@@ -16,25 +16,14 @@ pub enum OpponentSpec {
     },
     /// Alpha-beta Minimax with the game's heuristic.
     Minimax { depth: u32 },
-    /// A saved network (`checkpoint` file, architecture preset `net`) searching `sims` per move in
-    /// each of `trees` root-parallel trees, whose visit counts are summed to choose the move. More
-    /// trees search more without taking longer on a GPU: their positions are evaluated as one batch.
+    /// A saved network (`checkpoint` file, architecture preset `net`) searching `sims` per move with
+    /// one tree (matches run many games side by side, which already fills the network's batches).
     #[serde(rename = "alphazero")]
-    AlphaZero {
-        checkpoint: String,
-        net: String,
-        sims: usize,
-        #[serde(default = "one_tree")]
-        trees: usize,
-    },
+    AlphaZero { checkpoint: String, net: String, sims: usize },
 }
 
 const fn default_uct_c() -> f32 {
     1.414
-}
-
-const fn one_tree() -> usize {
-    1
 }
 
 impl OpponentSpec {
@@ -43,9 +32,8 @@ impl OpponentSpec {
             Self::Random => "Random".to_string(),
             Self::Mcts { sims, .. } => format!("MCTS-{sims} rollouts"),
             Self::Minimax { depth } => format!("Minimax d={depth}"),
-            Self::AlphaZero { checkpoint, sims, trees, .. } => {
-                let trees = if *trees > 1 { format!("×{trees}") } else { String::new() };
-                format!("AZ {} @{sims}{trees}", checkpoint.trim_end_matches(".safetensors"))
+            Self::AlphaZero { checkpoint, sims, .. } => {
+                format!("AZ {} @{sims}", checkpoint.trim_end_matches(".safetensors"))
             }
         }
     }
@@ -55,9 +43,7 @@ impl OpponentSpec {
         match self {
             Self::Mcts { sims, exploration } => Self::Mcts { sims: sims.clamp(1, 1_000_000), exploration: exploration.clamp(0.0, 10.0) },
             Self::Minimax { depth } => Self::Minimax { depth: depth.clamp(1, 12) },
-            Self::AlphaZero { checkpoint, net, sims, trees } => {
-                Self::AlphaZero { checkpoint, net, sims: sims.clamp(1, 100_000), trees: trees.clamp(1, 64) }
-            }
+            Self::AlphaZero { checkpoint, net, sims } => Self::AlphaZero { checkpoint, net, sims: sims.clamp(1, 100_000) },
             other => other,
         }
     }
@@ -84,17 +70,15 @@ mod tests {
             OpponentSpec::Random,
             OpponentSpec::Mcts { sims: 200, exploration: 1.414 },
             OpponentSpec::Minimax { depth: 2 },
-            OpponentSpec::AlphaZero { checkpoint: "uttt_exp4_block.safetensors".into(), net: "block".into(), sims: 100, trees: 8 },
+            OpponentSpec::AlphaZero { checkpoint: "uttt_exp4_block.safetensors".into(), net: "block".into(), sims: 100 },
         ];
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json[1]["kind"], "mcts");
         assert_eq!(json[3]["kind"], "alphazero");
         assert_eq!(parse_list(&json).unwrap(), list);
-        assert_eq!(list[3].label(), "AZ uttt_exp4_block @100×8");
+        assert_eq!(list[3].label(), "AZ uttt_exp4_block @100");
         // Missing optional parameter falls back to its default.
         let m: OpponentSpec = serde_json::from_str(r#"{"kind":"mcts","sims":50}"#).unwrap();
         assert_eq!(m, OpponentSpec::Mcts { sims: 50, exploration: 1.414 });
-        let az: OpponentSpec = serde_json::from_str(r#"{"kind":"alphazero","checkpoint":"a.safetensors","net":"block","sims":50}"#).unwrap();
-        assert!(matches!(az, OpponentSpec::AlphaZero { trees: 1, .. }), "saved specs without trees use one tree");
     }
 }

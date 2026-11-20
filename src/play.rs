@@ -58,8 +58,17 @@ pub struct PlayRequest {
     /// Engine to analyse the position with (`None`: board only).
     #[serde(default)]
     pub engine: Option<OpponentSpec>,
+    /// Root-parallel trees for an AlphaZero engine (`sims` each, visit counts summed). With one game
+    /// on the board, the trees' positions share the network batches, so more trees search more in
+    /// about the same time.
+    #[serde(default = "one_tree")]
+    pub trees: usize,
     #[serde(default)]
     pub seed: u64,
+}
+
+const fn one_tree() -> usize {
+    1
 }
 
 /// The position to draw.
@@ -140,11 +149,13 @@ pub fn board<R: PlayableGame<G, P>, const G: usize, const P: usize>(game: &Game<
     }
 }
 
-/// Lets `engine` search the (ongoing) `game`. `network` must be given for an AlphaZero engine.
+/// Lets `engine` search the (ongoing) `game`. `network` must be given for an AlphaZero engine,
+/// which searches with `trees` root-parallel trees.
 pub fn analyse<R: PlayableGame<G, P>, const G: usize, const P: usize>(
     game: &Game<R, 2>,
     engine: &OpponentSpec,
     network: Option<&NetService<G, P>>,
+    trees: usize,
     seed: u64,
 ) -> Result<Analysis, String> {
     let start = Instant::now();
@@ -180,15 +191,18 @@ pub fn analyse<R: PlayableGame<G, P>, const G: usize, const P: usize>(
             .evaluate_root();
             search_stats::<R, G, P>(&root, false)
         }
-        OpponentSpec::AlphaZero { sims, trees, .. } => {
+        OpponentSpec::AlphaZero { sims, .. } => {
             let network = network.ok_or("no network for the AlphaZero engine")?;
-            let config = AlphaZeroConfig::new(*trees, *sims, seed).with_dirichlet(0.3, 0.0);
+            let config = AlphaZeroConfig::new(trees, *sims, seed).with_dirichlet(0.3, 0.0);
             let root = AlphaZeroPlayer::new(game.clone(), network, config).evaluate_root();
             search_stats::<R, G, P>(&root, true)
         }
     };
     Ok(Analysis {
-        engine: engine.label(),
+        engine: match engine {
+            OpponentSpec::AlphaZero { .. } if trees > 1 => format!("{} ×{trees} trees", engine.label()),
+            _ => engine.label(),
+        },
         chosen: R::move_to_policy_index(chosen),
         simulations: moves.iter().map(|m| m.visits).sum(),
         moves,
@@ -236,7 +250,7 @@ pub fn respond<R: PlayableGame<G, P>, const G: usize, const P: usize>(
                 OpponentSpec::AlphaZero { checkpoint, net, .. } => Some(network(checkpoint, net)?),
                 _ => None,
             };
-            Some(analyse(&game, &engine, net.as_deref(), req.seed)?)
+            Some(analyse(&game, &engine, net.as_deref(), req.trees.clamp(1, 64), req.seed)?)
         }
         _ => None,
     };
@@ -270,14 +284,14 @@ mod tests {
     fn search_engines_report_heat_map_statistics() {
         let game = replay::<TicTacToe, 27, 9>(&[0, 4]).unwrap();
         let mcts = OpponentSpec::Mcts { sims: 400, exploration: 1.414 };
-        let a = analyse(&game, &mcts, None, 7).unwrap();
+        let a = analyse(&game, &mcts, None, 1, 7).unwrap();
         assert_eq!(a.moves.len(), 7);
         assert_eq!(a.simulations, a.moves.iter().map(|m| m.visits).sum::<u64>());
         assert_eq!(a.chosen, a.moves[0].cell, "plays the most visited move");
         assert!(a.moves.iter().all(|m| m.prior.is_none()));
         // Minimax scores every move; O must block X's diagonal 0-4-8 at cell 8 or lose.
         let game = replay::<TicTacToe, 27, 9>(&[0, 1, 4]).unwrap();
-        let a = analyse(&game, &OpponentSpec::Minimax { depth: 2 }, None, 7).unwrap();
+        let a = analyse(&game, &OpponentSpec::Minimax { depth: 2 }, None, 1, 7).unwrap();
         assert_eq!((a.chosen, a.moves.len(), a.value), (8, 6, None));
         assert_eq!(a.moves[0].cell, 8);
         assert!(a.moves[1..].iter().all(|m| m.proven == Some("loss")), "every other move loses");

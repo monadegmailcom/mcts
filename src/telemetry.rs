@@ -38,6 +38,7 @@ use crate::hyperparams::AlphaZeroHyperparams;
 use crate::checkpoints;
 use crate::opponents::{self, OpponentSpec};
 use crate::play::{self, NetService, PlayRequest, PlayableGame};
+use crate::utilization::UtilizationMonitor;
 use crate::inference::InferenceService;
 use crate::matchup::{RandomPlayer, run_multi_match, run_multi_match_with_openings};
 use crate::mcts::{Fpu, MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
@@ -774,6 +775,8 @@ struct HubInner {
     ttt_context: Option<ModelContext<27, 9, 2>>,
     uttt_context: Option<ModelContext<{ ultimate_ttt::INPUT_SIZE }, 81, 2>>,
     experiments: ExperimentStore,
+    /// CPU/GPU utilization, sampled while the HTTP server runs.
+    utilization: Option<Arc<UtilizationMonitor>>,
 }
 
 impl HubInner {
@@ -813,17 +816,18 @@ impl TelemetryHub {
                 system: SystemSettings {
                     backend: Backend::Candle,
                     device: DeviceChoice::Gpu,
-                    infer_batch: 64,
+                    infer_batch: 256,
                     infer_workers: 1,
                 },
                 system_pending: false,
-                active_game: LabGame::Ttt,
+                active_game: LabGame::Uttt,
                 // Auto-save is off by default (0); enable it in the Browser Lab when needed.
                 ttt_state: GameLabState::new(LabGame::Ttt, total_iterations, knobs, 0),
                 uttt_state: GameLabState::new(LabGame::Uttt, 30, uttt_knobs, 0),
                 ttt_context: None,
                 uttt_context: None,
                 experiments: ExperimentStore::in_memory(),
+                utilization: None,
             })),
         }
     }
@@ -897,6 +901,24 @@ impl TelemetryHub {
     pub fn set_phase(&self, iteration: usize, phase: impl Into<String>) {
         let game = self.active_game();
         self.set_phase_for(game, iteration, phase);
+    }
+
+    /// What the lab is doing right now, for the utilization samples.
+    fn current_activity(&self) -> &'static str {
+        let guard = self.inner.lock().expect("telemetry mutex poisoned");
+        if guard.experiments.is_running() {
+            return "experiment";
+        }
+        let phase = guard.state_for(guard.active_game).phase.to_ascii_lowercase();
+        if phase.contains("self-play") {
+            "self-play"
+        } else if phase.contains("sgd") {
+            "training"
+        } else if phase.contains("arena") {
+            "evaluation"
+        } else {
+            "idle"
+        }
     }
 
     pub fn set_phase_for(&self, game: LabGame, iteration: usize, phase: impl Into<String>) {
@@ -1287,6 +1309,7 @@ impl TelemetryHub {
                 "\"knobs\":{},",
                 "\"eval_opponents\":{},",
                 "\"models\":[{}],",
+                "\"utilization\":{},",
                 "\"calibration\":{},",
                 "\"history\":[{}],",
                 "\"matches\":[{}]",
@@ -1303,6 +1326,7 @@ impl TelemetryHub {
             st.knobs.to_json(),
             serde_json::to_string(&st.eval_opponents).unwrap_or_else(|_| "[]".into()),
             models_json,
+            guard.utilization.as_ref().map_or_else(|| "null".to_string(), |u| u.to_json().to_string()),
             cal_json,
             history_json,
             matches_json,
@@ -1375,6 +1399,10 @@ impl TelemetryHub {
         let listener = TcpListener::bind(addr)?;
         let bound_addr = listener.local_addr()?.to_string();
         let hub = self.clone();
+
+        let activity_hub = self.clone();
+        let monitor = UtilizationMonitor::start(move || activity_hub.current_activity());
+        self.inner.lock().expect("telemetry mutex poisoned").utilization = Some(monitor);
 
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -2983,8 +3011,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <p>Interactive Training Control • Tic-Tac-Toe & Ultimate Tic-Tac-Toe • Equal-Compute Match Calibration</p>
   </div>
   <div class="game-switcher">
-    <button id="game-btn-ttt" class="game-btn active" onclick="switchActiveGame('ttt')">🎯 Tic-Tac-Toe (3x3)</button>
-    <button id="game-btn-uttt" class="game-btn" onclick="switchActiveGame('uttt')">⚔️ Ultimate Tic-Tac-Toe (9x9)</button>
+    <button id="game-btn-uttt" class="game-btn active" onclick="switchActiveGame('uttt')">⚔️ Ultimate Tic-Tac-Toe (9x9)</button>
+    <button id="game-btn-ttt" class="game-btn" onclick="switchActiveGame('ttt')">🎯 Tic-Tac-Toe (3x3)</button>
   </div>
   <div class="badges">
     <span class="badge" id="device-badge">Device: ...</span>
@@ -3022,59 +3050,22 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div class="grid">
     <div class="card">
       <h2>
-        <span>1. Arena Win + 0.5×Draw Rate (%)</span>
+        <span>Arena score (%)</span>
         <span id="latest-wdl" style="font-size:0.78rem;color:var(--green)">—</span>
       </h2>
-      <p class="hint" id="arena-chart-hint">Score (wins + ½ draws) in % against the evaluation opponents configured below.</p>
+      <p class="hint" id="arena-chart-hint">Wins + ½ draws in % against each evaluation opponent configured below, measured after every iteration. The one number that says whether the network gets stronger.</p>
       <canvas id="chart-arena" width="600" height="205"></canvas>
       <div class="legend" id="arena-legend"></div>
     </div>
 
-    <div class="card">
-      <h2>
-        <span>2. Policy KL Divergence & Root Entropy</span>
-        <span id="latest-kl" style="font-size:0.78rem;color:var(--accent)">—</span>
-      </h2>
-      <p class="hint">KL(π_MCTS || p_NN) has a true 0.0 floor. Root Entropy H(π) tracks exploration sharpness.</p>
-      <canvas id="chart-policy" width="600" height="205"></canvas>
-      <div class="legend">
-        <span style="color:#38bdf8">Policy KL (→ 0)</span>
-        <span style="color:#a78bfa">Root MCTS Entropy H(π)</span>
-        <span style="color:#fb7185">Total Loss</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>
-        <span>3. Value MSE & Game Length (Moves)</span>
-        <span id="latest-val" style="font-size:0.78rem;color:var(--rose)">—</span>
-      </h2>
-      <p class="hint">Value MSE < 0.05 prevents premature collapse; rising game length shows deeper defense.</p>
-      <canvas id="chart-value" width="600" height="205"></canvas>
-      <div class="legend">
-        <span style="color:#fb7185">Value MSE (left)</span>
-        <span style="color:#34d399">Avg Game Moves / 10 (right)</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>
-        <span>4. System Queue, Batch Fill & Intra-Batch Dedup</span>
-        <span id="latest-sys" style="font-size:0.78rem;color:var(--amber)">—</span>
-      </h2>
-      <p class="hint">Logical batch vs Unique NN evaluations after intra-batch state deduplication.</p>
-      <canvas id="chart-sys" width="600" height="205"></canvas>
-      <div class="legend">
-        <span style="color:#fbbf24">Logical Batch</span>
-        <span style="color:#a78bfa">Unique NN Batch</span>
-        <span style="color:#38bdf8">Dedup Saved (%)</span>
-      </div>
-    </div>
   </div>
+
+  <!-- One card per metric (built by buildMetricCards), so every chart gets its own y-axis scale. -->
+  <div class="grid" id="metric-cards" style="margin-top:14px;"></div>
 
   <div class="card" style="margin-top:14px;">
     <h2>
-      <span>🎛️ Live Hyperparameter Knobs (<span id="knobs-game-label">Tic-Tac-Toe</span> — Applied on Next Iteration)</span>
+      <span>🎛️ Live Hyperparameter Knobs (<span id="knobs-game-label">Ultimate Tic-Tac-Toe</span> — Applied on Next Iteration)</span>
       <button class="btn" onclick="pushKnobs()">Apply Knobs</button>
     </h2>
     <h3 class="knob-section">Self-Play</h3>
@@ -3533,7 +3524,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <!-- TAB 3: INTERACTIVE PLAY & MCTS/NN INSPECTOR -->
 <script>
 let stateData = null;
-let activeGame = 'ttt';
+let activeGame = 'uttt';
 let knobsInitializedForGame = null;
 let systemInitialized = false;
 let modelsSignature = '';
@@ -3717,7 +3708,7 @@ async function fetchState() {
 }
 
 function renderDashboard(d) {
-  activeGame = d.active_game || 'ttt';
+  activeGame = d.active_game || 'uttt';
   const title = d.active_game_title || (activeGame === 'uttt' ? 'Ultimate Tic-Tac-Toe (9x9)' : 'Tic-Tac-Toe (3x3)');
 
   document.getElementById('game-btn-ttt').classList.toggle('active', activeGame === 'ttt');
@@ -3785,16 +3776,12 @@ function renderDashboard(d) {
   renderCalibration(d.calibration);
   renderMatches(d.matches || []);
 
+  renderUtilization(d.utilization);
   const h = d.history || [];
   if (!h.length) {
     document.getElementById('latest-wdl').textContent = '—';
-    document.getElementById('latest-kl').textContent = '—';
-    document.getElementById('latest-val').textContent = '—';
-    document.getElementById('latest-sys').textContent = '—';
     clearCanvas('chart-arena');
-    clearCanvas('chart-policy');
-    clearCanvas('chart-value');
-    clearCanvas('chart-sys');
+    renderMetricCards([]);
     return;
   }
   const last = h[h.length - 1];
@@ -3805,12 +3792,6 @@ function renderDashboard(d) {
   const lastArena = last.arena[last.arena.length - 1];
   document.getElementById('latest-wdl').textContent = lastArena
     ? `vs ${lastArena.label}: ${lastArena.wdl[0]}W-${lastArena.wdl[1]}D-${lastArena.wdl[2]}L` : '—';
-  document.getElementById('latest-kl').textContent =
-    `KL=${last.policy_kl.toFixed(4)} | H=${last.root_entropy_mean.toFixed(2)}`;
-  document.getElementById('latest-val').textContent =
-    `MSE=${last.value_loss.toFixed(4)} | Moves=${last.game_moves_mean.toFixed(1)}`;
-  document.getElementById('latest-sys').textContent =
-    `Batch=${last.batch_size_mean.toFixed(1)} → Uniq=${last.unique_batch_mean.toFixed(1)} (Saved ${last.dedup_saved_pct.toFixed(1)}%) | ${Math.round(last.simulations_per_sec)} sims/s`;
 
   // One line per opponent label seen in the history (opponents can change between iterations).
   const ARENA_COLORS = ['#34d399', '#38bdf8', '#fbbf24', '#fb7185', '#a78bfa', '#f472b6', '#22d3ee', '#a3e635'];
@@ -3822,22 +3803,88 @@ function renderDashboard(d) {
   document.getElementById('arena-legend').innerHTML = arenaLabels
     .map((l, i) => `<span style="color:${ARENA_COLORS[i % ARENA_COLORS.length]}">vs ${l}</span>`).join('');
 
-  drawChart('chart-policy', h.map(x => x.iteration), [
-    { data: h.map(x => x.policy_kl), color: '#38bdf8' },
-    { data: h.map(x => x.root_entropy_mean), color: '#a78bfa' },
-    { data: h.map(x => x.total_loss), color: '#fb7185' },
-  ]);
+  renderMetricCards(h);
+}
 
-  drawChart('chart-value', h.map(x => x.iteration), [
-    { data: h.map(x => x.value_loss), color: '#fb7185' },
-    { data: h.map(x => x.game_moves_mean / 10.0), color: '#34d399' },
-  ]);
+// Training-tab charts, one per metric so each has its own y-axis scale.
+// series: [label, color, value of an iteration record]; latest: text for the newest record.
+const METRIC_CARDS = [
+  { id: 'kl', title: 'Policy KL divergence', latest: x => x.policy_kl.toFixed(3),
+    hint: 'How far the network\'s move probabilities are from the search\'s visit counts, KL(π_search ‖ p_net), on the training batches. Lower = the network already predicts what search finds. It drops quickly at first and then levels off; a sudden rise means search keeps finding moves the network does not expect.',
+    series: [['KL', '#38bdf8', x => x.policy_kl]] },
+  { id: 'value', title: 'Value loss (MSE)', latest: x => x.value_loss.toFixed(3),
+    hint: 'Squared error of the network\'s outcome prediction against the value targets (game result, blended with the search value by qw). It falls as the network learns who is winning, but never reaches 0: early positions are genuinely uncertain.',
+    series: [['MSE', '#fb7185', x => x.value_loss]] },
+  { id: 'entropy', title: 'Search decisiveness (root entropy)', latest: x => x.root_entropy_mean.toFixed(2),
+    hint: 'Entropy of the visit distribution at the root, averaged over self-play moves. High = search spreads its visits over many moves, low = it settles on few. Falls as the network gets confident; the root noise keeps it from reaching 0.',
+    series: [['H(π)', '#a78bfa', x => x.root_entropy_mean]] },
+  { id: 'loss', title: 'Total training loss', latest: x => x.total_loss.toFixed(3),
+    hint: 'Policy cross-entropy + value MSE, the quantity SGD minimises. The policy part includes the entropy of the search targets themselves, so it cannot fall below that; use KL and value loss to judge learning.',
+    series: [['loss', '#f472b6', x => x.total_loss]] },
+  { id: 'moves', title: 'Self-play game length (moves)', latest: x => x.game_moves_mean.toFixed(1),
+    hint: 'Average length of the self-play games. Changes when play style changes: longer games usually mean both sides defend better.',
+    series: [['moves', '#34d399', x => x.game_moves_mean]] },
+  { id: 'speed', title: 'Self-play speed (simulations / s)', latest: x => Math.round(x.simulations_per_sec).toLocaleString(),
+    hint: 'Search simulations per second during self-play, the throughput of CPU tree search and GPU network evaluation together.',
+    series: [['sims/s', '#fbbf24', x => x.simulations_per_sec]] },
+  { id: 'batch', title: 'Network batch fill', latest: x => `${x.batch_size_mean.toFixed(1)} of ${x.max_batch_size}`,
+    hint: 'Average number of positions per network evaluation during self-play, out of the configured maximum batch. A full batch keeps the GPU efficient; a low fill means the CPU search threads cannot supply positions fast enough.',
+    series: [['positions', '#22d3ee', x => x.batch_size_mean]], min: 0, max: h => Math.max(...h.map(x => x.max_batch_size)) },
+  { id: 'time', title: 'Iteration time (s)', latest: x => `${((x.self_play_ms + x.train_ms + x.eval_ms) / 1000).toFixed(1)} s`,
+    hint: 'Where each iteration spends its time: self-play (CPU search + GPU evaluation), SGD training (GPU) and the arena evaluation.',
+    series: [['self-play', '#38bdf8', x => x.self_play_ms / 1000], ['training', '#fb7185', x => x.train_ms / 1000], ['evaluation', '#a78bfa', x => x.eval_ms / 1000]], min: 0 },
+];
 
-  drawChart('chart-sys', h.map(x => x.iteration), [
-    { data: h.map(x => x.batch_size_mean), color: '#fbbf24' },
-    { data: h.map(x => x.unique_batch_mean), color: '#a78bfa' },
-    { data: h.map(x => x.dedup_saved_pct), color: '#38bdf8' },
-  ], 0, Math.max(100, last.max_batch_size));
+function buildMetricCards() {
+  const grid = document.getElementById('metric-cards');
+  if (grid.childElementCount) return;
+  grid.innerHTML = `
+    <div class="card">
+      <h2><span>CPU &amp; GPU utilization (live, last 5 min)</span><span id="latest-util" style="font-size:0.78rem;color:var(--green)">—</span></h2>
+      <p class="hint">CPU: this process's CPU time as % of all <span id="util-cores">?</span> cores. GPU: device busy % reported by the OS
+        (<span id="util-gpu-src">n/a</span>; other programs count too). Sampled every second and tagged with what the lab was doing.</p>
+      <canvas id="chart-util" width="600" height="170"></canvas>
+      <div class="legend"><span style="color:#34d399">CPU %</span><span style="color:#fbbf24">GPU %</span></div>
+      <table style="margin-top:6px"><thead><tr><th style="text-align:left">Average while</th><th>samples</th><th>CPU</th><th>GPU</th></tr></thead>
+        <tbody id="util-by-activity"></tbody></table>
+    </div>` + METRIC_CARDS.map(c => `
+    <div class="card">
+      <h2><span>${c.title}</span><span id="latest-${c.id}" style="font-size:0.78rem;color:${c.series[0][1]}">—</span></h2>
+      <p class="hint">${c.hint}</p>
+      <canvas id="chart-${c.id}" width="600" height="170"></canvas>
+      ${c.series.length > 1 ? `<div class="legend">${c.series.map(([l, col]) => `<span style="color:${col}">${l}</span>`).join('')}</div>` : ''}
+    </div>`).join('');
+}
+
+function renderUtilization(u) {
+  buildMetricCards();
+  const samples = (u && u.samples) || [];
+  document.getElementById('util-cores').textContent = u ? u.cores : '?';
+  document.getElementById('util-gpu-src').textContent = u && u.gpu_source ? u.gpu_source : 'not available';
+  if (!samples.length) { clearCanvas('chart-util'); return; }
+  const last = samples[samples.length - 1];
+  document.getElementById('latest-util').textContent =
+    `CPU ${last.cpu.toFixed(0)}%` + (last.gpu == null ? '' : ` · GPU ${last.gpu.toFixed(0)}%`) + ` · ${last.activity}`;
+  drawChart('chart-util', samples.map(x => x.t), [
+    { data: samples.map(x => x.cpu), color: '#34d399' },
+    { data: samples.map(x => x.gpu == null ? NaN : x.gpu), color: '#fbbf24' },
+  ], 0, 100);
+  const groups = {};
+  for (const x of samples) (groups[x.activity] = groups[x.activity] || []).push(x);
+  const avg = (xs, f) => { const v = xs.map(f).filter(Number.isFinite); return v.length ? `${(v.reduce((a, b) => a + b, 0) / v.length).toFixed(0)}%` : '—'; };
+  document.getElementById('util-by-activity').innerHTML = ['self-play', 'training', 'evaluation', 'experiment', 'idle']
+    .filter(a => groups[a]).map(a => `<tr><td style="text-align:left">${a}</td><td>${groups[a].length}</td>`
+      + `<td>${avg(groups[a], x => x.cpu)}</td><td>${avg(groups[a], x => x.gpu == null ? NaN : x.gpu)}</td></tr>`).join('');
+}
+
+function renderMetricCards(h) {
+  buildMetricCards();
+  for (const c of METRIC_CARDS) {
+    document.getElementById(`latest-${c.id}`).textContent = h.length ? c.latest(h[h.length - 1]) : '—';
+    if (!h.length) { clearCanvas(`chart-${c.id}`); continue; }
+    drawChart(`chart-${c.id}`, h.map(x => x.iteration), c.series.map(([, color, f]) => ({ data: h.map(f), color })),
+      c.min, typeof c.max === 'function' ? c.max(h) : c.max);
+  }
 }
 
 function clearCanvas(id) {
@@ -4258,7 +4305,7 @@ function drawChart(canvasId, xs, series, fixedMin, fixedMax) {
     ctx.moveTo(padL, y);
     ctx.lineTo(W - padR, y);
     ctx.stroke();
-    ctx.fillText(val.toFixed(2), 4, y + 4);
+    ctx.fillText(Math.abs(maxY) >= 1000 ? `${(val / 1000).toFixed(maxY >= 10000 ? 0 : 1)}k` : val.toFixed(maxY >= 10 ? 1 : 2), 4, y + 4);
   }
 
   series.forEach(s => {
@@ -4323,7 +4370,7 @@ mod tests {
         assert!((prior_sum - 1.0).abs() < 1e-4, "priors must sum to 1, got {prior_sum}");
         assert_ne!(v["analysis"]["chosen"], 4, "the engine plays a free cell");
         let root_sims = |v: &serde_json::Value| v["analysis"]["simulations"].as_u64().unwrap();
-        let body = body.replace(r#""sims":32}"#, r#""sims":32,"trees":4}"#);
+        let body = body.replace(r#""seed":3,"#, r#""seed":3,"trees":4,"#);
         let four: serde_json::Value = serde_json::from_str(&hub.play_json(&body).unwrap()).unwrap();
         assert!(root_sims(&four) > 3 * root_sims(&v), "four trees search about four times as much");
         assert!(hub.play_json(r#"{"game":"ttt","moves":[4,4]}"#).is_err(), "illegal move");

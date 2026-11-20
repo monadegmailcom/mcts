@@ -27,3 +27,4 @@ pub mod statistics;
 pub mod telemetry;
 pub mod training;
 pub mod tree;
+pub mod utilization;

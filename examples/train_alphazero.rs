@@ -266,10 +266,10 @@ where
                     MctsConfig::new(*sims, seed).with_arena_capacity(sims * 16),
                 )),
                 OpponentSpec::Minimax { depth } => Box::new(MinimaxPlayer::new(g.clone(), h, *depth, seed)),
-                OpponentSpec::AlphaZero { sims, trees, .. } => Box::new(AlphaZeroPlayer::new(
+                OpponentSpec::AlphaZero { sims, .. } => Box::new(AlphaZeroPlayer::new(
                     g.clone(),
                     svc.expect("opponent network loaded above"),
-                    AlphaZeroConfig::new(*trees, *sims, seed).with_dirichlet(0.3, 0.0),
+                    AlphaZeroConfig::new(1, *sims, seed).with_dirichlet(0.3, 0.0),
                 )),
             }
         };
@@ -421,7 +421,9 @@ fn main() -> candle_core::Result<()> {
     let mut system = SystemSettings {
         backend,
         device: DeviceChoice::Gpu,
-        infer_batch: 64,
+        // Large enough for all self-play games in flight: batch 64 left the GPU waiting (UTTT self-play
+        // ran 3.5x slower than with 256).
+        infer_batch: 256,
         infer_workers: 8,
     };
     let (train_device, infer_devices) = system.devices();

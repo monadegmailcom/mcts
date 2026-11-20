@@ -1044,6 +1044,7 @@ dependencies = [
  "candle-nn",
  "crossbeam-queue",
  "crossbeam-utils",
+ "libc",
  "rand 0.10.3",
  "rand_distr 0.6.0",
  "serde",

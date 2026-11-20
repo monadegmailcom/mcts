@@ -361,13 +361,14 @@ function oppDefaults(kind, game) {
   switch (kind) {
     case 'mcts': return { kind, sims: 200, exploration: 1.414 };
     case 'minimax': return { kind, depth: 2 };
-    case 'alphazero': return { kind, checkpoint: g && g.checkpoints[0] || '', net: g && g.presets[0] || 'default', sims: 100, trees: 1 };
+    case 'alphazero': return { kind, checkpoint: g && g.checkpoints[0] || '', net: g && g.presets[0] || 'default', sims: 100 };
     default: return { kind: 'random' };
   }
 }
 
-// `extraCheckpoints` are offered before the saved files (the Play tab adds the live network).
-function oppParamsHtml(o, game, extraCheckpoints = []) {
+// The Play tab passes `play`: it offers the live network and root-parallel trees for AlphaZero.
+function oppParamsHtml(o, game, play = false) {
+  const extraCheckpoints = play ? ['live'] : [];
   const g = expData && expData.games[game];
   const num = (cls, label, v, step, title) =>
     `<label class="opp-field" title="${title}">${label} <input type="number" class="${cls}" value="${v}" step="${step}" min="0"></label>`;
@@ -384,8 +385,8 @@ function oppParamsHtml(o, game, extraCheckpoints = []) {
       const nets = (g ? g.presets : [o.net]).map(n => `<option ${n === o.net ? 'selected' : ''}>${n}</option>`).join('');
       return `<label class="opp-field" title="Saved .safetensors network (checkpoints/ folder)">file <select class="opp-ckpt">${opts || '<option value="">(no checkpoints)</option>'}</select></label>`
         + `<label class="opp-field" title="Architecture the checkpoint was trained with">net <select class="opp-net">${nets}</select></label>`
-        + num('opp-sims', 'sims', o.sims, 25, 'PUCT simulations per move in each tree')
-        + num('opp-trees', 'trees', o.trees || 1, 1, 'Root-parallel trees: each searches sims simulations, their visit counts are summed to choose the move. On a GPU more trees cost little extra time (one batch).');
+        + num('opp-sims', 'sims', o.sims, 25, play ? 'PUCT simulations per move in each tree' : 'PUCT simulations per move')
+        + (play ? num('opp-trees', 'trees', o.trees || 1, 1, 'Root-parallel trees: each searches sims simulations, their visit counts are summed to choose the move. With one game on the board their positions share the network batches, so more trees cost little extra time.') : '');
     }
     default: return '<span class="hint">uniformly random legal moves</span>';
   }
@@ -429,7 +430,11 @@ function oppReadRow(row) {
   switch (kind) {
     case 'mcts': return { kind, sims: parseInt(v('opp-sims').value, 10) || 200, exploration: parseFloat(v('opp-c').value) || 1.414 };
     case 'minimax': return { kind, depth: parseInt(v('opp-depth').value, 10) || 1 };
-    case 'alphazero': return { kind, checkpoint: v('opp-ckpt').value, net: v('opp-net').value, sims: parseInt(v('opp-sims').value, 10) || 100, trees: parseInt(v('opp-trees').value, 10) || 1 };
+    case 'alphazero': {
+      const spec = { kind, checkpoint: v('opp-ckpt').value, net: v('opp-net').value, sims: parseInt(v('opp-sims').value, 10) || 100 };
+      if (v('opp-trees')) spec.trees = parseInt(v('opp-trees').value, 10) || 1;
+      return spec;
+    }
     default: return { kind };
   }
 }

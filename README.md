@@ -75,7 +75,8 @@ Throughput comparison: `cargo run --release --features metal,tch --example bench
 ## Browser Lab
 
 `./start_lab.sh [--metal|--cuda] [--tch]` serves the lab at <http://127.0.0.1:8080>: live training
-with all hyperparameters as knobs, an arena for matches between engines and checkpoints, and an
+with all hyperparameters as knobs (one chart per training metric, plus live CPU/GPU utilization per
+phase), an arena for matches between engines and checkpoints, and an
 **Experiments** tab that queues training runs from scratch (architecture, backend, device,
 hyperparameters, training-time budget) and plots their strength against fixed opponents per
 training minute and per self-play game. Results persist in `lab_experiments.json`. Checkpoints are kept in `checkpoints/` (or `$MCTS_CHECKPOINT_DIR`, e.g. a mounted
@@ -83,7 +84,7 @@ volume in a container) and named `<game>_<name>.safetensors`.
 
 Evaluation opponents are configurable on the training page and per experiment: random, classical
 MCTS (simulations, exploration constant), Minimax (depth) or a saved AlphaZero checkpoint
-(file, architecture, simulations, root-parallel trees). Training can continue from a saved network: **Load → Live** in
+(file, architecture, simulations). Training can continue from a saved network: **Load → Live** in
 the arena tab (training page), or *Start From* in an experiment. A checkpoint only loads into a
 network of the same architecture; it carries weights only (no replay buffer or optimizer state).
 
