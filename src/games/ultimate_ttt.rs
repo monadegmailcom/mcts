@@ -576,18 +576,19 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 2> for UltimateTicTacToe {
         Symmetry::dihedral_grid(INPUT_PLANES, 9)
     }
 
-    /// Many cheap games per iteration (value learning is limited by the number of distinct games),
-    /// enough SGD steps to see each new position ~4 times (`256 games * ~50 positions * 4 / 256`),
-    /// a replay buffer holding ~6k games, and a value target blended with the search value
-    /// (`qw = 0.5`, meant to damp the noise of early, near-random game outcomes; compare against
-    /// `qw = 0` in the Experiments tab before relying on it).
+    /// Many cheap games per iteration: 1024 games keep the network batches full (self-play ~1.7x
+    /// faster than with 256 on the dev Mac) and in a 15-minute comparison learned faster per
+    /// minute and at least as well per game. Enough SGD steps to see each new position ~4 times
+    /// (`1024 games * ~50 positions * 4 / 256`), a replay buffer holding ~6k games, and a value
+    /// target blended with the search value (`qw = 0.5`, meant to damp the noise of early,
+    /// near-random game outcomes; compare against `qw = 0` in the Experiments tab before relying on it).
     fn hyperparams() -> AlphaZeroHyperparams {
         AlphaZeroHyperparams {
-            games_per_iteration: 256,
+            games_per_iteration: 1024,
             simulations_per_move: 64,
             opening_moves: 8,
             value_q_weight: 0.5,
-            train_steps: 200,
+            train_steps: 800,
             batch_size: 256,
             learning_rate: 2.0e-3,
             buffer_capacity: 300_000,
