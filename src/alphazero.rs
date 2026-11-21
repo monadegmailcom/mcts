@@ -540,6 +540,11 @@ pub struct SelfPlayConfig {
     pub value_q_weight: f32,
     /// How `value_q_weight` varies over the positions of a game (default: constant).
     pub value_q_schedule: ValueQSchedule,
+    /// Per-move discount `γ` (default `1.0`: none). The search discounts backed-up values by `γ`
+    /// per move, and a position `k` moves before the end of its episode gets `γ^k × outcome` as
+    /// value target. For puzzles (solved `1`, failed `0`) the network then learns
+    /// `γ^(moves to solved)`, an estimate of the distance to the solution.
+    pub discount: f32,
     /// Deterministic base seed.
     pub seed: u64,
 }
@@ -559,8 +564,14 @@ impl SelfPlayConfig {
             arena_capacity: 0,
             value_q_weight: 0.0,
             value_q_schedule: ValueQSchedule::Constant,
+            discount: 1.0,
             seed,
         }
+    }
+
+    pub const fn with_discount(mut self, discount: f32) -> Self {
+        self.discount = discount;
+        self
     }
 
     pub const fn with_value_q_weight(mut self, weight: f32) -> Self {
@@ -620,6 +631,10 @@ impl SelfPlayConfig {
 #[derive(Clone, Debug)]
 pub struct SelfPlayResult<const G: usize, const P: usize, const N: usize> {
     pub positions: Vec<TrainingPosition<G, P, N>>,
+    /// How the episodes of each game ended (one episode per game, except in
+    /// [`run_chained_self_play`]).
+    pub episodes: Vec<Vec<Episode<N>>>,
+    /// Games won by each player, judged by the last episode of each game.
     pub wins: [usize; N],
     pub draws: usize,
     pub total_games: usize,
@@ -631,6 +646,7 @@ impl<const G: usize, const P: usize, const N: usize> SelfPlayResult<G, P, N> {
     fn empty() -> Self {
         Self {
             positions: Vec::new(),
+            episodes: Vec::new(),
             wins: [0; N],
             draws: 0,
             total_games: 0,
@@ -641,18 +657,21 @@ impl<const G: usize, const P: usize, const N: usize> SelfPlayResult<G, P, N> {
 
     fn record_game(&mut self, completed: CompletedSelfPlayGame<G, P, N>) {
         self.positions.extend(completed.positions);
-        if let Some(winner_idx) = unique_winner_index(&completed.payoffs) {
+        let last = completed.episodes.last().expect("a finished game has played an episode");
+        if let Some(winner_idx) = unique_winner_index(&last.payoffs) {
             self.wins[winner_idx] += 1;
         } else {
             self.draws += 1;
         }
         self.total_games += 1;
-        self.game_moves_stats.update(completed.moves_played as f32);
+        self.game_moves_stats.update(completed.episodes.iter().map(|e| e.moves).sum::<usize>() as f32);
         self.root_entropy_stats.join(&completed.root_entropy_stats);
+        self.episodes.push(completed.episodes);
     }
 
     fn merge(&mut self, other: Self) {
         self.positions.extend(other.positions);
+        self.episodes.extend(other.episodes);
         for p in 0..N {
             self.wins[p] += other.wins[p];
         }
@@ -673,10 +692,24 @@ struct PendingTurn<const G: usize, const P: usize, const N: usize> {
 
 struct CompletedSelfPlayGame<const G: usize, const P: usize, const N: usize> {
     positions: Vec<TrainingPosition<G, P, N>>,
-    payoffs: [f32; N],
-    moves_played: usize,
+    episodes: Vec<Episode<N>>,
     root_entropy_stats: Statistics,
 }
+
+/// How one episode of a self-play game ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Episode<const N: usize> {
+    /// Terminal payoffs (absolute player order).
+    pub payoffs: [f32; N],
+    /// Moves played in the episode.
+    pub moves: usize,
+}
+
+/// How a self-play game continues after an episode: given the episodes played so far (none
+/// before the first), the start of the next episode, or `None` to end the game. A returned game
+/// must not be terminal already.
+pub type NextEpisode<'a, R, const N: usize> =
+    dyn Fn(&[Episode<N>], &mut SmallRng) -> Option<Game<R, N>> + Sync + 'a;
 
 /// A single self-play game slot pairing [`MctsSearch`] with [`NnEvaluator`] and recording
 /// `(state, policy_target)` training examples at every turn.
@@ -691,8 +724,16 @@ where
     opening_moves: usize,
     value_q_weight: f32,
     value_q_schedule: ValueQSchedule,
-    move_count: usize,
+    discount: f32,
+    /// Starts the next episode of a chained game (`None`: every game is a single episode).
+    next_episode: Option<&'a NextEpisode<'a, R, N>>,
+    rng: SmallRng,
+    /// Moves played in the current episode.
+    episode_moves: usize,
     pending_turns: Vec<PendingTurn<G, P, N>>,
+    /// Labelled positions and outcomes of the finished episodes of the current game.
+    positions: Vec<TrainingPosition<G, P, N>>,
+    episodes: Vec<Episode<N>>,
     root_entropy_stats: Statistics,
 }
 
@@ -705,6 +746,7 @@ where
         game: Game<R, N>,
         service: &'a InferenceService<E, G, P, N>,
         config: &SelfPlayConfig,
+        next_episode: Option<&'a NextEpisode<'a, R, N>>,
         slot_seed: u64,
     ) -> Self {
         let puct = Puct::new(config.c_base, config.c_init).with_fpu(config.fpu);
@@ -714,7 +756,8 @@ where
             puct,
             config.resolved_arena_capacity(),
             slot_seed,
-        );
+        )
+        .with_discount(config.discount);
         let evaluator = NnEvaluator::new(service, slot_seed ^ 0xBF58_476D_1CE4_E5B9)
             .with_dirichlet(config.dirichlet_alpha, config.dirichlet_epsilon);
 
@@ -725,18 +768,49 @@ where
             opening_moves: config.opening_moves,
             value_q_weight: if N <= 2 { config.value_q_weight.clamp(0.0, 1.0) } else { 0.0 },
             value_q_schedule: config.value_q_schedule,
-            move_count: 0,
+            discount: config.discount,
+            next_episode,
+            rng: SmallRng::seed_from_u64(slot_seed ^ 0x94D0_49BB_1331_11EB),
+            episode_moves: 0,
             pending_turns: Vec::with_capacity(64),
+            positions: Vec::new(),
+            episodes: Vec::new(),
             root_entropy_stats: Statistics::new(),
         }
     }
 
     /// Resets this slot for a new game, reusing its generational tree arena allocation in-place.
     fn reset(&mut self, new_game: Game<R, N>) {
-        self.search.reset(new_game, R::SENTINEL_MOVE);
-        self.move_count = 0;
-        self.pending_turns.clear();
+        self.start_episode(new_game);
+        self.positions.clear();
+        self.episodes.clear();
         self.root_entropy_stats.reset();
+    }
+
+    fn start_episode(&mut self, game: Game<R, N>) {
+        self.search.reset(game, R::SENTINEL_MOVE);
+        self.episode_moves = 0;
+        self.pending_turns.clear();
+    }
+
+    /// Labels the positions of the finished episode with its outcome `payoffs`: a position `k`
+    /// moves before the end gets `γ^k × payoffs`, blended with the search value by `value_q_weight`.
+    fn finish_episode(&mut self, payoffs: [f32; N]) {
+        let len = self.pending_turns.len();
+        let (max_w, schedule, discount) = (self.value_q_weight, self.value_q_schedule, self.discount);
+        self.positions.extend(self.pending_turns.drain(..).enumerate().map(|(index, turn)| {
+            let mut value = absolute_to_relative_values(turn.actor, &payoffs).map(|v| v * discount.powi((len - index) as i32));
+            let w = schedule.weight(max_w, index, len);
+            if w > 0.0 {
+                // `root_q` is the value of the positions one move later.
+                let q = discount * turn.root_q;
+                for (k, v) in value.iter_mut().enumerate() {
+                    *v = (1.0 - w) * *v + w * if k == 0 { q } else { -q };
+                }
+            }
+            TrainingPosition { state: turn.state, policy: turn.policy, value }
+        }));
+        self.episodes.push(Episode { payoffs, moves: len });
     }
 
     /// Records `(encoded_root_state, visit_distribution_policy)` for the current turn, chooses a
@@ -768,8 +842,8 @@ where
             root_q: self.search.root_value_estimate(),
         });
 
-        self.move_count += 1;
-        let (chosen_id, chosen_mv) = if self.move_count <= self.opening_moves {
+        self.episode_moves += 1;
+        let (chosen_id, chosen_mv) = if self.episode_moves <= self.opening_moves {
             self.search.sample_root_child_by_visits()
         } else {
             self.search.best_root_child()
@@ -788,33 +862,15 @@ where
 
     fn poll_step(&mut self) -> Poll<Self::Output> {
         loop {
-            if let GameStatus::Terminal(final_abs_payoffs) = self.search.root_game().status() {
-                let len = self.pending_turns.len();
-                let (max_w, schedule) = (self.value_q_weight, self.value_q_schedule);
-                let positions = self
-                    .pending_turns
-                    .drain(..)
-                    .enumerate()
-                    .map(|(index, turn)| {
-                        let mut value = absolute_to_relative_values(turn.actor, &final_abs_payoffs);
-                        let w = schedule.weight(max_w, index, len);
-                        if w > 0.0 {
-                            for (k, v) in value.iter_mut().enumerate() {
-                                let q = if k == 0 { turn.root_q } else { -turn.root_q };
-                                *v = (1.0 - w) * *v + w * q;
-                            }
-                        }
-                        TrainingPosition {
-                            state: turn.state,
-                            policy: turn.policy,
-                            value,
-                        }
-                    })
-                    .collect();
+            if let GameStatus::Terminal(payoffs) = self.search.root_game().status() {
+                self.finish_episode(payoffs);
+                if let Some(next) = self.next_episode.and_then(|next| next(&self.episodes, &mut self.rng)) {
+                    self.start_episode(next);
+                    continue;
+                }
                 return Poll::Ready(CompletedSelfPlayGame {
-                    positions,
-                    payoffs: final_abs_payoffs,
-                    moves_played: self.move_count,
+                    positions: std::mem::take(&mut self.positions),
+                    episodes: std::mem::take(&mut self.episodes),
                     root_entropy_stats: self.root_entropy_stats,
                 });
             }
@@ -876,6 +932,38 @@ where
     E: BatchEvaluator<G, P, N> + 'static,
     F: Fn(usize, &mut SmallRng) -> Game<R, N> + Sync,
 {
+    run_self_play_games(service, config, init_game, None)
+}
+
+/// Runs self-play games made of consecutive episodes, e.g. puzzle rounds of rising difficulty:
+/// `next_episode` starts each game and decides after every episode how it continues (see
+/// [`NextEpisode`]). Each episode is searched and labelled on its own (the search cannot look
+/// past an episode's end, whose continuation may be random); [`SelfPlayResult::episodes`]
+/// reports how the episodes of every game ended.
+pub fn run_chained_self_play<R, E, const G: usize, const P: usize, const N: usize>(
+    service: &InferenceService<E, G, P, N>,
+    config: &SelfPlayConfig,
+    next_episode: &NextEpisode<'_, R, N>,
+) -> SelfPlayResult<G, P, N>
+where
+    R: AlphaZeroGame<G, P, N>,
+    E: BatchEvaluator<G, P, N> + 'static,
+{
+    let first = |_: usize, rng: &mut SmallRng| next_episode(&[], rng).expect("every game has a first episode");
+    run_self_play_games(service, config, first, Some(next_episode))
+}
+
+fn run_self_play_games<R, E, F, const G: usize, const P: usize, const N: usize>(
+    service: &InferenceService<E, G, P, N>,
+    config: &SelfPlayConfig,
+    init_game: F,
+    next_episode: Option<&NextEpisode<'_, R, N>>,
+) -> SelfPlayResult<G, P, N>
+where
+    R: AlphaZeroGame<G, P, N>,
+    E: BatchEvaluator<G, P, N> + 'static,
+    F: Fn(usize, &mut SmallRng) -> Game<R, N> + Sync,
+{
     assert!(
         config.simulations_per_move > 0,
         "simulations_per_move must be > 0"
@@ -927,7 +1015,7 @@ where
             let slot_seed = config.seed.wrapping_add(
                 ((w.worker_id * 4096 + slot_idx) as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9),
             );
-            SelfPlaySlot::new(game, service, config, slot_seed)
+            SelfPlaySlot::new(game, service, config, next_episode, slot_seed)
         },
         |w, slot, game_idx| {
             let game = sample_ongoing_game(game_idx, &mut w.rng);
@@ -1155,6 +1243,33 @@ mod tests {
         );
         for pos in &result.positions {
             assert_eq!(pos.value, [1.0]);
+        }
+    }
+
+    #[test]
+    fn chained_round_game_labels_each_round_with_discounted_moves_to_go() {
+        use crate::games::rubiks_cube::RoundGame;
+        // Uniform priors, no value knowledge: the search alone solves the shallow rounds.
+        let blind = FnBatchEvaluator(|_: &[[f32; 324]], policies: &mut [[f32; 12]], values: &mut [[f32; 1]]| {
+            policies.fill([0.0; 12]);
+            values.fill([0.0]);
+        });
+        let service = InferenceService::new(blind, 32, 1);
+        let rounds = RoundGame { max_rounds: 4, moves_per_turn: 0, extra_moves: 3, max_moves: 3 };
+        let cfg = SelfPlayConfig::new(1, 300, 5).with_workers(1).with_opening_moves(0).with_dirichlet(0.3, 0.0).with_discount(0.9);
+        let result = run_chained_self_play(&service, &cfg, &|played, rng| rounds.next_round(played, rng));
+
+        let game = &result.episodes[0];
+        assert!(game.len() >= 2, "rounds 1 and 2 are solved by search alone: {game:?}");
+        assert!(game[..game.len() - 1].iter().all(|r| r.payoffs[0] > 0.0), "only the last round can fail");
+        assert_eq!(result.positions.len(), game.iter().map(|r| r.moves).sum::<usize>());
+        // Positions in order: `γ^k` for a solve `k` moves later, `0` in a failed round.
+        let mut positions = result.positions.iter();
+        for round in game {
+            for k in (1..=round.moves).rev() {
+                let expected = if round.payoffs[0] > 0.0 { 0.9f32.powi(k as i32) } else { 0.0 };
+                assert!((positions.next().unwrap().value[0] - expected).abs() < 1e-6);
+            }
         }
     }
 }

@@ -365,6 +365,8 @@ pub struct MctsSearch<R: GameRules<N>, const N: usize, S: SelectionPolicy> {
     path_buf: Vec<(NodeId, PlayerIndex<N>)>,
     /// Reusable buffer for bulk move generation during leaf expansion.
     move_buf: Vec<R::Move>,
+    /// Per-move discount `γ` of backed-up values (see [`Self::with_discount`]).
+    discount: f32,
 }
 
 impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
@@ -388,7 +390,17 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
             pending_leaf: None,
             path_buf: Vec::with_capacity(64),
             move_buf: Vec::with_capacity(32),
+            discount: 1.0,
         }
+    }
+
+    /// Discounts backed-up values by `γ` per move: a payoff reached `k` moves below a node counts
+    /// `γ^k` there, so the search prefers short wins (default `1.0`: no discount). For puzzles,
+    /// where solved is worth `1` and failure `0`, the value of a position then becomes
+    /// `γ^(moves to solved)`.
+    pub const fn with_discount(mut self, discount: f32) -> Self {
+        self.discount = discount;
+        self
     }
 
     #[inline]
@@ -476,16 +488,18 @@ impl<R: GameRules<N>, const N: usize, S: SelectionPolicy> MctsSearch<R, N, S> {
         }
     }
 
-    /// Backpropagates `payoffs` (`[f32; N]`) along the active root-to-leaf path recorded by
-    /// [`Self::select_to_leaf`].
+    /// Backpropagates `payoffs` (`[f32; N]`, the value of the leaf) along the active root-to-leaf
+    /// path recorded by [`Self::select_to_leaf`], discounted by `γ` per move above the leaf.
     #[inline]
     pub fn backpropagate(&mut self, payoffs: [f32; N]) {
         let arena = self.tree.active_mut();
         arena.get_mut(NodeId::ROOT).payload.visits += 1;
-        for &(node_id, acting_player) in &self.path_buf {
+        let mut factor = 1.0;
+        for &(node_id, acting_player) in self.path_buf.iter().rev() {
             let payload = &mut arena.get_mut(node_id).payload;
             payload.visits += 1;
-            payload.value_sum += payoffs[acting_player.index()];
+            payload.value_sum += factor * payoffs[acting_player.index()];
+            factor *= self.discount;
         }
     }
 
@@ -880,6 +894,26 @@ pub fn assign_masked_softmax_priors<M: Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discounted_backup_values_a_solve_one_move_later_at_gamma() {
+        use crate::games::rubiks_cube::{NO_MOVE, RubiksGame, RubiksState, apply_move_stickers, inverse_move};
+        // Scramble `U R`: the only 2-move solution is `R' U'`; the budget ends the search at depth 2.
+        let stickers = apply_move_stickers(&apply_move_stickers(&RubiksState::solved(0).stickers, 0), 6);
+        let game = RubiksGame::new(PlayerIndex::P0, RubiksState { stickers, remaining_steps: 2, last_move: NO_MOVE });
+        let mut search = MctsSearch::new(game, NO_MOVE, Uct::new(1.4), 4096, 3).with_discount(0.5);
+        let mut zero = FnEvaluator(|_: &RubiksGame, _: &mut [Node<u8, MctsPayload>]| [0.0]);
+        search.run_simulations(400, &mut zero);
+
+        let tree = search.tree().active();
+        let (first_id, _) = tree.children_with_ids(NodeId::ROOT).find(|(_, c)| c.mv == inverse_move(6)).unwrap();
+        let (_, solve) = tree.children_with_ids(first_id).find(|(_, c)| c.mv == inverse_move(0)).unwrap();
+        assert!(solve.payload.visits > 10, "the search finds the solution");
+        // The solved cube is worth 1 where it is reached and 0.5 one move earlier; the other
+        // grandchildren end unsolved (0).
+        assert_eq!(solve.payload.value_sum, solve.payload.visits as f32);
+        assert_eq!(tree.get(first_id).payload.value_sum, 0.5 * solve.payload.visits as f32);
+    }
 
     #[test]
     fn mcts_node_size_is_20_bytes_for_1_and_2_byte_moves() {

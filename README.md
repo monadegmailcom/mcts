@@ -62,6 +62,9 @@ into `./libtorch` on first use (version pinned in the script); `LIBTORCH` points
 LIBTORCH=/opt/libtorch ./start_lab.sh --cuda --tch  # Docker: a libtorch baked into the image
 ```
 
+For NVIDIA GPUs in the cloud, [RUNPOD.md](RUNPOD.md) describes the Docker image (built by GitHub
+Actions) and running the lab on RunPod with SSH access.
+
 Plain cargo commands with `tch` need the same libtorch and the version-check bypass (tch 0.22
 asks for exactly 2.9.0; 2.9.x patch releases are compatible):
 
@@ -71,6 +74,23 @@ LIBTORCH=$PWD/libtorch LIBTORCH_BYPASS_VERSION_CHECK=1 cargo test --release --fe
 
 Throughput comparison: `cargo run --release --features metal,tch --example bench_nn`
 (and `experiments/bench_cuda.sh` on a CUDA machine).
+
+## Rubik's cube round game
+
+`examples/train_rubiks.rs` trains a cube solver by playing rounds of rising difficulty: round `n`
+is a cube scrambled with `n` quarter turns, solving it within `2n + 10` moves (at most 100) leads to
+round `n + 1` (up to 26), failing ends the game, and a game scores `n + 1/r` for its last solved round (solved in `r` moves). Each
+round is searched and labelled on its own with a discounted value (`γ^(moves to solved)`), so the
+network learns how far a cube is from solved; the game moves self-play to deeper scrambles as the
+network improves.
+
+```bash
+LIBTORCH=$PWD/libtorch LIBTORCH_BYPASS_VERSION_CHECK=1 \
+  cargo run --release --features metal,tch --example train_rubiks -- minutes=60
+```
+
+Options are `key=value` (see the file header); weights go to `checkpoints/rubiks_rounds.safetensors`
+after every iteration and `init=rubiks_rounds.safetensors` continues a run.
 
 ## Browser Lab
 

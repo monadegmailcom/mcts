@@ -12,12 +12,20 @@
 //! - **324-Float One-Hot Neural Encoding**: [`encode_one_hot`] serializes the 54 stickers x 6
 //!   colors into `[f32; 324]` (matching *DeepCubeA* and sharing the exact `324` input width of
 //!   [`crate::games::ultimate_ttt::INPUT_SIZE`]).
+//! - **Round Game**: [`RoundGame`] chains scrambles of rising depth into one game, a curriculum
+//!   that follows the network's skill (trained by `examples/train_rubiks.rs`).
+//!
+//! Solving the cube pays `1`; running out of moves pays `0` (not `-1`), so that with a discounted
+//! search ([`RubiksSettings::discount`]) the value of a cube is `γ^(moves to solved)` and an
+//! unsolved cube is simply worth nothing.
 
 use std::fmt;
 
 use rand::prelude::{Rng, RngExt};
 
-use crate::alphazero::AlphaZeroGame;
+use crate::alphazero::{AlphaZeroGame, Episode};
+use crate::hyperparams::AlphaZeroHyperparams;
+use crate::mcts::Fpu;
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::minimax::HeuristicEvaluator;
 use crate::nn::AlphaZeroNetConfig;
@@ -450,7 +458,7 @@ impl GameRules<1> for RubiksCube {
         if state.is_solved() {
             GameStatus::Terminal([1.0])
         } else if state.remaining_steps == 0 {
-            GameStatus::Terminal([-1.0])
+            GameStatus::Terminal([0.0])
         } else {
             GameStatus::Ongoing
         }
@@ -505,14 +513,125 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 1> for RubiksCube {
         encode_one_hot(game.state(), out);
     }
 
-    /// Wider residual MLP over the one-hot sticker encoding (`G = 324, P = 12, N = 1`).
+    /// Residual MLP over the one-hot stickers, sized like DeepCubeA's network (~15M parameters)
+    /// so that it can learn to solve any cube: 1024 wide, 6 residual blocks (~13M parameters).
+    /// Convolutions do not fit: neighbouring stickers lie on different faces.
     fn net_config() -> AlphaZeroNetConfig {
         AlphaZeroNetConfig::ResMlp {
-            hidden_dim: 256,
-            num_res_blocks: 4,
-            head_hidden: 128,
+            hidden_dim: 1024,
+            num_res_blocks: 6,
+            head_hidden: 256,
         }
     }
+
+    /// Settings for the [`RoundGame`] (the cube-specific ones are in [`RubiksSettings`]):
+    /// - search: 200 simulations per move, no temperature moves (a wrong move only costs moves)
+    ///   and root noise for exploration;
+    /// - `fpu` 0: an untried move is assumed to lead nowhere (worth what an unsolved cube is worth);
+    /// - training: a game of rounds yields ~50-500 positions; 512 games and 500 steps of 512
+    ///   positions use every new position about twice; the buffer holds a few iterations.
+    fn hyperparams() -> AlphaZeroHyperparams {
+        AlphaZeroHyperparams {
+            games_per_iteration: 512,
+            simulations_per_move: 200,
+            opening_moves: 0,
+            dirichlet_alpha: 0.5,
+            dirichlet_epsilon: 0.25,
+            fpu: Fpu::Absolute(0.0),
+            value_q_weight: 0.0,
+            train_steps: 500,
+            batch_size: 512,
+            learning_rate: 1e-3,
+            buffer_capacity: 500_000,
+            eval_games: 128,
+            eval_sims: 400,
+            ..AlphaZeroHyperparams::GENERIC
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round game
+// ---------------------------------------------------------------------------------------------
+
+/// Cube-specific training settings, on top of the shared [`AlphaZeroHyperparams`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RubiksSettings {
+    /// Per-move discount `γ` of search values and value targets
+    /// ([`crate::alphazero::SelfPlayConfig::discount`]): the network learns `γ^(moves to solved)`,
+    /// so `0.9` values a cube solved in 5 moves at `0.59` and one solved in 20 moves at `0.12`.
+    pub discount: f32,
+    /// Rules of the game played in self-play and evaluation.
+    pub rounds: RoundGame,
+}
+
+impl Default for RubiksSettings {
+    fn default() -> Self {
+        Self { discount: 0.9, rounds: RoundGame::default() }
+    }
+}
+
+/// A game of rounds of rising difficulty: round `n` is a cube scrambled with `n` quarter turns
+/// ([`RubiksState::scrambled`]) to be solved within [`Self::move_budget`] moves. Solving it leads
+/// to round `n + 1`, up to `max_rounds`; failing ends the game.
+///
+/// Solving round `n` in `r` moves scores `n + 1/r`, and a game scores what its last solved round
+/// scored (`0` if none): a higher round always scores more, and fewer moves earn a bonus.
+///
+/// Each round is one episode of [`crate::alphazero::run_chained_self_play`]. The next scramble is
+/// random, so rounds are searched and learned on their own; the game decides *which* cubes are
+/// played, moving on to deeper scrambles as the network improves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoundGame {
+    /// Last round (26 quarter turns reach every cube).
+    pub max_rounds: u8,
+    /// Round `n` allows `moves_per_turn × n + extra_moves` moves, at most `max_moves`: room for
+    /// detours that grows with the scramble, while a failed round (which ends every game) stays
+    /// cheap and does not swamp the training data with unsolved positions.
+    pub moves_per_turn: u8,
+    pub extra_moves: u8,
+    pub max_moves: u8,
+}
+
+impl Default for RoundGame {
+    fn default() -> Self {
+        Self { max_rounds: 26, moves_per_turn: 2, extra_moves: 10, max_moves: 100 }
+    }
+}
+
+impl RoundGame {
+    /// Moves allowed in round `round` (1-based).
+    pub fn move_budget(&self, round: usize) -> u8 {
+        (self.moves_per_turn as usize * round + self.extra_moves as usize).min(self.max_moves as usize) as u8
+    }
+
+    /// The cube of the round after `played` (round 1 if `played` is empty), or `None` when the
+    /// game is over: the last round failed or `max_rounds` were solved.
+    pub fn next_round(&self, played: &[Episode<1>], rng: &mut impl Rng) -> Option<RubiksGame> {
+        let round = played.len() + 1;
+        if played.last().is_some_and(|r| !solved(r)) || round > self.max_rounds as usize {
+            return None;
+        }
+        // Scrambles that cancel out (e.g. `U D U' D'`) are drawn again.
+        loop {
+            let state = RubiksState::scrambled(round as u8, self.move_budget(round), rng);
+            if !state.is_solved() {
+                return Some(RubiksGame::new(PlayerIndex::P0, state));
+            }
+        }
+    }
+
+    /// Score of a game whose rounds ended as `played`: `n + 1/r` of its last solved round.
+    pub fn score(played: &[Episode<1>]) -> f64 {
+        played
+            .iter()
+            .rposition(solved)
+            .map_or(0.0, |i| (i + 1) as f64 + 1.0 / played[i].moves as f64)
+    }
+}
+
+fn solved(round: &Episode<1>) -> bool {
+    round.payoffs[0] > 0.0
 }
 
 #[cfg(test)]
@@ -523,6 +642,27 @@ mod tests {
     use crate::matchup::play_match;
     use crate::mcts::{MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
     use crate::minimax::MinimaxPlayer;
+
+    #[test]
+    fn round_game_continues_after_solves_and_scores_the_last_solved_round() {
+        let game = RoundGame { max_rounds: 3, ..RoundGame::default() };
+        let mut rng = SmallRng::seed_from_u64(1);
+        let solved = |moves| Episode { payoffs: [1.0], moves };
+        let failed = Episode { payoffs: [0.0], moves: 10 };
+
+        let first = game.next_round(&[], &mut rng).unwrap();
+        assert!(!first.state().is_solved());
+        assert_eq!(first.state().remaining_steps, 12);
+        assert_eq!([2, 20, 45, 50].map(|n| game.move_budget(n)), [14, 50, 100, 100]);
+        assert!(game.next_round(&[solved(1), solved(4)], &mut rng).is_some(), "round 3 follows");
+        assert!(game.next_round(&[solved(1), failed], &mut rng).is_none(), "a failed round ends the game");
+        assert!(game.next_round(&[solved(1), solved(2), solved(3)], &mut rng).is_none(), "max_rounds reached");
+
+        assert_eq!(RoundGame::score(&[]), 0.0);
+        assert_eq!(RoundGame::score(&[failed]), 0.0);
+        assert_eq!(RoundGame::score(&[solved(1), solved(4), failed]), 2.25);
+        assert_eq!(RoundGame::score(&[solved(1), solved(2), solved(3)]), 3.0 + 1.0 / 3.0);
+    }
 
     #[test]
     fn rubiks_state_fits_in_single_64_byte_cache_line() {
