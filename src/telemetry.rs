@@ -1527,6 +1527,7 @@ impl TelemetryHub {
             "store": store,
             "games": games,
             "backends": backends,
+            "system": { "infer_batch": guard.system.infer_batch, "infer_workers": guard.system.infer_workers },
             "active_game": guard.active_game.as_str(),
             "live_training": !guard.active_state().knobs.paused,
         })

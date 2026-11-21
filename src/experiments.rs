@@ -44,6 +44,9 @@ pub struct ExperimentSpec {
     pub eval_games: usize,
     /// Maximum positions per batched NN inference call (larger batches use GPUs much better).
     pub infer_batch: usize,
+    /// Inference workers, one model replica each, as for live training (CUDA: one per GPU, so
+    /// self-play and evaluation use up to this many GPUs; Apple GPUs: always 1).
+    pub infer_workers: usize,
     /// Evaluation opponents (empty = the game's defaults).
     pub opponents: Vec<OpponentSpec>,
     /// Checkpoint to start from (empty = fresh random weights). Must match the `net` architecture.
@@ -65,6 +68,7 @@ impl Default for ExperimentSpec {
             eval_sims: 100,
             eval_games: 48,
             infer_batch: 256,
+            infer_workers: 1,
             opponents: Vec::new(),
             init_checkpoint: String::new(),
         }

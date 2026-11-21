@@ -365,13 +365,15 @@ where
         }
         trainer.load_checkpoint(&path)?;
     }
-    let service = trainer.build_inference_service(spec.infer_batch, &dev.replicas(1))?;
+    let infer_devices = dev.replicas(spec.infer_workers);
+    let service = trainer.build_inference_service(spec.infer_batch, &infer_devices)?;
     let mut buffer = ReplayBuffer::<G, P, 2>::new(hp.buffer_capacity).with_symmetries(S::symmetries());
     let mut rng = SmallRng::seed_from_u64(S::SEED ^ (id * 7919));
     let opponents = if spec.opponents.is_empty() { default_eval_opponents(S::LAB) } else { spec.opponents.clone() };
     let start_from = if spec.init_checkpoint.is_empty() { String::new() } else { format!(" · from {}", spec.init_checkpoint) };
-    hub.experiment_started(id, opponents.iter().map(OpponentSpec::label).collect(), format!("{dev} · {net_name} net{start_from}"));
-    println!("🧪 Experiment #{id} '{}' on {dev} ({net_name} net, {} min budget)", spec.name, spec.budget_minutes);
+    let device = device_label(dev, &infer_devices, spec.infer_batch);
+    hub.experiment_started(id, opponents.iter().map(OpponentSpec::label).collect(), format!("{device} · {net_name} net{start_from}"));
+    println!("🧪 Experiment #{id} '{}' on {device} ({net_name} net, {} min budget)", spec.name, spec.budget_minutes);
 
     let openings = S::eval_openings(spec.eval_games.div_ceil(2));
     let start = Instant::now();
