@@ -19,6 +19,8 @@
 //!   configurable engines (`alphazero`, `mcts`, `tree-minimax`, `minimax`, `random`) and reports
 //!   both W/D/L and actual measured thinking time (`µs/move`) per engine.
 //! - `POST /api/play`: Board and engine analysis for a single game in the Play tab (see [`crate::play`]).
+//! - `POST /api/elo`: Queues a calibration of the game's Elo anchors (`anchors`, `games_per_pair`);
+//!   see [`crate::elo`]. Ratings of the network appear in the history and experiment points.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -33,6 +35,7 @@ use crate::games::tic_tac_toe::{self, EMPTY_STATE, TicTacToe, TttGame, TttHeuris
 use crate::games::ultimate_ttt::{
     self, EMPTY_STATE as UTTT_EMPTY_STATE, UltimateTicTacToe, UtttGame, UtttHeuristic,
 };
+use crate::elo::EloPool;
 use crate::experiments::{ExperimentPoint, ExperimentSpec, ExperimentStore, RunStatus, json_value};
 use crate::hyperparams::AlphaZeroHyperparams;
 use crate::checkpoints;
@@ -104,13 +107,33 @@ pub enum TrainingCommand {
     /// Run a queued experiment to completion (already marked running). Only issued while live
     /// training is paused.
     RunExperiment { id: u64, spec: Box<ExperimentSpec> },
+    /// Play a round-robin between `anchors` and fit their Elo ratings. Only issued while live
+    /// training is paused.
+    CalibrateElo { game: LabGame, anchors: Vec<OpponentSpec>, games_per_pair: usize },
 }
 
 /// `[wins, draws, losses]` of the trained network against one evaluation opponent.
 #[derive(Clone, Debug)]
 pub struct ArenaResult {
+    pub opponent: OpponentSpec,
+    /// The opponent's label, or why it could not play.
     pub label: String,
     pub wdl: [usize; 3],
+}
+
+/// Default Elo anchors: fixed-strength engines from very weak to strong. Saved networks can be
+/// added in the Browser Lab to extend the scale upwards.
+pub fn default_elo_anchors(game: LabGame) -> Vec<OpponentSpec> {
+    match game {
+        LabGame::Ttt => vec![OpponentSpec::Random, OpponentSpec::Minimax { depth: 1 }, OpponentSpec::Minimax { depth: 2 }],
+        LabGame::Uttt => vec![
+            OpponentSpec::Random,
+            OpponentSpec::Minimax { depth: 1 },
+            OpponentSpec::Mcts { sims: 200, exploration: 1.414 },
+            OpponentSpec::Minimax { depth: 2 },
+            OpponentSpec::Minimax { depth: 3 },
+        ],
+    }
 }
 
 /// Default evaluation opponents of the live-training arena.
@@ -156,7 +179,12 @@ pub struct IterationTelemetry {
 }
 
 impl IterationTelemetry {
-    fn to_json(&self) -> String {
+    /// The anchored rating implied by this iteration's arena results.
+    fn rating(&self, pool: Option<&EloPool>) -> Option<crate::elo::Rating> {
+        pool?.estimate(self.arena.iter().map(|a| (&a.opponent, a.wdl)))
+    }
+
+    fn to_json(&self, pool: Option<&EloPool>) -> String {
         format!(
             concat!(
                 "{{",
@@ -170,6 +198,7 @@ impl IterationTelemetry {
                 "\"self_play_wins\":[{},{}],",
                 "\"self_play_draws\":{},",
                 "\"arena\":[{}],",
+                "\"elo\":{},",
                 "\"buffer_len\":{},",
                 "\"buffer_capacity\":{},",
                 "\"batch_size_mean\":{:.3},",
@@ -206,6 +235,7 @@ impl IterationTelemetry {
                 ))
                 .collect::<Vec<_>>()
                 .join(","),
+            serde_json::to_string(&self.rating(pool)).unwrap_or_else(|_| "null".into()),
             self.buffer_len,
             self.buffer_capacity,
             finite_or_zero(self.batch_size_mean),
@@ -751,6 +781,41 @@ struct GameLabState {
     history: Vec<IterationTelemetry>,
     matches: Vec<TttMatchRecord>,
     calibration: Option<CalibrationReport>,
+    elo: EloState,
+}
+
+/// Elo anchors of one game and the state of their calibration.
+#[derive(Default)]
+struct EloState {
+    pool: Option<EloPool>,
+    /// Requested calibration `(anchors, games per pair)`, not yet picked up by the training loop.
+    request: Option<(Vec<OpponentSpec>, usize)>,
+    running: bool,
+    /// What the calibration is doing, or how it ended.
+    status: String,
+}
+
+impl EloState {
+    fn to_json(&self, game: LabGame) -> serde_json::Value {
+        let anchors: Vec<serde_json::Value> = self.pool.iter().flat_map(|p| &p.anchors).map(|a| serde_json::json!({
+            "label": a.opponent.label(),
+            "opponent": json_value(&a.opponent),
+            "elo": a.rating.elo,
+            "stderr": a.rating.stderr,
+        })).collect();
+        serde_json::json!({
+            "anchors": anchors,
+            "games_per_pair": self.pool.as_ref().map(|p| p.games_per_pair),
+            "calibrated_unix": self.pool.as_ref().map(|p| p.calibrated_unix),
+            "default_anchors": json_value(&default_elo_anchors(game)),
+            "busy": self.request.is_some() || self.running,
+            "status": self.status,
+        })
+    }
+}
+
+fn elo_pool_path(game: LabGame) -> std::path::PathBuf {
+    checkpoints::path(&format!("{}elo_pool.json", game.prefix()))
 }
 
 impl GameLabState {
@@ -773,6 +838,7 @@ impl GameLabState {
             history: Vec::with_capacity(total_iterations.max(64)),
             matches: Vec::new(),
             calibration: None,
+            elo: EloState::default(),
         }
     }
 }
@@ -922,6 +988,9 @@ impl TelemetryHub {
         if guard.experiments.is_running() {
             return "experiment";
         }
+        if guard.ttt_state.elo.running || guard.uttt_state.elo.running {
+            return "evaluation";
+        }
         let phase = guard.state_for(guard.active_game).phase.to_ascii_lowercase();
         if phase.contains("self-play") {
             "self-play"
@@ -1046,11 +1115,56 @@ impl TelemetryHub {
             }
         }
 
+        for game in [LabGame::Ttt, LabGame::Uttt] {
+            let elo = &mut guard.state_for_mut(game).elo;
+            if let Some((anchors, games_per_pair)) = elo.request.take() {
+                elo.status = "Starting calibration...".into();
+                elo.running = true;
+                return TrainingCommand::CalibrateElo { game, anchors, games_per_pair };
+            }
+        }
+
         if let Some((id, spec)) = guard.experiments.next_queued() {
             guard.experiments.start(id, Vec::new(), String::new());
             return TrainingCommand::RunExperiment { id, spec: Box::new(spec) };
         }
         TrainingCommand::Idle
+    }
+
+    /// Loads the calibrated Elo anchors of both games from the checkpoint folder.
+    pub fn enable_elo_pools(&self) {
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        for game in [LabGame::Ttt, LabGame::Uttt] {
+            guard.state_for_mut(game).elo.pool = EloPool::load(&elo_pool_path(game));
+        }
+    }
+
+    /// The calibrated Elo anchors of `game`, if any.
+    pub fn elo_pool(&self, game: LabGame) -> Option<EloPool> {
+        self.inner.lock().expect("telemetry mutex poisoned").state_for(game).elo.pool.clone()
+    }
+
+    pub fn set_elo_status(&self, game: LabGame, status: impl Into<String>) {
+        self.inner.lock().expect("telemetry mutex poisoned").state_for_mut(game).elo.status = status.into();
+    }
+
+    /// Stores (and saves) a finished calibration, or reports why it failed.
+    pub fn finish_elo_calibration(&self, game: LabGame, result: Result<EloPool, String>) {
+        let status = match &result {
+            Ok(pool) => match pool.save(&elo_pool_path(game)) {
+                Ok(()) => format!("Calibrated {} anchors", pool.anchors.len()),
+                Err(e) => format!("Calibrated, but saving failed: {e}"),
+            },
+            Err(e) => format!("Calibration failed: {e}"),
+        };
+        println!("⚖️  [Browser Lab] {} Elo: {status}", game.title());
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        let elo = &mut guard.state_for_mut(game).elo;
+        elo.status = status;
+        elo.running = false;
+        if let Ok(pool) = result {
+            elo.pool = Some(pool);
+        }
     }
 
     /// Loads (and from now on persists) experiment results at `path`.
@@ -1295,7 +1409,7 @@ impl TelemetryHub {
         let history_json = st
             .history
             .iter()
-            .map(IterationTelemetry::to_json)
+            .map(|h| h.to_json(st.elo.pool.as_ref()))
             .collect::<Vec<_>>()
             .join(",");
         let matches_json = st
@@ -1324,6 +1438,7 @@ impl TelemetryHub {
                 "\"models\":[{}],",
                 "\"utilization\":{},",
                 "\"calibration\":{},",
+                "\"elo\":{},",
                 "\"history\":[{}],",
                 "\"matches\":[{}]",
                 "}}"
@@ -1341,6 +1456,7 @@ impl TelemetryHub {
             models_json,
             guard.utilization.as_ref().map_or_else(|| "null".to_string(), |u| u.to_json().to_string()),
             cal_json,
+            st.elo.to_json(game),
             history_json,
             matches_json,
         )
@@ -1395,7 +1511,18 @@ impl TelemetryHub {
             .into_iter()
             .map(|b| serde_json::json!({ "name": b.as_str(), "gpu": b.gpu_name() }))
             .collect();
-        let store: serde_json::Value = serde_json::from_str(&guard.experiments.to_json()).unwrap_or_default();
+        let mut store: serde_json::Value = serde_json::from_str(&guard.experiments.to_json()).unwrap_or_default();
+        // Ratings come from the current anchors, so a recalibration updates every run's curve.
+        for run in store["runs"].as_array_mut().into_iter().flatten() {
+            let Ok(spec) = serde_json::from_value::<ExperimentSpec>(run["spec"].clone()) else { continue };
+            let game = LabGame::from_str_lossy(&spec.game);
+            let Some(pool) = guard.state_for(game).elo.pool.as_ref() else { continue };
+            let opponents = if spec.opponents.is_empty() { default_eval_opponents(game) } else { spec.opponents };
+            for point in run["points"].as_array_mut().into_iter().flatten() {
+                let wdl: Vec<[usize; 3]> = serde_json::from_value(point["wdl"].clone()).unwrap_or_default();
+                point["elo"] = serde_json::to_value(pool.estimate(opponents.iter().zip(wdl))).unwrap_or_default();
+            }
+        }
         serde_json::json!({
             "store": store,
             "games": games,
@@ -2241,6 +2368,23 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
         return write_http_response(&mut stream, "200 OK", "application/json", &json);
     }
 
+    if method == "POST" && raw_path.starts_with("/api/elo") {
+        let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let game = req["game"].as_str().map_or_else(|| hub.active_game(), LabGame::from_str_lossy);
+        let anchors = opponents::parse_list(&req["anchors"]).unwrap_or_default();
+        let games_per_pair = req["games_per_pair"].as_u64().unwrap_or(48).clamp(2, 1000) as usize;
+        if anchors.len() < 2 {
+            return write_http_response(&mut stream, "400 Bad Request", "application/json", r#"{"error":"need at least two anchors"}"#);
+        }
+        {
+            let mut guard = hub.inner.lock().expect("telemetry mutex poisoned");
+            let elo = &mut guard.state_for_mut(game).elo;
+            elo.status = "Queued — starts while live training is paused".into();
+            elo.request = Some((anchors, games_per_pair));
+        }
+        return write_http_response(&mut stream, "200 OK", "application/json", &hub.to_json());
+    }
+
     if method == "POST" && raw_path.starts_with("/api/system") {
         {
             let mut guard = hub.inner.lock().expect("telemetry mutex poisoned");
@@ -3057,15 +3201,18 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div class="grid">
     <div class="card">
       <h2>
-        <span>Arena score (%)</span>
-        <span id="latest-wdl" style="font-size:0.78rem;color:var(--green)">—</span>
+        <span>Strength (anchored Elo)</span>
+        <span id="latest-elo" style="font-size:0.78rem;color:var(--green)">—</span>
       </h2>
-      <p class="hint" id="arena-chart-hint">Wins + ½ draws in % against each evaluation opponent configured below, measured after every iteration. The one number that says whether the network gets stronger.</p>
-      <canvas id="chart-arena" width="600" height="205"></canvas>
-      <div class="legend" id="arena-legend"></div>
+      <p class="hint" id="elo-chart-hint">The rating that best explains this iteration's results against the evaluation opponents that are Elo anchors
+        (see ⚖️ Elo anchors below). One scale for all opponents, iterations and experiments: +100 Elo means an expected score of 64 % against the old self.
+        The thin lines mark ± one standard error.</p>
+      <canvas id="chart-elo" width="600" height="205"></canvas>
     </div>
-
   </div>
+
+  <!-- One win/draw/loss card per evaluation opponent (built by renderArenaCards). -->
+  <div class="grid" id="arena-cards" style="margin-top:14px;"></div>
 
   <!-- One card per metric (built by buildMetricCards), so every chart gets its own y-axis scale. -->
   <div class="grid" id="metric-cards" style="margin-top:14px;"></div>
@@ -3170,6 +3317,25 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <button class="btn" onclick="pushOpponents()">Apply Opponents</button>
     </h2>
     <div id="live-opps"></div>
+  </div>
+
+  <div class="card" style="margin-top:14px;">
+    <h2>
+      <span>⚖️ Elo anchors (<span id="elo-game-label">Ultimate Tic-Tac-Toe</span>)</span>
+      <span id="elo-status" style="font-size:0.78rem;color:var(--muted)">—</span>
+    </h2>
+    <p class="hint">Engines of fixed strength that define the Elo scale. Calibrating plays every pair of anchors (fixed openings, colors swapped)
+      and fits their ratings, the first anchor fixed at 0. After that every evaluation against anchors yields a rating without extra games:
+      add anchors near the network's strength as evaluation opponents above. Add saved networks to extend the scale upwards, and do not overwrite
+      an anchor's checkpoint file afterwards. Calibration runs while live training is paused.</p>
+    <table style="margin-bottom:8px"><thead><tr><th style="text-align:left">Anchor</th><th>Elo</th><th>± std. error</th></tr></thead>
+      <tbody id="elo-anchor-rows"></tbody></table>
+    <div id="elo-anchors"></div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:0.8rem;color:var(--muted)">
+      <label>Games per pair <input type="number" id="elo-games" value="48" min="2" max="1000" step="2"
+        style="width:60px;background:var(--bg);color:var(--text);border:1px solid var(--border);padding:3px 6px;border-radius:4px;"></label>
+      <button class="btn" id="elo-calibrate-btn" onclick="calibrateElo()">⚖️ Calibrate anchors</button>
+    </div>
   </div>
 
   <div class="card" style="margin-top:14px;">
@@ -3783,34 +3949,90 @@ function renderDashboard(d) {
   renderCalibration(d.calibration);
   renderMatches(d.matches || []);
 
+  renderEloAnchors(d.elo, title);
   renderUtilization(d.utilization);
   const h = d.history || [];
-  if (!h.length) {
-    document.getElementById('latest-wdl').textContent = '—';
-    clearCanvas('chart-arena');
-    renderMetricCards([]);
-    return;
-  }
-  const last = h[h.length - 1];
-  const scorePct = (arr) => {
-    const tot = arr[0] + arr[1] + arr[2];
-    return tot > 0 ? ((arr[0] + 0.5 * arr[1]) / tot) * 100.0 : 0.0;
-  };
-  const lastArena = last.arena[last.arena.length - 1];
-  document.getElementById('latest-wdl').textContent = lastArena
-    ? `vs ${lastArena.label}: ${lastArena.wdl[0]}W-${lastArena.wdl[1]}D-${lastArena.wdl[2]}L` : '—';
-
-  // One line per opponent label seen in the history (opponents can change between iterations).
-  const ARENA_COLORS = ['#34d399', '#38bdf8', '#fbbf24', '#fb7185', '#a78bfa', '#f472b6', '#22d3ee', '#a3e635'];
-  const arenaLabels = [...new Set(h.flatMap(x => x.arena.map(a => a.label)))];
-  drawChart('chart-arena', h.map(x => x.iteration), arenaLabels.map((label, i) => ({
-    data: h.map(x => { const r = x.arena.find(a => a.label === label); return r ? scorePct(r.wdl) : NaN; }),
-    color: ARENA_COLORS[i % ARENA_COLORS.length],
-  })), 0, 100);
-  document.getElementById('arena-legend').innerHTML = arenaLabels
-    .map((l, i) => `<span style="color:${ARENA_COLORS[i % ARENA_COLORS.length]}">vs ${l}</span>`).join('');
-
+  renderEloChart(h, d.elo);
+  renderArenaCards(h);
   renderMetricCards(h);
+}
+
+// ---- Strength: anchored Elo and per-opponent wins / draws / losses ----
+let eloEditorGame = null;
+let eloWasBusy = false;
+
+function renderEloAnchors(elo, title) {
+  document.getElementById('elo-game-label').textContent = title;
+  document.getElementById('elo-status').textContent = elo.status
+    || (elo.calibrated_unix ? `calibrated ${new Date(elo.calibrated_unix * 1000).toLocaleString()} · ${elo.games_per_pair} games per pair` : 'not calibrated yet');
+  document.getElementById('elo-calibrate-btn').disabled = elo.busy;
+  document.getElementById('elo-anchor-rows').innerHTML = elo.anchors.length
+    ? elo.anchors.map(a => `<tr><td style="text-align:left">${a.label}</td><td>${a.elo.toFixed(0)}</td>`
+      + `<td>${a.stderr == null ? '—' : a.stderr === 0 ? 'fixed' : a.stderr.toFixed(0)}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="hint" style="text-align:left">No anchors calibrated for this game yet.</td></tr>';
+  // The editor shows the calibrated anchors (or the defaults) when the game changes or a
+  // calibration ends, and is left alone in between.
+  if (eloEditorGame !== activeGame || (eloWasBusy && !elo.busy)) {
+    oppRender('elo-anchors', elo.anchors.length ? elo.anchors.map(a => a.opponent) : elo.default_anchors, activeGame);
+    eloEditorGame = activeGame;
+  }
+  eloWasBusy = elo.busy;
+}
+
+async function calibrateElo() {
+  const anchors = oppRead('elo-anchors');
+  if (anchors.length < 2) { alert('Calibration needs at least two anchors.'); return; }
+  const games_per_pair = parseInt(document.getElementById('elo-games').value, 10) || 48;
+  const pairs = anchors.length * (anchors.length - 1) / 2;
+  if (!confirm(`Play ${pairs} pairings × ${games_per_pair} games between ${anchors.length} anchors? Live training must be paused for it to start.`)) return;
+  const res = await fetch('/api/elo', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ game: activeGame, anchors, games_per_pair })
+  });
+  if (!res.ok) { alert((await res.json()).error); return; }
+  stateData = await res.json();
+  renderDashboard(stateData);
+}
+
+function renderEloChart(h, elo) {
+  const ratings = h.map(x => x.elo);
+  const last = [...ratings].reverse().find(r => r);
+  document.getElementById('latest-elo').textContent = last
+    ? `${last.elo.toFixed(0)} ± ${last.stderr == null ? '?' : last.stderr.toFixed(0)}`
+    : (elo.anchors.length ? 'no anchor among the evaluation opponents' : 'calibrate the Elo anchors first');
+  if (!last) { clearCanvas('chart-elo'); return; }
+  const band = (sign) => ratings.map(r => r && r.stderr != null ? r.elo + sign * r.stderr : NaN);
+  drawChart('chart-elo', h.map(x => x.iteration), [
+    { data: band(1), color: '#1f6f55', width: 1 },
+    { data: band(-1), color: '#1f6f55', width: 1 },
+    { data: ratings.map(r => r ? r.elo : NaN), color: '#34d399' },
+  ]);
+}
+
+const WDL_SERIES = [['wins', '#34d399'], ['draws', '#94a3b8'], ['losses', '#fb7185']];
+
+// One card per opponent seen in the history (opponents can change between iterations).
+function renderArenaCards(h) {
+  const grid = document.getElementById('arena-cards');
+  const labels = [...new Set(h.flatMap(x => x.arena.map(a => a.label)))];
+  const sig = labels.join('|');
+  if (grid.dataset.labels !== sig) {
+    grid.innerHTML = labels.map((l, i) => `
+      <div class="card">
+        <h2><span>vs ${l}</span><span id="arena-latest-${i}" style="font-size:0.78rem;color:var(--green)">—</span></h2>
+        <p class="hint">Wins, draws and losses of the trained network in % of the evaluation games after every iteration.</p>
+        <canvas id="arena-chart-${i}" width="600" height="170"></canvas>
+        <div class="legend">${WDL_SERIES.map(([n, c]) => `<span style="color:${c}">${n}</span>`).join('')}</div>
+      </div>`).join('');
+    grid.dataset.labels = sig;
+  }
+  labels.forEach((label, i) => {
+    const results = h.map(x => x.arena.find(a => a.label === label));
+    const pct = (k) => results.map(r => { const n = r ? r.wdl[0] + r.wdl[1] + r.wdl[2] : 0; return n ? 100 * r.wdl[k] / n : NaN; });
+    drawChart(`arena-chart-${i}`, h.map(x => x.iteration), WDL_SERIES.map(([, color], k) => ({ data: pct(k), color })), 0, 100);
+    const last = [...results].reverse().find(r => r);
+    document.getElementById(`arena-latest-${i}`).textContent = last ? `${last.wdl[0]}W-${last.wdl[1]}D-${last.wdl[2]}L` : '—';
+  });
 }
 
 // Training-tab charts, one per metric so each has its own y-axis scale.
@@ -4312,12 +4534,13 @@ function drawChart(canvasId, xs, series, fixedMin, fixedMax) {
     ctx.moveTo(padL, y);
     ctx.lineTo(W - padR, y);
     ctx.stroke();
-    ctx.fillText(Math.abs(maxY) >= 1000 ? `${(val / 1000).toFixed(maxY >= 10000 ? 0 : 1)}k` : val.toFixed(maxY >= 10 ? 1 : 2), 4, y + 4);
+    const span = maxY - minY;
+    ctx.fillText(Math.abs(maxY) >= 10000 ? `${(val / 1000).toFixed(0)}k` : val.toFixed(span >= 20 ? 0 : span >= 2 ? 1 : 2), 4, y + 4);
   }
 
   series.forEach(s => {
     ctx.strokeStyle = s.color;
-    ctx.lineWidth = 2.2;
+    ctx.lineWidth = s.width || 2.2;
     ctx.beginPath();
     let penDown = false;
     s.data.forEach((v, idx) => {

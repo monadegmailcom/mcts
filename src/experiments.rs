@@ -83,6 +83,10 @@ pub struct ExperimentPoint {
     pub wall_secs: f64,
     /// Score `(wins + draws / 2) / games` in percent vs each of the run's `opponents`.
     pub scores: Vec<f32>,
+    /// `[wins, draws, losses]` vs each of the run's `opponents` (empty in runs recorded before
+    /// these were kept).
+    #[serde(default)]
+    pub wdl: Vec<[usize; 3]>,
     pub value_loss: f32,
     pub policy_kl: f32,
     pub sims_per_sec: f32,

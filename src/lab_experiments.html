@@ -64,7 +64,7 @@
       <div style="overflow-x:auto;">
         <table class="exp-table" style="width:100%; border-collapse:collapse; font-size:0.78rem;">
           <thead><tr style="color:var(--muted); text-align:left;">
-            <th></th><th>Run</th><th>Setup</th><th>Status</th><th>Iter</th><th>Games</th><th>Train min</th><th>Games/min</th><th>Last scores</th><th></th>
+            <th></th><th>Run</th><th>Setup</th><th>Status</th><th>Iter</th><th>Games</th><th>Train min</th><th>Games/min</th><th>Last results (W-D-L)</th><th></th>
           </tr></thead>
           <tbody id="exp-rows"></tbody>
         </table>
@@ -77,6 +77,11 @@
       <span>📈 Strength Curves</span>
       <span style="font-size:0.78rem; display:flex; gap:8px; align-items:center;">
         Game <select id="exp-chart-game" onchange="expDrawChart()"></select>
+        show <select id="exp-chart-y" onchange="expDrawChart()">
+          <option value="wdl">wins · draws · losses</option>
+          <option value="score">score</option>
+          <option value="elo">anchored Elo</option>
+        </select>
         vs <select id="exp-chart-opp" onchange="expDrawChart()"></select>
         x-axis <select id="exp-chart-x" onchange="expDrawChart()">
           <option value="train">training minutes</option>
@@ -85,7 +90,9 @@
         </select>
       </span>
     </h2>
-    <p class="hint">Score = (wins + ½ draws) / games in % against the chosen evaluation opponent (fixed openings, colors swapped). Click a run's colour dot in the table to hide/show it.</p>
+    <p class="hint">Results against the chosen evaluation opponent (fixed openings, colors swapped): wins (solid), draws (dashed) and losses (dotted) in %,
+      or the score (wins + ½ draws). Anchored Elo combines all opponents that are Elo anchors (calibrated on the training tab) into one rating, so
+      runs evaluated against different anchors stay comparable. Click a run's colour dot in the table to hide/show it.</p>
     <canvas id="exp-chart" width="1100" height="320" style="width:100%;"></canvas>
     <div id="exp-legend" class="legend" style="flex-wrap:wrap;"></div>
   </div>
@@ -170,7 +177,12 @@ function expRender() {
     const last = r.points[r.points.length - 1];
     const trainMin = last ? last.train_secs / 60 : 0;
     const gpm = last && last.train_secs > 0 ? (last.games / (last.train_secs / 60)).toFixed(0) : '—';
-    const scores = last ? r.opponents.map((o, i) => `${o.split(' ')[0]} ${last.scores[i].toFixed(0)}%`).join('<br>') : '—';
+    const results = last ? r.opponents.map((o, i) => {
+      const wdl = last.wdl && last.wdl[i];
+      return `${o.split(' ')[0]} ${wdl ? wdl.join('-') : last.scores[i].toFixed(0) + '%'}`;
+    }) : [];
+    if (last && last.elo) results.push(`<b>Elo ${last.elo.elo.toFixed(0)}</b>${last.elo.stderr == null ? '' : ' ± ' + last.elo.stderr.toFixed(0)}`);
+    const scores = results.join('<br>') || '—';
     const st = r.status.state + (r.status.message ? `: ${r.status.message}` : '');
     const spec = r.spec;
     const actions = [];
@@ -303,17 +315,31 @@ function expDrawChart() {
     if ([...oppSel.options].some(o => o.value === prev)) oppSel.value = prev;
   }
   const opp = oppSel.value || 'avg';
+  const yKey = document.getElementById('exp-chart-y').value;
+  oppSel.disabled = yKey === 'elo';
   const xKey = document.getElementById('exp-chart-x').value;
   const xOf = (p) => xKey === 'train' ? p.train_secs / 60 : (xKey === 'games' ? p.games : p.iteration);
-  const yOf = (r, p) => {
+  // [wins, draws, losses] against the chosen opponent, or summed over all opponents.
+  const wdlOf = (r, p) => {
+    if (!p.wdl || !p.wdl.length) return null;
+    if (opp === 'avg') return p.wdl.reduce((s, x) => s.map((v, k) => v + x[k]), [0, 0, 0]);
+    const i = r.opponents.indexOf(opp);
+    return i >= 0 ? p.wdl[i] : null;
+  };
+  const pctOf = (wdl, k) => { const n = wdl ? wdl[0] + wdl[1] + wdl[2] : 0; return n ? 100 * wdl[k] / n : null; };
+  const scoreOf = (r, p) => {
     if (opp === 'avg') return p.scores.reduce((a, b) => a + b, 0) / Math.max(1, p.scores.length);
     const i = r.opponents.indexOf(opp);
     return i >= 0 ? p.scores[i] : null;
   };
-  const series = runs.filter(r => !expHidden.has(r.id)).map(r => ({
-    color: expColor(r.id), name: r.spec.name,
-    pts: r.points.map(p => [xOf(p), yOf(r, p)]).filter(([, y]) => y !== null),
-  }));
+  // One line per run (wins, draws and losses: three lines per run, told apart by their dash).
+  const lines = yKey === 'wdl'
+    ? [[0, []], [1, [6, 4]], [2, [2, 3]]].map(([k, dash]) => ({ dash, y: (r, p) => pctOf(wdlOf(r, p), k) }))
+    : [{ dash: [], y: yKey === 'elo' ? (r, p) => (p.elo ? p.elo.elo : null) : scoreOf }];
+  const series = runs.filter(r => !expHidden.has(r.id)).flatMap(r => lines.map(l => ({
+    color: expColor(r.id), name: r.spec.name, dash: l.dash,
+    pts: r.points.map(p => [xOf(p), l.y(r, p)]).filter(([, y]) => y !== null),
+  })));
 
   const c = document.getElementById('exp-chart');
   const ctx = c.getContext('2d');
@@ -324,33 +350,47 @@ function expDrawChart() {
   let maxX = 0;
   series.forEach(s => s.pts.forEach(([x]) => { if (x > maxX) maxX = x; }));
   if (maxX <= 0) maxX = 1;
+  // Percentages on a fixed 0–100 axis; Elo on rounded bounds around the data.
+  let [minY, maxY] = [0, 100];
+  if (yKey === 'elo') {
+    const ys = series.flatMap(s => s.pts.map(([, y]) => y));
+    minY = ys.length ? Math.floor(Math.min(...ys) / 100) * 100 : 0;
+    maxY = ys.length ? Math.ceil(Math.max(...ys) / 100) * 100 : 100;
+    if (maxY === minY) maxY += 100;
+  }
   const X = (x) => padL + plotW * (x / maxX);
-  const Y = (y) => padT + plotH * (1 - y / 100);
+  const Y = (y) => padT + plotH * (1 - (y - minY) / (maxY - minY));
   ctx.font = '11px monospace';
   ctx.strokeStyle = '#1e293b';
   ctx.fillStyle = '#64748b';
   for (let i = 0; i <= 4; i++) {
-    const y = Y(i * 25);
+    const v = minY + (maxY - minY) * i / 4;
+    const y = Y(v);
     ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-    ctx.fillText(`${i * 25}%`, 6, y + 4);
+    ctx.fillText(yKey === 'elo' ? v.toFixed(0) : `${v.toFixed(0)}%`, 6, y + 4);
   }
   for (let i = 0; i <= 5; i++) {
     const xv = maxX * i / 5;
     ctx.fillText(xKey === 'train' ? xv.toFixed(1) : Math.round(xv).toString(), X(xv) - 10, H - 10);
   }
   ctx.fillText(xKey === 'train' ? 'training minutes' : (xKey === 'games' ? 'self-play games' : 'iteration'), W - padR - 130, H - 10);
-  ctx.setLineDash([4, 4]);
-  ctx.strokeStyle = '#475569';
-  ctx.beginPath(); ctx.moveTo(padL, Y(50)); ctx.lineTo(W - padR, Y(50)); ctx.stroke();
-  ctx.setLineDash([]);
+  if (yKey === 'score') {
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = '#475569';
+    ctx.beginPath(); ctx.moveTo(padL, Y(50)); ctx.lineTo(W - padR, Y(50)); ctx.stroke();
+  }
   series.forEach(s => {
     ctx.strokeStyle = s.color; ctx.fillStyle = s.color; ctx.lineWidth = 2.2;
+    ctx.setLineDash(s.dash);
     ctx.beginPath();
     s.pts.forEach(([x, y], i) => { if (i === 0) ctx.moveTo(X(x), Y(y)); else ctx.lineTo(X(x), Y(y)); });
     ctx.stroke();
-    s.pts.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(X(x), Y(y), 3, 0, 2 * Math.PI); ctx.fill(); });
+    ctx.setLineDash([]);
+    if (s.dash.length === 0) s.pts.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(X(x), Y(y), 3, 0, 2 * Math.PI); ctx.fill(); });
   });
-  document.getElementById('exp-legend').innerHTML = series.map(s => `<span style="color:${s.color}">● ${s.name}</span>`).join('');
+  const names = [...new Map(series.map(s => [s.name, s.color])).entries()];
+  document.getElementById('exp-legend').innerHTML = names.map(([n, c]) => `<span style="color:${c}">● ${n}</span>`).join('')
+    + (yKey === 'wdl' ? '<span class="hint">— wins · ‒ ‒ draws · ··· losses</span>' : '');
 }
 
 // ---- Opponent editor (used by the live-training page and the experiment form) ----

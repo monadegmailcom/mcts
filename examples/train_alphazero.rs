@@ -33,6 +33,7 @@ use mcts::games::tic_tac_toe::TicTacToe;
 use mcts::games::ultimate_ttt::{INPUT_SIZE as UTTT_INPUT_SIZE, UltimateTicTacToe};
 use mcts::inference::InferenceService;
 use mcts::matchup::{RandomPlayer, run_multi_match_with_openings};
+use mcts::elo::{EloPool, Pairing};
 use mcts::experiments::{ExperimentPoint, ExperimentSpec, RunStatus, score_pct};
 use mcts::hyperparams::AlphaZeroHyperparams;
 use mcts::mcts::{MctsConfig, MctsPlayer, PlayoutEvaluator, Uct};
@@ -166,8 +167,11 @@ where
         eval_ms,
     };
 
-    let arena_txt: Vec<String> =
+    let mut arena_txt: Vec<String> =
         rec.arena.iter().map(|a| format!("vs {} {}W-{}D-{}L", a.label, a.wdl[0], a.wdl[1], a.wdl[2])).collect();
+    if let Some(r) = hub.elo_pool(game).and_then(|pool| pool.estimate(rec.arena.iter().map(|a| (&a.opponent, a.wdl)))) {
+        arena_txt.push(format!("Elo {:.0} ± {:.0}", r.elo, r.stderr));
+    }
     println!(
         "[{tag:<4} #{iter:>3}] Loss {:>5.3} | KL {:>6.4} | MSE {:>6.4} | {} | Dedup {:>4.1}% | {:>7.0} sims/s",
         rec.total_loss,
@@ -198,6 +202,57 @@ where
 
 type LabService<const G: usize, const P: usize> = InferenceService<NetEvaluator<G, P, 2>, G, P, 2>;
 
+/// The networks of `opponents` (in order; `None` for engines without one), loaded on `device`.
+/// An `Err` says why a checkpoint could not be loaded.
+fn load_opponent_networks<S, const G: usize, const P: usize>(
+    opponents: &[OpponentSpec],
+    device: NnDevice,
+) -> Vec<Result<Option<LabService<G, P>>, String>>
+where
+    S: LabGameSpec<G, P>,
+{
+    opponents
+        .iter()
+        .map(|o| match o {
+            OpponentSpec::AlphaZero { checkpoint, .. } => {
+                let path = checkpoints::path(checkpoint);
+                let cfg = checkpoints::net_config::<S, G, P, 2>(&path)?;
+                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(&path)).map_err(|e| e.to_string())?;
+                Ok(Some(InferenceService::new(ev, 256, 1)))
+            }
+            _ => Ok(None),
+        })
+        .collect()
+}
+
+/// A player for `spec` starting at `game`; `net` is the network of an AlphaZero opponent.
+fn opponent_player<'a, S, const G: usize, const P: usize>(
+    spec: &OpponentSpec,
+    game: &Game<S, 2>,
+    seed: u64,
+    net: Option<&'a LabService<G, P>>,
+) -> Box<dyn Player<S, 2> + 'a>
+where
+    S: LabGameSpec<G, P>,
+{
+    match spec {
+        OpponentSpec::Random => Box::new(RandomPlayer::new(game.clone(), seed)),
+        OpponentSpec::Mcts { sims, exploration } => Box::new(MctsPlayer::new(
+            game.clone(),
+            S::SENTINEL_MOVE,
+            Uct::new(*exploration),
+            PlayoutEvaluator::new(seed ^ 0x55),
+            MctsConfig::new(*sims, seed).with_arena_capacity(sims * 16),
+        )),
+        OpponentSpec::Minimax { depth } => Box::new(MinimaxPlayer::new(game.clone(), S::heuristic(), *depth, seed)),
+        OpponentSpec::AlphaZero { sims, .. } => Box::new(AlphaZeroPlayer::new(
+            game.clone(),
+            net.expect("AlphaZero opponents come with their network"),
+            AlphaZeroConfig::new(1, *sims, seed).with_dirichlet(0.3, 0.0),
+        )),
+    }
+}
+
 /// Plays argmax AlphaZero (`eval_sims` per move, no noise) on `service` against each opponent from
 /// the fixed `openings` (colors swapped). An AlphaZero opponent's checkpoint is loaded on `device`;
 /// if that fails, the opponent is reported with 0 games and the error in its label.
@@ -217,28 +272,15 @@ where
     S::State: Sync,
 {
     let threads = hp.eval_thread_count();
-    let h = S::heuristic();
-    // Opponent networks are loaded first so the player factories can borrow them.
-    let az_services: Vec<Result<Option<LabService<G, P>>, String>> = opponents
-        .iter()
-        .map(|o| match o {
-            OpponentSpec::AlphaZero { checkpoint, .. } => {
-                let path = checkpoints::path(checkpoint);
-                let cfg = checkpoints::net_config::<S, G, P, 2>(&path)?;
-                let ev = NetEvaluator::<G, P, 2>::standalone(&cfg, &[device], Some(&path)).map_err(|e| e.to_string())?;
-                Ok(Some(InferenceService::new(ev, 256, 1)))
-            }
-            _ => Ok(None),
-        })
-        .collect();
+    let nets = load_opponent_networks::<S, G, P>(opponents, device);
     let mut results = Vec::with_capacity(opponents.len());
-    for (k, (opp, az)) in opponents.iter().zip(&az_services).enumerate() {
+    for (k, (opp, net)) in opponents.iter().zip(&nets).enumerate() {
         let label = opp.label();
-        let svc = match az {
-            Ok(svc) => svc.as_ref(),
+        let net = match net {
+            Ok(net) => net.as_ref(),
             Err(e) => {
                 println!("⚠️  Opponent '{label}' unavailable: {e}");
-                results.push(ArenaResult { label: format!("{label} (⚠ {e})"), wdl: [0, 0, 0] });
+                results.push(ArenaResult { opponent: opp.clone(), label: format!("{label} (⚠ {e})"), wdl: [0, 0, 0] });
                 continue;
             }
         };
@@ -254,29 +296,42 @@ where
                     .with_dirichlet(0.3, 0.0),
             ))
         };
-        let opp = opp.clone();
-        let f_opp = move |g: &Game<S, 2>, seed: u64| -> Box<dyn Player<S, 2> + '_> {
-            match &opp {
-                OpponentSpec::Random => Box::new(RandomPlayer::new(g.clone(), seed)),
-                OpponentSpec::Mcts { sims, exploration } => Box::new(MctsPlayer::new(
-                    g.clone(),
-                    S::SENTINEL_MOVE,
-                    Uct::new(*exploration),
-                    PlayoutEvaluator::new(seed ^ 0x55),
-                    MctsConfig::new(*sims, seed).with_arena_capacity(sims * 16),
-                )),
-                OpponentSpec::Minimax { depth } => Box::new(MinimaxPlayer::new(g.clone(), h, *depth, seed)),
-                OpponentSpec::AlphaZero { sims, .. } => Box::new(AlphaZeroPlayer::new(
-                    g.clone(),
-                    svc.expect("opponent network loaded above"),
-                    AlphaZeroConfig::new(1, *sims, seed).with_dirichlet(0.3, 0.0),
-                )),
-            }
-        };
+        let f_opp = |g: &Game<S, 2>, seed: u64| opponent_player::<S, G, P>(opp, g, seed, net);
         let r = run_multi_match_with_openings(openings, [&f_az, &f_opp], threads, seed + 1 + k as u64);
-        results.push(ArenaResult { label, wdl: [r.wins[0], r.draws, r.wins[1]] });
+        results.push(ArenaResult { opponent: opp.clone(), label, wdl: [r.wins[0], r.draws, r.wins[1]] });
     }
     results
+}
+
+/// Plays a round-robin between `anchors` (`games_per_pair` games per pairing from the evaluation
+/// openings, colors swapped) and fits their Elo ratings.
+fn calibrate_elo<S, const G: usize, const P: usize>(
+    hub: &TelemetryHub,
+    anchors: Vec<OpponentSpec>,
+    games_per_pair: usize,
+) -> Result<EloPool, String>
+where
+    S: LabGameSpec<G, P>,
+    S::State: Sync,
+{
+    let nets = load_opponent_networks::<S, G, P>(&anchors, hub.system_settings().train_device())
+        .into_iter()
+        .zip(&anchors)
+        .map(|(net, a)| net.map_err(|e| format!("{}: {e}", a.label())))
+        .collect::<Result<Vec<_>, _>>()?;
+    let openings = S::eval_openings(games_per_pair.div_ceil(2));
+    let threads = hub.knobs_for(S::LAB).eval_thread_count();
+    let pairs: Vec<(usize, usize)> = (0..anchors.len()).flat_map(|a| (a + 1..anchors.len()).map(move |b| (a, b))).collect();
+    let mut pairings = Vec::with_capacity(pairs.len());
+    for (k, &(a, b)) in pairs.iter().enumerate() {
+        hub.set_elo_status(S::LAB, format!("Pairing {}/{}: {} vs {}", k + 1, pairs.len(), anchors[a].label(), anchors[b].label()));
+        let f_a = |g: &Game<S, 2>, seed: u64| opponent_player::<S, G, P>(&anchors[a], g, seed, nets[a].as_ref());
+        let f_b = |g: &Game<S, 2>, seed: u64| opponent_player::<S, G, P>(&anchors[b], g, seed, nets[b].as_ref());
+        let r = run_multi_match_with_openings(&openings, [&f_a, &f_b], threads, S::SEED + 700_000 + k as u64 * 10);
+        println!("⚖️  {} vs {}: {}W-{}D-{}L", anchors[a].label(), anchors[b].label(), r.wins[0], r.draws, r.wins[1]);
+        pairings.push(Pairing { a, b, wdl: [r.wins[0], r.draws, r.wins[1]] });
+    }
+    Ok(EloPool::calibrate(anchors, pairings, openings.len() * 2))
 }
 
 /// Trains a fresh network for experiment `id` until its budget is used up (or it is stopped),
@@ -323,13 +378,14 @@ where
     let (mut train_secs, mut games, mut positions) = (0.0f64, 0usize, 0usize);
     let (mut value_loss, mut policy_kl, mut sims_per_sec) = (0.0f32, 0.0f32, 0.0f32);
     let evaluate = |iter: usize, train_secs: f64, games: usize, positions: usize, vl: f32, kl: f32, sps: f32| {
-        let scores: Vec<f32> =
+        let wdl: Vec<[usize; 3]> =
             play_opponents::<S, G, P>(&service, &openings, spec.eval_sims, &hp, &opponents, dev, 9_000 + iter as u64 * 10, |p| {
                 hub.experiment_phase(id, format!("iter {iter}: {p}"));
             })
             .iter()
-            .map(|a| score_pct(a.wdl[0], a.wdl[1], a.wdl.iter().sum()))
+            .map(|a| a.wdl)
             .collect();
+        let scores: Vec<f32> = wdl.iter().map(|&[w, d, l]| score_pct(w, d, w + d + l)).collect();
         println!("🧪 #{id} iter {iter:>3} | {:>5.1} train-min | {games:>6} games | scores {scores:?}", train_secs / 60.0);
         hub.experiment_point(id, ExperimentPoint {
             iteration: iter,
@@ -338,6 +394,7 @@ where
             train_secs,
             wall_secs: start.elapsed().as_secs_f64(),
             scores,
+            wdl,
             value_loss: vl,
             policy_kl: kl,
             sims_per_sec: sps,
@@ -454,6 +511,7 @@ fn main() -> candle_core::Result<()> {
     let hub = TelemetryHub::new(label, iterations, initial_knobs);
     if interactive_lab {
         hub.enable_experiment_store("lab_experiments.json");
+        hub.enable_elo_pools();
     }
     hub.set_system_info(system);
     match hub.spawn_http_server(&bind_addr) {
@@ -581,6 +639,13 @@ fn main() -> candle_core::Result<()> {
                         RunStatus::Failed(e.to_string())
                     });
                     hub.experiment_finished(id, status);
+                }
+                TrainingCommand::CalibrateElo { game, anchors, games_per_pair } => {
+                    let result = match game {
+                        LabGame::Ttt => calibrate_elo::<TicTacToe, 27, 9>(&hub, anchors, games_per_pair),
+                        LabGame::Uttt => calibrate_elo::<UltimateTicTacToe, { UTTT_INPUT_SIZE }, 81>(&hub, anchors, games_per_pair),
+                    };
+                    hub.finish_elo_calibration(game, result);
                 }
                 TrainingCommand::RunIteration {
                     game: LabGame::Ttt,
