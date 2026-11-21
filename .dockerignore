@@ -1,0 +1,8 @@
+# The image builds from Cargo.toml, Cargo.lock, build.rs, src/, examples/ and docker/ only.
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!examples/
+!docker/

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# (Re)starts the Browser Lab in the background, in MCTS_DATA_DIR (checkpoints, experiments, Elo
+# pools) and serving on MCTS_BIND_ADDR. Output goes to $MCTS_DATA_DIR/lab.log. Extra arguments are
+# passed to train_alphazero, e.g. `mcts-lab --backend=candle`.
+set -euo pipefail
+
+if pkill -x train_alphazero; then
+    echo "Stopped the running lab."
+    sleep 1
+fi
+mkdir -p "$MCTS_DATA_DIR"
+cd "$MCTS_DATA_DIR"
+nohup train_alphazero --serve "$@" >> lab.log 2>&1 &
+echo "Browser Lab started (pid $!) on $MCTS_BIND_ADDR, data in $MCTS_DATA_DIR, log in $MCTS_DATA_DIR/lab.log"
