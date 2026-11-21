@@ -90,7 +90,8 @@ LIBTORCH=$PWD/libtorch LIBTORCH_BYPASS_VERSION_CHECK=1 \
 ```
 
 Options are `key=value` (see the file header); weights go to `checkpoints/rubiks_rounds.safetensors`
-after every iteration and `init=rubiks_rounds.safetensors` continues a run.
+after every iteration and `init=rubiks_rounds.safetensors` continues a run. The Browser Lab trains,
+experiments with and plays the cube as well (🧊 Rubik's Cube).
 
 ## Browser Lab
 
@@ -117,3 +118,10 @@ map shows what it thinks of every candidate move (⏭ plays it, ▶ keeps playin
 and the score of every move for Minimax. A win-probability graph and the move list let you review the game.
 New games implement `play::PlayableGame` (start position, Minimax heuristic, evaluation openings,
 cell owners). The evaluation openings are shared by the training evaluation, experiments and arena matches.
+
+The **Rubik's cube** is a one-player game in the lab: live training and experiments play the round
+game, with the cube's own settings (discount γ, rounds, move budget) next to the shared knobs, and
+are evaluated in noise-free round games (game score, solve rate per round) instead of opponents.
+In the Play tab the cube is drawn in 3D (drag to turn the view): turn faces with the buttons or
+keys, scramble it, and let AlphaZero solve it step by step (⏭) or on its own (▶), with the
+network's prior, the search share and the expected moves to solved for every move.

@@ -22,9 +22,11 @@
 use std::fmt;
 
 use rand::prelude::{Rng, RngExt};
+use serde::{Deserialize, Serialize};
 
-use crate::alphazero::{AlphaZeroGame, Episode};
+use crate::alphazero::{AlphaZeroGame, Episode, SelfPlayConfig, SelfPlayResult, run_chained_self_play};
 use crate::hyperparams::AlphaZeroHyperparams;
+use crate::inference::{BatchEvaluator, InferenceService};
 use crate::mcts::Fpu;
 use crate::game::{Game, GameRules, GameStatus, PlayerIndex};
 use crate::minimax::HeuristicEvaluator;
@@ -152,6 +154,20 @@ const fn sticker_3d(idx: usize) -> Sticker3D {
         pos,
         normal: FACE_NORMALS[face],
     }
+}
+
+/// Where sticker `idx` sits: the position of its cubie (`x` right, `y` up, `z` front; each in
+/// `-1..=1`) and the outward normal of its face. For drawing the cube.
+pub const fn sticker_geometry(idx: usize) -> ([i8; 3], [i8; 3]) {
+    let s = sticker_3d(idx);
+    (s.pos, s.normal)
+}
+
+/// The face turned by `mv`, as its outward normal: the move turns the layer of cubies on that
+/// side by 90°, clockwise as seen from outside for even moves (`U`, `D`, ...) and
+/// counter-clockwise for the primed ones.
+pub const fn move_axis(mv: RubiksMove) -> [i8; 3] {
+    FACE_NORMALS[(mv / 2) as usize]
 }
 
 #[inline]
@@ -290,6 +306,13 @@ impl RubiksState {
     #[inline]
     pub fn is_solved(&self) -> bool {
         self.stickers == SOLVED_STICKERS
+    }
+
+    /// The cube after `moves` from solved, with `remaining_steps` moves left and every move
+    /// allowed next (like a fresh scramble).
+    pub fn after_moves(moves: &[RubiksMove], remaining_steps: u8) -> Self {
+        let stickers = moves.iter().fold(SOLVED_STICKERS, |s, &mv| apply_move_stickers(&s, mv));
+        Self { stickers, remaining_steps, last_move: NO_MOVE }
     }
 
     /// Generates a curriculum scramble `scramble_depth` quarter-turns away from solved,
@@ -554,20 +577,120 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 1> for RubiksCube {
 // Round game
 // ---------------------------------------------------------------------------------------------
 
-/// Cube-specific training settings, on top of the shared [`AlphaZeroHyperparams`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Cube-specific training settings, on top of the shared [`AlphaZeroHyperparams`]. In JSON the
+/// round rules sit next to `discount` (`{"discount": 0.9, "max_rounds": 26, ...}`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RubiksSettings {
     /// Per-move discount `γ` of search values and value targets
     /// ([`crate::alphazero::SelfPlayConfig::discount`]): the network learns `γ^(moves to solved)`,
     /// so `0.9` values a cube solved in 5 moves at `0.59` and one solved in 20 moves at `0.12`.
     pub discount: f32,
     /// Rules of the game played in self-play and evaluation.
+    #[serde(flatten)]
     pub rounds: RoundGame,
 }
 
 impl Default for RubiksSettings {
     fn default() -> Self {
         Self { discount: 0.9, rounds: RoundGame::default() }
+    }
+}
+
+impl RubiksSettings {
+    /// Clamps the settings to sane ranges.
+    pub fn sanitized(self) -> Self {
+        let r = self.rounds;
+        Self {
+            discount: self.discount.clamp(0.5, 1.0),
+            rounds: RoundGame {
+                max_rounds: r.max_rounds.clamp(1, 40),
+                moves_per_turn: r.moves_per_turn.min(10),
+                extra_moves: r.extra_moves,
+                max_moves: r.max_moves.max(1),
+            },
+        }
+    }
+
+    /// Self-play of one iteration: `hp`'s search settings with this discount.
+    pub fn self_play_config(&self, hp: &AlphaZeroHyperparams, seed: u64) -> SelfPlayConfig {
+        hp.self_play_config(seed).with_discount(self.discount)
+    }
+
+    /// Evaluation: `hp.eval_games` games at `hp.eval_simulations()` per move, without noise.
+    pub fn eval_config(&self, hp: &AlphaZeroHyperparams, seed: u64) -> SelfPlayConfig {
+        SelfPlayConfig::new(hp.eval_games, hp.eval_simulations(), seed)
+            .with_workers(hp.eval_thread_count())
+            .with_opening_moves(0)
+            .with_puct(hp.c_base, hp.c_init)
+            .with_fpu(hp.fpu)
+            .with_dirichlet(0.3, 0.0)
+            .with_discount(self.discount)
+    }
+
+    /// Plays round games with `config` (self-play or evaluation).
+    pub fn play<E>(&self, service: &InferenceService<E, INPUT_SIZE, POLICY_SIZE, 1>, config: &SelfPlayConfig) -> SelfPlayResult<INPUT_SIZE, POLICY_SIZE, 1>
+    where
+        E: BatchEvaluator<INPUT_SIZE, POLICY_SIZE, 1> + 'static,
+    {
+        run_chained_self_play(service, config, &|played, rng| self.rounds.next_round(played, rng))
+    }
+}
+
+/// How a set of round games went.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoundStats {
+    pub games: usize,
+    /// Mean game score and its standard error.
+    pub score: f64,
+    pub score_stderr: f64,
+    /// Highest round solved in any game.
+    pub best_round: usize,
+    /// Per round, from round 1 to the highest one played: games that played it, solved it, and
+    /// the total moves of those solves.
+    pub reached: Vec<usize>,
+    pub solved: Vec<usize>,
+    pub solve_moves: Vec<usize>,
+}
+
+impl RoundStats {
+    /// Statistics of round games whose rounds ended as `games` ([`SelfPlayResult::episodes`]).
+    pub fn new(games: &[Vec<Episode<1>>]) -> Self {
+        let rounds = games.iter().map(Vec::len).max().unwrap_or(0);
+        let mut stats = Self {
+            games: games.len(),
+            reached: vec![0; rounds],
+            solved: vec![0; rounds],
+            solve_moves: vec![0; rounds],
+            ..Self::default()
+        };
+        let scores: Vec<f64> = games.iter().map(|g| RoundGame::score(g)).collect();
+        let n = scores.len() as f64;
+        stats.score = scores.iter().sum::<f64>() / n.max(1.0);
+        stats.score_stderr =
+            (scores.iter().map(|s| (s - stats.score).powi(2)).sum::<f64>() / (n - 1.0).max(1.0) / n.max(1.0)).sqrt();
+        for game in games {
+            for (i, round) in game.iter().enumerate() {
+                stats.reached[i] += 1;
+                if solved(round) {
+                    stats.solved[i] += 1;
+                    stats.solve_moves[i] += round.moves;
+                }
+            }
+        }
+        stats.best_round = stats.solved.iter().rposition(|&s| s > 0).map_or(0, |i| i + 1);
+        stats
+    }
+
+    /// One line per round played: games that reached it, solve rate and average moves of the solves.
+    pub fn table(&self) -> String {
+        let mut out = String::from("      round | reached | solved | moves (avg)\n");
+        for (i, (&reached, &solved)) in self.reached.iter().zip(&self.solved).enumerate() {
+            let moves = if solved > 0 { format!("{:.1}", self.solve_moves[i] as f64 / solved as f64) } else { "-".into() };
+            let rate = 100.0 * solved as f64 / reached.max(1) as f64;
+            out += &format!("      {:>5} | {reached:>7} | {rate:>5.0}% | {moves:>6}\n", i + 1);
+        }
+        out
     }
 }
 
@@ -581,7 +704,8 @@ impl Default for RubiksSettings {
 /// Each round is one episode of [`crate::alphazero::run_chained_self_play`]. The next scramble is
 /// random, so rounds are searched and learned on their own; the game decides *which* cubes are
 /// played, moving on to deeper scrambles as the network improves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RoundGame {
     /// Last round (26 quarter turns reach every cube).
     pub max_rounds: u8,

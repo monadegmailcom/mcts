@@ -20,6 +20,7 @@ pub mod minimax;
 pub mod nn;
 pub mod opponents;
 pub mod play;
+pub mod play_cube;
 #[cfg(feature = "tch")]
 pub mod nn_tch;
 pub mod player;

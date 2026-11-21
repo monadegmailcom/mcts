@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::games::rubiks_cube::RoundStats;
+
 use crate::hyperparams::AlphaZeroHyperparams;
 use crate::opponents::OpponentSpec;
 
@@ -51,6 +53,9 @@ pub struct ExperimentSpec {
     pub opponents: Vec<OpponentSpec>,
     /// Checkpoint to start from (empty = fresh random weights). Must match the `net` architecture.
     pub init_checkpoint: String,
+    /// The game's own settings (the cube's `RubiksSettings`; `null`: the game's defaults).
+    #[serde(default)]
+    pub game_settings: serde_json::Value,
 }
 
 impl Default for ExperimentSpec {
@@ -71,6 +76,7 @@ impl Default for ExperimentSpec {
             infer_workers: 1,
             opponents: Vec::new(),
             init_checkpoint: String::new(),
+            game_settings: serde_json::Value::Null,
         }
     }
 }
@@ -91,6 +97,9 @@ pub struct ExperimentPoint {
     /// these were kept).
     #[serde(default)]
     pub wdl: Vec<[usize; 3]>,
+    /// How the evaluation's round games went (Rubik's cube runs, which have no opponents).
+    #[serde(default)]
+    pub rounds: Option<RoundStats>,
     pub value_loss: f32,
     pub policy_kl: f32,
     pub sims_per_sec: f32,

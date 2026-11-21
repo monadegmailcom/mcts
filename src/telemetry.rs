@@ -35,12 +35,14 @@ use crate::games::tic_tac_toe::{self, EMPTY_STATE, TicTacToe, TttGame, TttHeuris
 use crate::games::ultimate_ttt::{
     self, EMPTY_STATE as UTTT_EMPTY_STATE, UltimateTicTacToe, UtttGame, UtttHeuristic,
 };
+use crate::games::rubiks_cube::{self, RoundStats, RubiksCube, RubiksSettings};
+use crate::play_cube::{self, CubePlayRequest};
 use crate::elo::EloPool;
 use crate::experiments::{ExperimentPoint, ExperimentSpec, ExperimentStore, RunStatus, json_value};
 use crate::hyperparams::AlphaZeroHyperparams;
 use crate::checkpoints;
 use crate::opponents::{self, OpponentSpec};
-use crate::play::{self, NetService, PlayRequest, PlayableGame};
+use crate::play::{self, PlayRequest, PlayableGame};
 use crate::utilization::UtilizationMonitor;
 use crate::inference::InferenceService;
 use crate::matchup::{RandomPlayer, run_multi_match, run_multi_match_with_openings};
@@ -58,14 +60,20 @@ pub enum LabGame {
     Ttt,
     /// 9x9 Ultimate Tic-Tac-Toe (`G = 324, P = 81, N = 2`).
     Uttt,
+    /// 3x3x3 Rubik's cube, trained with the round game (`G = 324, P = 12, N = 1`; see
+    /// [`rubiks_cube::RoundGame`]). A one-player puzzle: no opponents, Elo or arena.
+    Rubiks,
 }
 
 impl LabGame {
+    pub const ALL: [Self; 3] = [Self::Ttt, Self::Uttt, Self::Rubiks];
+
     #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ttt => "ttt",
             Self::Uttt => "uttt",
+            Self::Rubiks => "rubiks",
         }
     }
 
@@ -74,24 +82,35 @@ impl LabGame {
         match self {
             Self::Ttt => "Tic-Tac-Toe (3x3)",
             Self::Uttt => "Ultimate Tic-Tac-Toe (9x9)",
+            Self::Rubiks => "Rubik's Cube (3x3x3)",
         }
     }
 
+    /// Prefix of the game's checkpoint files.
     #[inline]
     pub const fn prefix(self) -> &'static str {
         match self {
             Self::Ttt => "ttt_",
             Self::Uttt => "uttt_",
+            Self::Rubiks => "rubiks_",
         }
+    }
+
+    /// One-player puzzles have no opponents: no arena, Elo or win/draw/loss.
+    #[inline]
+    pub const fn is_puzzle(self) -> bool {
+        matches!(self, Self::Rubiks)
     }
 
     #[inline]
     pub fn from_str_lossy(raw: &str) -> Self {
-        if raw.trim().eq_ignore_ascii_case("uttt") {
-            Self::Uttt
-        } else {
-            Self::Ttt
-        }
+        let raw = raw.trim();
+        Self::ALL.into_iter().find(|g| g.as_str().eq_ignore_ascii_case(raw)).unwrap_or(Self::Ttt)
+    }
+
+    /// The game a checkpoint file belongs to, by its prefix (unprefixed files count as TTT).
+    pub fn of_checkpoint(name: &str) -> Self {
+        [Self::Uttt, Self::Rubiks].into_iter().find(|g| name.starts_with(g.prefix())).unwrap_or(Self::Ttt)
     }
 }
 
@@ -133,6 +152,7 @@ pub fn default_elo_anchors(game: LabGame) -> Vec<OpponentSpec> {
             OpponentSpec::Minimax { depth: 2 },
             OpponentSpec::Minimax { depth: 3 },
         ],
+        LabGame::Rubiks => Vec::new(),
     }
 }
 
@@ -146,7 +166,15 @@ pub fn default_eval_opponents(game: LabGame) -> Vec<OpponentSpec> {
             OpponentSpec::Minimax { depth: 1 },
             OpponentSpec::Minimax { depth: 2 },
         ],
+        LabGame::Rubiks => Vec::new(),
     }
+}
+
+/// Round-game results of one Rubik's cube iteration.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RoundsTelemetry {
+    pub self_play: RoundStats,
+    pub eval: RoundStats,
 }
 
 /// Per-iteration training, search, arena, and system pipeline telemetry record.
@@ -161,8 +189,10 @@ pub struct IterationTelemetry {
     pub game_moves_mean: f32,
     pub self_play_wins: [usize; 2],
     pub self_play_draws: usize,
-    /// Arena results against each configured evaluation opponent.
+    /// Arena results against each configured evaluation opponent (two-player games).
     pub arena: Vec<ArenaResult>,
+    /// How the round games went (Rubik's cube): self-play and, if evaluated, the noise-free games.
+    pub rounds: Option<RoundsTelemetry>,
     pub buffer_len: usize,
     pub buffer_capacity: usize,
     pub batch_size_mean: f32,
@@ -199,6 +229,7 @@ impl IterationTelemetry {
                 "\"self_play_draws\":{},",
                 "\"arena\":[{}],",
                 "\"elo\":{},",
+                "\"rounds\":{},",
                 "\"buffer_len\":{},",
                 "\"buffer_capacity\":{},",
                 "\"batch_size_mean\":{:.3},",
@@ -236,6 +267,7 @@ impl IterationTelemetry {
                 .collect::<Vec<_>>()
                 .join(","),
             serde_json::to_string(&self.rating(pool)).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&self.rounds).unwrap_or_else(|_| "null".into()),
             self.buffer_len,
             self.buffer_capacity,
             finite_or_zero(self.batch_size_mean),
@@ -296,6 +328,10 @@ impl LiveKnobs {
 
     pub fn default_uttt() -> Self {
         Self::for_game::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, { ultimate_ttt::POLICY_SIZE }, 2>()
+    }
+
+    pub fn default_rubiks() -> Self {
+        Self::for_game::<RubiksCube, { rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>()
     }
 
     fn to_json(self) -> String {
@@ -696,10 +732,10 @@ impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
     }
 }
 
-impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
+impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
     /// Network for a Play-tab AlphaZero engine: the live model, or a checkpoint file (loaded with
     /// the architecture recorded in it).
-    fn play_network<R: AlphaZeroGame<G, P, 2>>(&self, checkpoint: &str) -> Result<Arc<NetService<G, P>>, String> {
+    fn play_network<R: AlphaZeroGame<G, P, N>>(&self, checkpoint: &str) -> Result<SharedService<G, P, N>, String> {
         if checkpoint.is_empty() || checkpoint == "live" {
             return Ok(Arc::clone(&self.live_service));
         }
@@ -715,7 +751,7 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
             cache.push(entry);
             return Ok(service);
         }
-        let config = checkpoints::net_config::<R, G, P, 2>(&path)?;
+        let config = checkpoints::net_config::<R, G, P, N>(&path)?;
         let evaluator = NetEvaluator::standalone(&config, &self.devices, Some(&path))
             .map_err(|e| format!("cannot load '{}': {e}", key.0))?;
         let replicas = evaluator.num_replicas();
@@ -851,8 +887,12 @@ struct HubInner {
     active_game: LabGame,
     ttt_state: GameLabState,
     uttt_state: GameLabState,
+    rubiks_state: GameLabState,
     ttt_context: Option<ModelContext<27, 9, 2>>,
     uttt_context: Option<ModelContext<{ ultimate_ttt::INPUT_SIZE }, 81, 2>>,
+    rubiks_context: Option<ModelContext<{ rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>>,
+    /// The cube's own settings (discount, round rules), applied on the next iteration.
+    rubiks_settings: RubiksSettings,
     experiments: ExperimentStore,
     /// CPU/GPU utilization, sampled while the HTTP server runs.
     utilization: Option<Arc<UtilizationMonitor>>,
@@ -863,6 +903,7 @@ impl HubInner {
         match game {
             LabGame::Ttt => &self.ttt_state,
             LabGame::Uttt => &self.uttt_state,
+            LabGame::Rubiks => &self.rubiks_state,
         }
     }
 
@@ -870,11 +911,20 @@ impl HubInner {
         match game {
             LabGame::Ttt => &mut self.ttt_state,
             LabGame::Uttt => &mut self.uttt_state,
+            LabGame::Rubiks => &mut self.rubiks_state,
         }
     }
 
     fn active_state(&self) -> &GameLabState {
         self.state_for(self.active_game)
+    }
+
+    fn has_live_model(&self, game: LabGame) -> bool {
+        match game {
+            LabGame::Ttt => self.ttt_context.is_some(),
+            LabGame::Uttt => self.uttt_context.is_some(),
+            LabGame::Rubiks => self.rubiks_context.is_some(),
+        }
     }
 }
 
@@ -889,6 +939,8 @@ impl TelemetryHub {
     pub fn new(device_name: impl Into<String>, total_iterations: usize, knobs: LiveKnobs) -> Self {
         let mut uttt_knobs = LiveKnobs::default_uttt();
         uttt_knobs.paused = knobs.paused;
+        let mut rubiks_knobs = LiveKnobs::default_rubiks();
+        rubiks_knobs.paused = knobs.paused;
         Self {
             inner: Arc::new(Mutex::new(HubInner {
                 device_name: device_name.into(),
@@ -903,8 +955,11 @@ impl TelemetryHub {
                 // Auto-save is off by default (0); enable it in the Browser Lab when needed.
                 ttt_state: GameLabState::new(LabGame::Ttt, total_iterations, knobs, 0),
                 uttt_state: GameLabState::new(LabGame::Uttt, 30, uttt_knobs, 0),
+                rubiks_state: GameLabState::new(LabGame::Rubiks, 30, rubiks_knobs, 0),
                 ttt_context: None,
                 uttt_context: None,
+                rubiks_context: None,
+                rubiks_settings: RubiksSettings::default(),
                 experiments: ExperimentStore::in_memory(),
                 utilization: None,
             })),
@@ -977,6 +1032,22 @@ impl TelemetryHub {
         guard.uttt_context = Some(ModelContext::new(live_service, net_config, devices));
     }
 
+    /// Attaches the live Rubik's cube (`G=324, P=12, N=1`) [`InferenceService`] and [`AlphaZeroNetConfig`].
+    pub fn attach_rubiks_service(
+        &self,
+        live_service: SharedService<{ rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>,
+        net_config: AlphaZeroNetConfig,
+        devices: Vec<NnDevice>,
+    ) {
+        let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
+        guard.rubiks_context = Some(ModelContext::new(live_service, net_config, devices));
+    }
+
+    /// The cube's own settings in effect.
+    pub fn rubiks_settings(&self) -> RubiksSettings {
+        self.inner.lock().expect("telemetry mutex poisoned").rubiks_settings
+    }
+
     pub fn set_phase(&self, iteration: usize, phase: impl Into<String>) {
         let game = self.active_game();
         self.set_phase_for(game, iteration, phase);
@@ -988,7 +1059,7 @@ impl TelemetryHub {
         if guard.experiments.is_running() {
             return "experiment";
         }
-        if guard.ttt_state.elo.running || guard.uttt_state.elo.running {
+        if LabGame::ALL.iter().any(|&g| guard.state_for(g).elo.running) {
             return "evaluation";
         }
         let phase = guard.state_for(guard.active_game).phase.to_ascii_lowercase();
@@ -996,7 +1067,7 @@ impl TelemetryHub {
             "self-play"
         } else if phase.contains("sgd") {
             "training"
-        } else if phase.contains("arena") {
+        } else if phase.contains("evaluation") {
             "evaluation"
         } else {
             "idle"
@@ -1067,7 +1138,7 @@ impl TelemetryHub {
     /// Polls the next training lifecycle command for the background training worker loop.
     pub fn poll_training_command(&self) -> TrainingCommand {
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
-        for game in [LabGame::Ttt, LabGame::Uttt] {
+        for game in LabGame::ALL {
             let st = guard.state_for_mut(game);
             if st.reset_requested {
                 st.reset_requested = false;
@@ -1115,7 +1186,7 @@ impl TelemetryHub {
             }
         }
 
-        for game in [LabGame::Ttt, LabGame::Uttt] {
+        for game in LabGame::ALL {
             let elo = &mut guard.state_for_mut(game).elo;
             if let Some((anchors, games_per_pair)) = elo.request.take() {
                 elo.status = "Starting calibration...".into();
@@ -1134,7 +1205,7 @@ impl TelemetryHub {
     /// Loads the calibrated Elo anchors of both games from the checkpoint folder.
     pub fn enable_elo_pools(&self) {
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
-        for game in [LabGame::Ttt, LabGame::Uttt] {
+        for game in LabGame::ALL {
             guard.state_for_mut(game).elo.pool = EloPool::load(&elo_pool_path(game));
         }
     }
@@ -1197,12 +1268,8 @@ impl TelemetryHub {
     pub fn discover_models(&self) -> Vec<ModelInfo> {
         let guard = self.inner.lock().expect("telemetry mutex poisoned");
         let game = guard.active_game;
-        let has_live = match game {
-            LabGame::Ttt => guard.ttt_context.is_some(),
-            LabGame::Uttt => guard.uttt_context.is_some(),
-        };
         let iter = guard.state_for(game).current_iteration;
-        discover_game_models(game, has_live, iter)
+        discover_game_models(game, guard.has_live_model(game), iter)
     }
 
     /// Runs a fast empirical timing calibration for `game` (`Tic-Tac-Toe` or `Ultimate Tic-Tac-Toe`),
@@ -1227,6 +1294,7 @@ impl TelemetryHub {
                     .clone();
                 calibrate_uttt(uttt_ctx.as_ref())?
             }
+            LabGame::Rubiks => return Err("timing calibration is for the two-player games".into()),
         };
 
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
@@ -1381,6 +1449,7 @@ impl TelemetryHub {
                     svc_b.as_deref(),
                 )
             }
+            LabGame::Rubiks => return Err("matches are for the two-player games".into()),
         };
 
         let mut guard = self.inner.lock().expect("telemetry mutex poisoned");
@@ -1396,11 +1465,7 @@ impl TelemetryHub {
         let guard = self.inner.lock().expect("telemetry mutex poisoned");
         let game = guard.active_game;
         let st = guard.state_for(game);
-        let has_live = match game {
-            LabGame::Ttt => guard.ttt_context.is_some(),
-            LabGame::Uttt => guard.uttt_context.is_some(),
-        };
-        let models = discover_game_models(game, has_live, st.current_iteration);
+        let models = discover_game_models(game, guard.has_live_model(game), st.current_iteration);
         let models_json = models
             .iter()
             .map(ModelInfo::to_json)
@@ -1439,6 +1504,7 @@ impl TelemetryHub {
                 "\"utilization\":{},",
                 "\"calibration\":{},",
                 "\"elo\":{},",
+                "\"game_settings\":{},",
                 "\"history\":[{}],",
                 "\"matches\":[{}]",
                 "}}"
@@ -1457,6 +1523,7 @@ impl TelemetryHub {
             guard.utilization.as_ref().map_or_else(|| "null".to_string(), |u| u.to_json().to_string()),
             cal_json,
             st.elo.to_json(game),
+            if game == LabGame::Rubiks { json_value(&guard.rubiks_settings) } else { serde_json::Value::Null },
             history_json,
             matches_json,
         )
@@ -1464,22 +1531,30 @@ impl TelemetryHub {
 
     /// Answers `POST /api/play` (see [`crate::play`]).
     fn play_json(&self, body: &str) -> Result<String, String> {
-        let req: PlayRequest = serde_json::from_str(body).map_err(|e| format!("bad play request: {e}"))?;
-        let (ttt, uttt) = {
+        let bad = |e: serde_json::Error| format!("bad play request: {e}");
+        let game = serde_json::from_str::<serde_json::Value>(body).map_err(bad)?["game"].as_str().map(LabGame::from_str_lossy);
+        let (ttt, uttt, rubiks, settings) = {
             let guard = self.inner.lock().expect("telemetry mutex poisoned");
-            (guard.ttt_context.clone(), guard.uttt_context.clone())
+            (guard.ttt_context.clone(), guard.uttt_context.clone(), guard.rubiks_context.clone(), guard.rubiks_settings)
         };
         let missing = || "the network for this game is not loaded yet".to_string();
-        let response = match LabGame::from_str_lossy(&req.game) {
-            LabGame::Ttt => {
-                let ctx = ttt.ok_or_else(missing)?;
-                play::respond::<TicTacToe, 27, 9>(&req, |ckpt| ctx.play_network::<TicTacToe>(ckpt))?
-            }
+        if game == Some(LabGame::Rubiks) {
+            let req: CubePlayRequest = serde_json::from_str(body).map_err(bad)?;
+            let ctx = rubiks.ok_or_else(missing)?;
+            let response = play_cube::respond(&req, settings.discount, |ckpt| ctx.play_network::<RubiksCube>(ckpt))?;
+            return serde_json::to_string(&response).map_err(|e| e.to_string());
+        }
+        let req: PlayRequest = serde_json::from_str(body).map_err(bad)?;
+        let response = match game.unwrap_or(LabGame::Ttt) {
             LabGame::Uttt => {
                 let ctx = uttt.ok_or_else(missing)?;
                 play::respond::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81>(&req, |ckpt| {
                     ctx.play_network::<UltimateTicTacToe>(ckpt)
                 })?
+            }
+            _ => {
+                let ctx = ttt.ok_or_else(missing)?;
+                play::respond::<TicTacToe, 27, 9>(&req, |ckpt| ctx.play_network::<TicTacToe>(ckpt))?
             }
         };
         serde_json::to_string(&response).map_err(|e| e.to_string())
@@ -1505,6 +1580,17 @@ impl TelemetryHub {
                 "live": json_value(&guard.uttt_state.knobs.hp),
                 "default_opponents": default_eval_opponents(LabGame::Uttt),
                 "checkpoints": disk_checkpoints(LabGame::Uttt),
+            },
+            "rubiks": {
+                "title": LabGame::Rubiks.title(),
+                "puzzle": true,
+                "presets": presets(<RubiksCube as AlphaZeroGame<{ rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>>::net_presets()),
+                "defaults": json_value(&<RubiksCube as AlphaZeroGame<{ rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>>::hyperparams()),
+                "live": json_value(&guard.rubiks_state.knobs.hp),
+                "settings": json_value(&guard.rubiks_settings),
+                "default_settings": json_value(&RubiksSettings::default()),
+                "default_opponents": [],
+                "checkpoints": disk_checkpoints(LabGame::Rubiks),
             },
         });
         let backends: Vec<serde_json::Value> = Backend::available()
@@ -2090,8 +2176,7 @@ fn discover_game_models(game: LabGame, has_live: bool, current_iter: usize) -> V
     });
 
     for (name, size_bytes) in checkpoints::list() {
-        let belongs_to_uttt = name.starts_with("uttt_");
-        if belongs_to_uttt == (game == LabGame::Uttt) {
+        if LabGame::of_checkpoint(&name) == game {
             list.push(ModelInfo {
                 id: name,
                 kind: "disk",
@@ -2106,11 +2191,10 @@ fn discover_game_models(game: LabGame, has_live: bool, current_iter: usize) -> V
 
 fn ensure_game_prefixed_filename(game: LabGame, raw: &str) -> Option<String> {
     let base = checkpoints::sanitize_name(raw)?;
-    let prefix = game.prefix();
-    if base.starts_with("ttt_") || base.starts_with("uttt_") {
+    if LabGame::ALL.iter().any(|g| base.starts_with(g.prefix())) {
         Some(base)
     } else {
-        Some(format!("{prefix}{base}"))
+        Some(format!("{}{base}", game.prefix()))
     }
 }
 
@@ -2266,6 +2350,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
             }
 
             let active_game = guard.active_game;
+            apply_game_settings(&mut guard, body);
             let st = guard.state_for_mut(active_game);
             apply_knob_updates(&mut st.knobs, body);
             apply_opponent_updates(&mut st.eval_opponents, body);
@@ -2411,6 +2496,7 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
         {
             let mut guard = hub.inner.lock().expect("telemetry mutex poisoned");
             let active_game = guard.active_game;
+            apply_game_settings(&mut guard, body);
             let st = guard.state_for_mut(active_game);
             let was_paused = st.knobs.paused;
             apply_knob_updates(&mut st.knobs, body);
@@ -2446,11 +2532,12 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
             .map(|s| LabGame::from_str_lossy(&s))
             .unwrap_or_else(|| hub.active_game());
 
-        let (ttt_ctx, uttt_ctx, cur_iter) = {
+        let (ttt_ctx, uttt_ctx, rubiks_ctx, cur_iter) = {
             let guard = hub.inner.lock().expect("telemetry mutex poisoned");
             (
                 guard.ttt_context.clone(),
                 guard.uttt_context.clone(),
+                guard.rubiks_context.clone(),
                 guard.state_for(game).current_iteration,
             )
         };
@@ -2490,6 +2577,17 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                                 "400 Bad Request",
                                 "application/json",
                                 "{\"error\":\"No live UTTT model attached\"}",
+                            );
+                        };
+                        ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename), &ctx.net_config)
+                    }
+                    LabGame::Rubiks => {
+                        let Some(ctx) = rubiks_ctx else {
+                            return write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                "{\"error\":\"No live cube model attached\"}",
                             );
                         };
                         ctx.live_service.evaluator().save_safetensors(checkpoints::path(&filename), &ctx.net_config)
@@ -2537,6 +2635,17 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                             );
                         };
                         ctx.load_into_live::<UltimateTicTacToe>(&filename)
+                    }
+                    LabGame::Rubiks => {
+                        let Some(ctx) = rubiks_ctx else {
+                            return write_http_response(
+                                &mut stream,
+                                "400 Bad Request",
+                                "application/json",
+                                "{\"error\":\"No live cube model attached\"}",
+                            );
+                        };
+                        ctx.load_into_live::<RubiksCube>(&filename)
                     }
                 };
                 if let Err(e) = load_res {
@@ -2792,6 +2901,23 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
 }
 
 /// Replaces the evaluation opponents if the request body carries a non-empty `eval_opponents` list.
+/// Applies `game_settings` from a knobs request to the active game's own settings (the cube's
+/// [`RubiksSettings`]; fields left out keep their value).
+fn apply_game_settings(hub: &mut HubInner, body: &str) {
+    if hub.active_game != LabGame::Rubiks {
+        return;
+    }
+    let Ok(req) = serde_json::from_str::<serde_json::Value>(body) else { return };
+    let Some(update) = req["game_settings"].as_object() else { return };
+    let mut merged = json_value(&hub.rubiks_settings);
+    for (k, v) in update {
+        merged[k] = v.clone();
+    }
+    if let Ok(settings) = serde_json::from_value::<RubiksSettings>(merged) {
+        hub.rubiks_settings = settings.sanitized();
+    }
+}
+
 fn apply_opponent_updates(opponents: &mut Vec<OpponentSpec>, body: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return };
     if let Some(list) = opponents::parse_list(&v["eval_opponents"]).filter(|l| !l.is_empty()) {
@@ -2862,13 +2988,14 @@ fn escape_json(s: &str) -> String {
 static DASHBOARD_PAGE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     const EXPERIMENTS_TAB: &str = include_str!("lab_experiments.html");
     const PLAY_TAB: &str = include_str!("lab_play.html");
+    const CUBE_VIEW: &str = include_str!("lab_cube.html");
     DASHBOARD_HTML
         .replacen(
             "</button>\n</div>\n\n<!-- TAB 1",
             "</button>\n  <button class=\"tab-btn\" id=\"tab-btn-experiments\" onclick=\"switchTab('experiments')\">🧪 Experiments</button>\n</div>\n\n<!-- TAB 1",
             1,
         )
-        .replacen("<script>", &format!("{EXPERIMENTS_TAB}\n{PLAY_TAB}\n<script>"), 1)
+        .replacen("<script>", &format!("{EXPERIMENTS_TAB}\n{}\n<script>", PLAY_TAB.replacen("<!-- CUBE VIEW -->", CUBE_VIEW, 1)), 1)
 });
 
 const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
@@ -3127,6 +3254,8 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   }
   .bar-fill { height: 100%; background: var(--accent); }
   .hidden { display: none; }
+  /* The Rubik's cube is a one-player puzzle: no opponents, Elo or arena, but round-game charts. */
+  body.puzzle .two-player-only, body:not(.puzzle) .puzzle-only { display: none; }
   .engine-params {
     margin-top: 10px;
     padding-top: 10px;
@@ -3165,6 +3294,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <div class="game-switcher">
     <button id="game-btn-uttt" class="game-btn active" onclick="switchActiveGame('uttt')">⚔️ Ultimate Tic-Tac-Toe (9x9)</button>
     <button id="game-btn-ttt" class="game-btn" onclick="switchActiveGame('ttt')">🎯 Tic-Tac-Toe (3x3)</button>
+    <button id="game-btn-rubiks" class="game-btn" onclick="switchActiveGame('rubiks')">🧊 Rubik's Cube</button>
   </div>
   <div class="badges">
     <span class="badge" id="device-badge">Device: ...</span>
@@ -3175,7 +3305,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
 <div class="tabs">
   <button class="tab-btn active" id="tab-btn-lab" onclick="switchTab('lab')">📊 Live Training & System Lab</button>
-  <button class="tab-btn" id="tab-btn-arena" onclick="switchTab('arena')">⚔️ Multi-Match Arena & Compute Calibrator</button>
+  <button class="tab-btn two-player-only" id="tab-btn-arena" onclick="switchTab('arena')">⚔️ Multi-Match Arena & Compute Calibrator</button>
   <button class="tab-btn" id="tab-btn-play" onclick="switchTab('play')">🎮 Play</button>
 </div>
 
@@ -3199,7 +3329,26 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="grid">
+  <div class="grid puzzle-only">
+    <div class="card">
+      <h2><span>Round game score</span><span id="latest-round-score" style="font-size:0.78rem;color:var(--green)">—</span></h2>
+      <p class="hint">Mean game score <i>n</i> + 1/<i>r</i> (<i>n</i>: last solved round, <i>r</i>: its moves) of the noise-free evaluation
+        games (green, thin lines ± one standard error) and of the self-play games, which explore with root noise (blue). The one number
+        that says whether the network gets better.</p>
+      <canvas id="chart-round-score" width="600" height="205"></canvas>
+      <div class="legend"><span style="color:#34d399">evaluation</span><span style="color:#38bdf8">self-play</span></div>
+    </div>
+    <div class="card">
+      <h2><span>Solve rate per round (evaluation)</span><span id="latest-best-round" style="font-size:0.78rem;color:var(--green)">—</span></h2>
+      <p class="hint">One column per iteration, one row per round (round 1 at the bottom): the share of the games reaching the round that
+        solved it, from red (0 %) to green (100 %); dark: no game reached it. The table shows the latest evaluation.</p>
+      <canvas id="chart-round-heat" width="600" height="205"></canvas>
+      <table style="margin-top:6px"><thead><tr><th style="text-align:left">Round</th><th>reached</th><th>solved</th><th>moves (avg)</th></tr></thead>
+        <tbody id="round-table"></tbody></table>
+    </div>
+  </div>
+
+  <div class="grid two-player-only">
     <div class="card">
       <h2>
         <span>Strength (anchored Elo)</span>
@@ -3213,7 +3362,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
   <!-- One win/draw/loss card per evaluation opponent (built by renderArenaCards). -->
-  <div class="grid" id="arena-cards" style="margin-top:14px;"></div>
+  <div class="grid two-player-only" id="arena-cards" style="margin-top:14px;"></div>
 
   <!-- One card per metric (built by buildMetricCards), so every chart gets its own y-axis scale. -->
   <div class="grid" id="metric-cards" style="margin-top:14px;"></div>
@@ -3312,7 +3461,24 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="card" style="margin-top:14px;">
+  <div class="card puzzle-only" style="margin-top:14px;">
+    <h2>
+      <span>🧊 Round game settings (applied on the next iteration)</span>
+      <button class="btn" onclick="pushGameSettings()">Apply Settings</button>
+    </h2>
+    <p class="hint">Round <i>n</i> is a cube scrambled with <i>n</i> quarter turns, solvable within moves-per-turn × <i>n</i> + extra moves
+      (at most the maximum); solving it leads to round <i>n</i> + 1, failing ends the game. The discount γ makes the network learn
+      γ<sup>moves to solved</sup>, an estimate of the distance to the solution. Evaluation plays Eval Games round games without noise.</p>
+    <div class="knobs-grid">
+      <div class="knob-item" title="Per-move discount of search values and value targets"><label>Discount γ</label><input type="number" id="g-discount" step="0.01" min="0.5" max="1"></div>
+      <div class="knob-item" title="Last round (26 quarter turns reach every cube)"><label>Max Rounds</label><input type="number" id="g-max_rounds" min="1" max="40"></div>
+      <div class="knob-item"><label>Budget: Moves per Turn</label><input type="number" id="g-moves_per_turn" min="0" max="10"></div>
+      <div class="knob-item"><label>Budget: Extra Moves</label><input type="number" id="g-extra_moves" min="0" max="255"></div>
+      <div class="knob-item"><label>Budget: Max Moves</label><input type="number" id="g-max_moves" min="1" max="255"></div>
+    </div>
+  </div>
+
+  <div class="card two-player-only" style="margin-top:14px;">
     <h2>
       <span>🎯 Evaluation Opponents (applied on next iteration — the trained net plays each from fixed openings, colors swapped)</span>
       <button class="btn" onclick="pushOpponents()">Apply Opponents</button>
@@ -3320,7 +3486,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     <div id="live-opps"></div>
   </div>
 
-  <div class="card" style="margin-top:14px;">
+  <div class="card two-player-only" style="margin-top:14px;">
     <h2>
       <span>⚖️ Elo anchors (<span id="elo-game-label">Ultimate Tic-Tac-Toe</span>)</span>
       <span id="elo-status" style="font-size:0.78rem;color:var(--muted)">—</span>
@@ -3773,7 +3939,30 @@ function collectKnobs() {
   }
   const fpu = parseFloat(document.getElementById('k-fpu').value);
   if (Number.isFinite(fpu)) out.fpu = { [document.getElementById('k-fpu-mode').value]: fpu };
+  if (activeGame === 'rubiks') out.game_settings = collectGameSettings();
   return out;
+}
+
+// The cube's own settings ([JSON field, parser]); inputs are `g-<field>`.
+const GAME_SETTING_FIELDS = [['discount', parseFloat], ['max_rounds', parseInt], ['moves_per_turn', parseInt], ['extra_moves', parseInt], ['max_moves', parseInt]];
+
+function collectGameSettings() {
+  const out = {};
+  for (const [key, parse] of GAME_SETTING_FIELDS) {
+    const v = parse(document.getElementById(`g-${key}`).value);
+    if (Number.isFinite(v)) out[key] = v;
+  }
+  return out;
+}
+
+async function pushGameSettings() {
+  const res = await fetch('/api/knobs', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ game_settings: collectGameSettings() })
+  });
+  stateData = await res.json();
+  for (const [key] of GAME_SETTING_FIELDS) document.getElementById(`g-${key}`).value = stateData.game_settings[key];
+  renderDashboard(stateData);
 }
 
 async function pushOpponents() {
@@ -3887,6 +4076,10 @@ function renderDashboard(d) {
 
   document.getElementById('game-btn-ttt').classList.toggle('active', activeGame === 'ttt');
   document.getElementById('game-btn-uttt').classList.toggle('active', activeGame === 'uttt');
+  document.getElementById('game-btn-rubiks').classList.toggle('active', activeGame === 'rubiks');
+  const puzzle = activeGame === 'rubiks';
+  document.body.classList.toggle('puzzle', puzzle);
+  if (puzzle && !document.getElementById('tab-arena').classList.contains('hidden')) switchTab('lab');
   document.getElementById('knobs-game-label').textContent = title;
   document.getElementById('models-game-label').textContent = title;
   document.getElementById('cal-game-label').textContent = title;
@@ -3939,6 +4132,7 @@ function renderDashboard(d) {
     document.getElementById('k-fpu-mode').value = fpuMode;
     document.getElementById('k-fpu').value = fpuValue;
     oppRender('live-opps', d.eval_opponents || [], activeGame);
+    if (d.game_settings) for (const [key] of GAME_SETTING_FIELDS) document.getElementById(`g-${key}`).value = d.game_settings[key];
     document.getElementById('ctrl-total-iters').value = d.total_iterations;
     document.getElementById('ctrl-autosave').value = d.auto_save_every;
     knobsInitializedForGame = activeGame;
@@ -3953,9 +4147,66 @@ function renderDashboard(d) {
   renderEloAnchors(d.elo, title);
   renderUtilization(d.utilization);
   const h = d.history || [];
-  renderEloChart(h, d.elo);
-  renderArenaCards(h);
+  if (puzzle) {
+    renderRoundCharts(h);
+  } else {
+    renderEloChart(h, d.elo);
+    renderArenaCards(h);
+  }
   renderMetricCards(h);
+}
+
+// ---- Rubik's cube: round-game score and solve rate per round ----
+function renderRoundCharts(h) {
+  const rows = h.filter(x => x.rounds);
+  const last = rows[rows.length - 1];
+  document.getElementById('latest-round-score').textContent = last
+    ? `${last.rounds.eval.score.toFixed(2)} ± ${last.rounds.eval.score_stderr.toFixed(2)}` : '—';
+  document.getElementById('latest-best-round').textContent = last ? `best round ${last.rounds.eval.best_round}` : '—';
+  if (!rows.length) {
+    clearCanvas('chart-round-score');
+    clearCanvas('chart-round-heat');
+    document.getElementById('round-table').innerHTML = '';
+    return;
+  }
+  const evals = rows.map(x => x.rounds.eval);
+  drawChart('chart-round-score', rows.map(x => x.iteration), [
+    { data: evals.map(e => e.score + e.score_stderr), color: '#1f6f55', width: 1 },
+    { data: evals.map(e => e.score - e.score_stderr), color: '#1f6f55', width: 1 },
+    { data: rows.map(x => x.rounds.self_play.score), color: '#38bdf8' },
+    { data: evals.map(e => e.score), color: '#34d399' },
+  ], 0);
+  drawRoundHeat('chart-round-heat', evals);
+  const e = last.rounds.eval;
+  document.getElementById('round-table').innerHTML = e.reached.map((reached, i) => {
+    const solved = e.solved[i];
+    const moves = solved ? (e.solve_moves[i] / solved).toFixed(1) : '—';
+    return `<tr><td style="text-align:left">${i + 1}</td><td>${reached}</td><td>${(100 * solved / Math.max(1, reached)).toFixed(0)}%</td><td>${moves}</td></tr>`;
+  }).join('');
+}
+
+// Heat map: one column per evaluation, one row per round, coloured by the solve rate.
+function drawRoundHeat(canvasId, evals) {
+  const c = document.getElementById(canvasId);
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  const rounds = Math.max(1, ...evals.map(e => e.reached.length));
+  const padL = 30, padB = 4, padT = 4;
+  const cw = (c.width - padL) / evals.length, rh = (c.height - padT - padB) / rounds;
+  ctx.font = '10px monospace';
+  ctx.fillStyle = '#64748b';
+  for (let r = 0; r < rounds; r += Math.ceil(rounds / 10)) {
+    ctx.fillText(String(r + 1), 4, c.height - padB - r * rh - rh / 2 + 3);
+  }
+  evals.forEach((e, col) => {
+    for (let r = 0; r < rounds; r++) {
+      const reached = e.reached[r] || 0;
+      const rate = reached ? e.solved[r] / reached : null;
+      // Red (0) through amber to green (1).
+      ctx.fillStyle = rate == null ? '#111827' : `hsl(${Math.round(120 * rate)}, 65%, ${30 + 12 * rate}%)`;
+      ctx.fillRect(padL + col * cw, c.height - padB - (r + 1) * rh, Math.max(1, cw - 1), Math.max(1, rh - 1));
+    }
+  });
 }
 
 // ---- Strength: anchored Elo and per-opponent wins / draws / losses ----

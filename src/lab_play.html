@@ -39,7 +39,10 @@
   .pl-moves span.current { border-color: var(--amber); color: var(--amber); }
   #pl-chart { width: 100%; height: 150px; display: block; }
 </style>
-  <div class="pl-layout">
+  <div class="pl-row" style="margin:0 0 10px; font-size:0.85rem;">
+    Game <select id="pl-game" onchange="plNewGame()"><option value="uttt">Ultimate TTT</option><option value="ttt">Tic-Tac-Toe</option><option value="rubiks">Rubik's cube</option></select>
+  </div>
+  <div class="pl-layout" id="pl-board-view">
     <div class="card">
       <h2><span>🎮 Play</span><span id="pl-status" style="font-size:0.8rem;color:var(--green)"></span></h2>
       <p class="hint" style="margin:0 0 6px;">
@@ -48,7 +51,6 @@
         score per move, W/L = forced win/loss). ⏭ plays that move; ▶ keeps playing with the delay between moves.
       </p>
       <div class="pl-row">
-        Game <select id="pl-game" onchange="plNewGame()"><option value="uttt">Ultimate TTT</option><option value="ttt">Tic-Tac-Toe</option></select>
         <button class="btn" onclick="plNewGame()" title="Start the game over (keeps the players)">↺ Reset</button>
         <button class="btn secondary" onclick="plUndo()" title="Take back moves until it is a human's turn again">↶ Undo</button>
         <button class="btn secondary" id="pl-auto" onclick="plToggleAuto()" title="Play: engines move on their own">▶</button>
@@ -78,6 +80,7 @@
       <div class="pl-moves" id="pl-moves"></div>
     </div>
   </div>
+<!-- CUBE VIEW -->
 </div>
 
 <script>
@@ -109,7 +112,7 @@ const plSleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function playActivated() {
   if (!expData) await expRefresh(true);
   if (!PL.game) {
-    document.getElementById('pl-game').value = activeGame === 'uttt' ? 'uttt' : 'ttt';
+    document.getElementById('pl-game').value = activeGame;
     plNewGame();
   }
 }
@@ -159,6 +162,16 @@ function plSeatsChanged() {
 
 function plNewGame() {
   const game = document.getElementById('pl-game').value;
+  // The cube has its own view (lab_cube.html).
+  document.getElementById('pl-board-view').classList.toggle('hidden', game === 'rubiks');
+  document.getElementById('pl-cube-view').classList.toggle('hidden', game !== 'rubiks');
+  if (game === 'rubiks') {
+    PL.token++;
+    plSetAuto(false);
+    PL.game = game;
+    cubeActivated();
+    return;
+  }
   if (game !== PL.game) {
     PL.game = game;
     plRenderSeat('pl-seat-1', { kind: 'human' }, true);

@@ -1,0 +1,404 @@
+<!-- Rubik's cube view of the Play tab (spliced into lab_play.html by telemetry.rs). The cube is drawn with
+     CSS 3D transforms: 26 cubies with black faces and coloured stickers. A move turns its layer of cubies
+     by 90°; when the turn ends the cubies snap back and take the colours of the new cube from the server. -->
+<div id="pl-cube-view" class="hidden">
+<style>
+  .cb-layout { display: grid; grid-template-columns: minmax(380px, 540px) 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 960px) { .cb-layout { grid-template-columns: 1fr; } }
+  .cb-stage { height: 360px; perspective: 1100px; display: flex; align-items: center; justify-content: center;
+    cursor: grab; user-select: none; touch-action: none; overflow: hidden; }
+  .cb-stage:active { cursor: grabbing; }
+  .cb-scene, .cb-cubie { position: absolute; transform-style: preserve-3d; }
+  .cb-face, .cb-sticker { position: absolute; width: var(--cb); height: var(--cb); left: calc(var(--cb) / -2); top: calc(var(--cb) / -2); }
+  .cb-face { background: #05070c; }
+  .cb-sticker { border-radius: 7px; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35); display: flex; align-items: center;
+    justify-content: center; font: 800 0.8rem system-ui, sans-serif; color: rgba(0, 0, 0, 0.45); }
+  .cb-moves { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin: 8px 0; }
+  .cb-moves button { background: var(--panel-alt); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 0; font: 700 0.85rem monospace; cursor: pointer; }
+  .cb-moves button:hover { border-color: var(--accent); }
+  .cb-moves button.best { border-color: var(--amber); color: var(--amber); }
+  .cb-history { display: flex; flex-wrap: wrap; gap: 3px; font: 0.76rem monospace; margin-top: 6px; }
+  .cb-history span { padding: 1px 5px; border-radius: 3px; background: var(--panel-alt); border: 1px solid var(--border); }
+  .cb-history span.scramble { color: var(--muted); }
+  .cb-bar { height: 8px; border-radius: 3px; background: var(--accent); }
+</style>
+  <div class="cb-layout">
+    <div class="card">
+      <h2><span>🧊 Rubik's cube</span><span id="cb-status" style="font-size:0.8rem;color:var(--green)"></span></h2>
+      <p class="hint" style="margin:0 0 6px;">
+        Drag to turn the view. Turn faces with the buttons or keys (U D L R F B, with Shift for the primed, counter-clockwise turn).
+        With the solver on, AlphaZero thinks about the cube on the screen: ⏭ plays its move, ▶ solves the cube move by move.
+      </p>
+      <div class="pl-row">
+        <label title="Quarter turns of the scramble (the round of the round game)">Scramble <input type="number" id="cb-depth" value="6" min="1" max="40"> turns</label>
+        <button class="btn" onclick="cbScramble()">🎲 Scramble</button>
+        <button class="btn secondary" onclick="cbReset()" title="Back to the solved cube">↺ Solved</button>
+        <button class="btn secondary" onclick="cbUndo()" title="Take back the last turn">↶ Undo</button>
+        <button class="btn secondary" onclick="cbResetView()" title="Default view">👁</button>
+      </div>
+      <div id="cb-stage" class="cb-stage"><div id="cb-scene" class="cb-scene"></div></div>
+      <div class="cb-moves" id="cb-moves"></div>
+      <div class="pl-row">
+        <label><input type="checkbox" id="cb-solver" checked onchange="cbThink()"> Solver</label>
+        AlphaZero <select id="cb-ckpt" onchange="cbThink()"></select>
+        <label>sims <input type="number" id="cb-sims" value="800" min="1" step="100" onchange="cbThink()"></label>
+        <button class="btn secondary" id="cb-auto" onclick="cbToggleAuto()" title="Solve: play the solver's moves one after another">▶</button>
+        <button class="btn secondary" onclick="cbPlayShown()" title="Play the solver's move">⏭</button>
+        <label title="Pause between solver moves">Delay <input type="number" id="cb-delay" value="400" min="0" step="100"> ms</label>
+      </div>
+      <div class="cb-history" id="cb-history"></div>
+    </div>
+
+    <div class="card">
+      <h2><span>Solver</span><span id="cb-meta" style="font-size:0.75rem;color:var(--muted)"></span></h2>
+      <p class="hint" style="margin:0 0 8px;">
+        Per move: the network's prior, the share of the search, and the moves to solved the search expects after it
+        (from its value γ<sup>moves</sup>, the network's distance estimate). The solver plays the most searched move.
+      </p>
+      <div id="cb-summary" style="font-size:0.9rem;margin-bottom:8px;"></div>
+      <table>
+        <thead><tr><th style="text-align:left">Move</th><th>Prior</th><th style="width:35%">Search</th><th>Visits</th><th>Moves to solved</th></tr></thead>
+        <tbody id="cb-cands"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+// Cube state: the browser keeps the moves made from the solved cube; every request replays them.
+const CB = {
+  moves: [],          // all turns from solved (scramble first)
+  scrambled: 0,       // how many of them are the scramble
+  budget: 100,        // moves allowed after the scramble
+  stickers: null,
+  geometry: null,
+  cubies: null,       // [{ el, pos }]
+  stickerEls: [],
+  analysis: null,
+  view: { rx: -28, ry: -38 },
+  auto: false,
+  animating: false,
+  token: 0,
+  seed: 1,
+};
+const CB_SIZE = 56;
+const CB_COLORS = ['#f8fafc', '#facc15', '#fb923c', '#ef4444', '#22c55e', '#3b82f6'];  // U D L R F B
+const CB_FACE_NAMES = ['U', 'D', 'L', 'R', 'F', 'B'];
+const cbSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function cubeActivated() {
+  if (!CB.geometry) {
+    const data = await cbRequest(null);
+    CB.geometry = data.geometry;
+    cbBuild();
+    cbBuildMoveButtons();
+    cbBindView();
+    cbApply(data);
+    cbThink();
+  }
+  cbFillCheckpoints();
+}
+
+function cbFillCheckpoints() {
+  const sel = document.getElementById('cb-ckpt');
+  const files = (expData && expData.games.rubiks) ? expData.games.rubiks.checkpoints : [];
+  const want = ['live', ...files].join('|');
+  if (sel.dataset.files === want) return;
+  const prev = sel.value || 'live';
+  sel.innerHTML = ['live', ...files].map(f => `<option value="${f}">${f === 'live' ? 'live network' : f}</option>`).join('');
+  sel.dataset.files = want;
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
+// Our axes: x right, y up, z front. CSS: y points down.
+const cbCss = ([x, y, z]) => [x, -y, z];
+const cbKey = (pos) => pos.join(',');
+const CB_FACE_TRANSFORMS = {
+  '0,1,0': 'rotateX(90deg)', '0,-1,0': 'rotateX(-90deg)', '-1,0,0': 'rotateY(-90deg)',
+  '1,0,0': 'rotateY(90deg)', '0,0,1': '', '0,0,-1': 'rotateY(180deg)',
+};
+
+function cbCubieTransform(pos) {
+  const [x, y, z] = cbCss(pos).map(v => v * CB_SIZE);
+  return `translate3d(${x}px, ${y}px, ${z}px)`;
+}
+
+// 26 cubies, each with six black faces and its stickers (indices into the server's sticker list).
+function cbBuild() {
+  const scene = document.getElementById('cb-scene');
+  scene.style.setProperty('--cb', `${CB_SIZE}px`);
+  scene.innerHTML = '';
+  CB.cubies = [];
+  const byPos = {};
+  for (let x = -1; x <= 1; x++) for (let y = -1; y <= 1; y++) for (let z = -1; z <= 1; z++) {
+    if (!x && !y && !z) continue;
+    const el = document.createElement('div');
+    el.className = 'cb-cubie';
+    el.style.transform = cbCubieTransform([x, y, z]);
+    for (const t of Object.values(CB_FACE_TRANSFORMS)) {
+      const f = document.createElement('div');
+      f.className = 'cb-face';
+      f.style.transform = `${t} translateZ(${CB_SIZE / 2}px)`;
+      el.appendChild(f);
+    }
+    scene.appendChild(el);
+    const cubie = { el, pos: [x, y, z] };
+    CB.cubies.push(cubie);
+    byPos[cbKey(cubie.pos)] = cubie;
+  }
+  CB.stickerEls = CB.geometry.stickers.map(([pos, normal], i) => {
+    const s = document.createElement('div');
+    s.className = 'cb-sticker';
+    s.style.transform = `${CB_FACE_TRANSFORMS[cbKey(normal)]} translateZ(${CB_SIZE / 2 + 0.6}px) scale(0.9)`;
+    if (pos.filter(v => v !== 0).length === 1) s.textContent = CB_FACE_NAMES[Math.floor(i / 9)];  // face centres
+    byPos[cbKey(pos)].el.appendChild(s);
+    return s;
+  });
+  cbUpdateView();
+}
+
+function cbBuildMoveButtons() {
+  document.getElementById('cb-moves').innerHTML = CB.geometry.moves
+    .map(([name], mv) => `<button data-mv="${mv}" onclick="cbHumanMove(${mv})">${name}</button>`).join('');
+  document.addEventListener('keydown', (e) => {
+    if (document.getElementById('pl-cube-view').classList.contains('hidden') || document.getElementById('tab-play').classList.contains('hidden')) return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.metaKey || e.ctrlKey) return;
+    const face = CB_FACE_NAMES.indexOf(e.key.toUpperCase());
+    if (face < 0) return;
+    e.preventDefault();
+    cbHumanMove(face * 2 + (e.shiftKey ? 1 : 0));
+  });
+}
+
+function cbBindView() {
+  const stage = document.getElementById('cb-stage');
+  let last = null;
+  stage.addEventListener('pointerdown', (e) => { last = [e.clientX, e.clientY]; stage.setPointerCapture(e.pointerId); });
+  stage.addEventListener('pointermove', (e) => {
+    if (!last) return;
+    CB.view.ry += (e.clientX - last[0]) * 0.5;
+    CB.view.rx = Math.max(-89, Math.min(89, CB.view.rx - (e.clientY - last[1]) * 0.5));
+    last = [e.clientX, e.clientY];
+    cbUpdateView();
+  });
+  stage.addEventListener('pointerup', () => { last = null; });
+}
+
+function cbUpdateView() {
+  document.getElementById('cb-scene').style.transform = `rotateX(${CB.view.rx}deg) rotateY(${CB.view.ry}deg)`;
+}
+
+function cbResetView() {
+  CB.view = { rx: -28, ry: -38 };
+  cbUpdateView();
+}
+
+function cbPaint() {
+  CB.stickers.forEach((c, i) => { CB.stickerEls[i].style.background = CB_COLORS[c]; });
+}
+
+// Turns the layer of `mv` by 90° over `ms`, then snaps the cubies back (the caller repaints).
+function cbAnimate(mv, ms) {
+  const [name, axis] = CB.geometry.moves[mv];
+  const layer = CB.cubies.filter(c => c.pos[0] * axis[0] + c.pos[1] * axis[1] + c.pos[2] * axis[2] === 1);
+  // Clockwise seen from outside is -90° about the outward normal; flipping y for CSS flips the sense.
+  const [ax, ay, az] = cbCss(axis);
+  const angle = mv % 2 === 0 ? 90 : -90;
+  return new Promise(resolve => {
+    const start = performance.now();
+    const frame = (now) => {
+      const t = Math.min(1, (now - start) / Math.max(1, ms));
+      const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      for (const c of layer) c.el.style.transform = `rotate3d(${ax}, ${ay}, ${az}, ${angle * eased}deg) ${cbCubieTransform(c.pos)}`;
+      if (t < 1) requestAnimationFrame(frame);
+      else {
+        for (const c of layer) c.el.style.transform = cbCubieTransform(c.pos);
+        resolve(name);
+      }
+    };
+    requestAnimationFrame(frame);
+  });
+}
+
+function cbMovesLeft() {
+  return Math.max(0, CB.budget - (CB.moves.length - CB.scrambled));
+}
+
+async function cbRequest(engine) {
+  const res = await fetch('/api/play', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ game: 'rubiks', moves: CB.moves, moves_left: Math.min(255, cbMovesLeft()), engine, seed: CB.seed + CB.moves.length }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function cbApply(data) {
+  CB.stickers = data.stickers;
+  CB.solved = data.solved;
+  cbPaint();
+  cbRenderHistory();
+}
+
+// The solver's engine, or null when it is off.
+function cbEngine() {
+  if (!document.getElementById('cb-solver').checked) return null;
+  return { kind: 'alphazero', checkpoint: document.getElementById('cb-ckpt').value || 'live',
+           sims: parseInt(document.getElementById('cb-sims').value, 10) || 800 };
+}
+
+// Lets the solver think about the cube on the screen; with ▶ on, plays its move after the delay.
+async function cbThink() {
+  const token = ++CB.token;
+  CB.analysis = null;
+  cbRenderAnalysis();
+  const engine = cbEngine();
+  if (!engine || CB.solved || !cbMovesLeft()) { cbStatus(); if (CB.auto) cbSetAuto(false); return; }
+  cbSetStatus('🤔 thinking...', 'var(--amber)');
+  try {
+    const data = await cbRequest(engine);
+    if (token !== CB.token) return;
+    CB.analysis = data.analysis;
+    cbRenderAnalysis();
+    cbStatus();
+    if (CB.auto) {
+      await cbSleep(parseInt(document.getElementById('cb-delay').value, 10) || 0);
+      if (token === CB.token && CB.auto) cbPlayShown();
+    }
+  } catch (e) {
+    if (token === CB.token) { cbSetStatus('⚠ ' + e.message, 'var(--rose)'); cbSetAuto(false); }
+  }
+}
+
+async function cbTurn(mv, ms) {
+  if (CB.animating) return;
+  CB.animating = true;
+  CB.token++;
+  CB.moves.push(mv);
+  try {
+    const [, data] = await Promise.all([cbAnimate(mv, ms), cbRequest(null)]);
+    cbApply(data);
+  } catch (e) {
+    cbSetStatus('⚠ ' + e.message, 'var(--rose)');
+  } finally {
+    CB.animating = false;
+  }
+  cbThink();
+}
+
+function cbHumanMove(mv) {
+  cbSetAuto(false);
+  cbTurn(mv, 220);
+}
+
+function cbPlayShown() {
+  if (CB.analysis && !CB.animating) cbTurn(CB.analysis.chosen, 260);
+}
+
+function cbSetAuto(on) {
+  CB.auto = on;
+  document.getElementById('cb-auto').textContent = on ? '⏸' : '▶';
+}
+
+function cbToggleAuto() {
+  cbSetAuto(!CB.auto);
+  if (CB.auto && CB.analysis) cbPlayShown();
+  else if (CB.auto) cbThink();
+}
+
+// A random scramble with the round game's rules: no `X X'` and no `X X X`.
+async function cbScramble() {
+  const depth = Math.max(1, Math.min(40, parseInt(document.getElementById('cb-depth').value, 10) || 1));
+  let data;
+  do {
+    const moves = [];
+    while (moves.length < depth) {
+      const mv = Math.floor(Math.random() * 12);
+      const [a, b] = [moves[moves.length - 1], moves[moves.length - 2]];
+      if (a === (mv ^ 1) || (a === mv && b === mv)) continue;
+      moves.push(mv);
+    }
+    CB.moves = moves;
+    CB.scrambled = depth;
+    data = await cbRequest(null);
+  } while (data.solved);
+  // The round game's budget for this round, if the cube's settings are known.
+  const g = (stateData && stateData.game_settings) || (expData && expData.games.rubiks && expData.games.rubiks.settings);
+  CB.budget = g ? Math.min(g.max_moves, g.moves_per_turn * depth + g.extra_moves) : 100;
+  CB.seed = Math.floor(Math.random() * 1e9);
+  cbSetAuto(false);
+  cbApply(data);
+  cbThink();
+}
+
+async function cbReset() {
+  cbSetAuto(false);
+  CB.moves = [];
+  CB.scrambled = 0;
+  CB.budget = 100;
+  cbApply(await cbRequest(null));
+  cbThink();
+}
+
+async function cbUndo() {
+  if (CB.moves.length <= CB.scrambled || CB.animating) return;
+  cbSetAuto(false);
+  CB.animating = true;
+  CB.token++;
+  const last = CB.moves.pop();
+  try {
+    const [, data] = await Promise.all([cbAnimate(last ^ 1, 200), cbRequest(null)]);
+    cbApply(data);
+  } catch (e) {
+    cbSetStatus('⚠ ' + e.message, 'var(--rose)');
+  } finally {
+    CB.animating = false;
+  }
+  cbThink();
+}
+
+function cbSetStatus(text, color) {
+  const el = document.getElementById('cb-status');
+  el.textContent = text;
+  el.style.color = color || 'var(--green)';
+}
+
+function cbStatus() {
+  const used = CB.moves.length - CB.scrambled;
+  if (CB.solved && CB.scrambled) cbSetStatus(used ? `✔ solved in ${used} move${used === 1 ? '' : 's'}` : '✔ solved');
+  else if (CB.solved) cbSetStatus('solved cube — scramble it');
+  else if (!cbMovesLeft()) cbSetStatus(`✘ out of moves (${CB.budget})`, 'var(--rose)');
+  else cbSetStatus(`${used} / ${CB.budget} moves`, 'var(--muted)');
+}
+
+function cbRenderHistory() {
+  const names = CB.geometry.moves.map(([n]) => n);
+  document.getElementById('cb-history').innerHTML = CB.moves
+    .map((mv, i) => `<span class="${i < CB.scrambled ? 'scramble' : ''}">${names[mv]}</span>`).join('');
+  cbStatus();
+}
+
+function cbRenderAnalysis() {
+  const a = CB.analysis;
+  document.querySelectorAll('#cb-moves button').forEach(b => b.classList.toggle('best', !!a && Number(b.dataset.mv) === a.chosen));
+  document.getElementById('cb-meta').textContent = a ? `${a.engine} · ${a.millis.toFixed(0)} ms` : '';
+  if (!a) {
+    document.getElementById('cb-summary').textContent = '';
+    document.getElementById('cb-cands').innerHTML = '';
+    return;
+  }
+  const names = CB.geometry.moves.map(([n]) => n);
+  document.getElementById('cb-summary').innerHTML = `Plays <b>${names[a.chosen]}</b> · `
+    + (a.distance == null ? 'no solve in sight' : `≈ <b>${a.distance.toFixed(1)}</b> moves to solved`)
+    + ` <span class="hint">(value ${a.value.toFixed(3)})</span>`;
+  const total = a.moves.reduce((s, m) => s + m.visits, 0) || 1;
+  document.getElementById('cb-cands').innerHTML = a.moves.map(m => `<tr>
+      <td style="text-align:left;font-family:monospace;font-weight:700">${names[m.move]}</td>
+      <td>${(100 * m.prior).toFixed(1)}%</td>
+      <td><div class="cb-bar" style="width:${(100 * m.visits / total).toFixed(1)}%"></div></td>
+      <td>${m.visits}</td>
+      <td>${m.distance == null ? '—' : m.distance.toFixed(1)}</td></tr>`).join('');
+}
+</script>
