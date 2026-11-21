@@ -11,7 +11,7 @@
 //! - CPU + Apple GPU:    `cargo run --release --features metal --example bench_nn`
 //! - CPU + NVIDIA GPU:   `cargo run --release --features cuda --example bench_nn`
 //!
-//! Options (`key=value`): `nets=resnet6,resnet4,block,mlp` `devices=cpu,gpu` `backends=candle,tch`
+//! Options (`key=value`): `nets=resnet6,resnet4,block,block_deep,mlp` `devices=cpu,gpu` `backends=candle,tch`
 //! `secs=1.5`. The tch backend needs `--features tch` (see `start_lab.sh` for the libtorch setup).
 
 use std::time::Instant;
@@ -41,6 +41,7 @@ fn net_by_name(name: &str) -> AlphaZeroNetConfig {
         },
         "resnet4" => ultimate_ttt::net_resnet(),
         "block" => ultimate_ttt::net_block(),
+        "block_deep" => ultimate_ttt::net_block_deep(),
         "mlp" => ultimate_ttt::net_mlp(),
         other => panic!("unknown net {other}"),
     }

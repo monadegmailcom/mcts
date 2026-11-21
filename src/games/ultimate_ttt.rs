@@ -523,6 +523,22 @@ pub const fn net_block() -> AlphaZeroNetConfig {
     }
 }
 
+/// [`net_block`] with twice the residual blocks (6), for when the default network stops
+/// improving: more capacity, at roughly 1.5–2× the time per network call and training step.
+pub const fn net_block_deep() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::BlockNet {
+        in_planes: INPUT_PLANES,
+        board_height: 9,
+        board_width: 9,
+        block_height: 3,
+        block_width: 3,
+        local_dim: 64,
+        hidden_dim: 256,
+        num_res_blocks: 6,
+        head_hidden: 64,
+    }
+}
+
 /// Convolutional ResNet over the `9x9` grid.
 pub const fn net_resnet() -> AlphaZeroNetConfig {
     AlphaZeroNetConfig::ResNet2d {
@@ -564,7 +580,7 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 2> for UltimateTicTacToe {
     }
 
     fn net_presets() -> Vec<(&'static str, AlphaZeroNetConfig)> {
-        vec![("block", net_block()), ("resnet", net_resnet()), ("mlp", net_mlp())]
+        vec![("block", net_block()), ("block_deep", net_block_deep()), ("resnet", net_resnet()), ("mlp", net_mlp())]
     }
 
     /// The 8 dihedral symmetries of Ultimate Tic-Tac-Toe for replay-buffer augmentation.
