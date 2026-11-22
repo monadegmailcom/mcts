@@ -108,10 +108,16 @@ echo " URL:  http://${BIND_ADDR}"
 echo " Mode: ${APP_ARGS[*]}"
 echo "================================================================"
 
-if command -v pgrep >/dev/null 2>&1 && pgrep -f "target/.*/examples/train_alphazero" >/dev/null 2>&1; then
-    echo "Stopping previous train_alphazero instance..."
-    pkill -9 -f "target/.*/examples/train_alphazero" 2>/dev/null || true
-    sleep 0.3
+# Stop a lab still holding our port from an earlier start; labs on other ports keep running.
+PORT="${BIND_ADDR##*:}"
+if command -v lsof >/dev/null 2>&1; then
+    for pid in $(lsof -t -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null); do
+        if [[ "$(ps -o comm= -p "$pid")" == *train_alphazero ]]; then
+            echo "Stopping previous train_alphazero instance on port $PORT..."
+            kill -9 "$pid"
+            sleep 0.3
+        fi
+    done
 fi
 
 if [[ "${MCTS_OPEN_BROWSER:-0}" == "1" ]] && command -v open >/dev/null 2>&1; then
