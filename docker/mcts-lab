@@ -8,6 +8,10 @@ if pkill -x train_alphazero; then
     echo "Stopped the running lab."
     sleep 1
 fi
+# The lab runs its own threads (self-play games, one per core). libtorch's OpenMP pool would add
+# one spinning thread per host core on top (64 on a RunPod host, whatever the pod's CPU share),
+# which starves them: inference got about 6x slower.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 mkdir -p "$MCTS_DATA_DIR"
 cd "$MCTS_DATA_DIR"
 nohup train_alphazero --serve "$@" >> lab.log 2>&1 &

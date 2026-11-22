@@ -8,5 +8,11 @@ fn main() {
     // Exported by torch-sys (`links = "tch"`).
     if let Ok(lib) = std::env::var("DEP_TCH_LIBTORCH_LIB") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{lib}");
+        // A CUDA libtorch registers CUDA in libtorch_cuda's static initializers. No symbol of it
+        // is referenced, so the linker's --as-needed (default on Linux) drops it and libtorch sees
+        // no GPU (`tch::Cuda::is_available()` is false).
+        if std::path::Path::new(&lib).join("libtorch_cuda.so").exists() {
+            println!("cargo:rustc-link-arg=-Wl,--no-as-needed,-ltorch_cuda,--as-needed");
+        }
     }
 }
