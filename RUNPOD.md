@@ -6,6 +6,8 @@ The [Dockerfile](Dockerfile) builds an image for NVIDIA GPUs:
   2.9.1 (CUDA 12.8 build) as the default.
 - An SSH server that accepts your RunPod SSH key.
 - The Browser Lab, started in the background on port 8080.
+- The build environment (Rust, the CUDA compiler, libtorch with headers) and the build in `/src`,
+  so code changes are built on the pod ([Developing on the pod](#developing-on-the-pod)).
 
 Lab state lives in `/workspace/mcts`: `checkpoints/`, `lab_experiments.json` and the Elo pools.
 On RunPod that is the pod's volume, so it survives restarts and new image versions.
@@ -118,7 +120,40 @@ curl -s localhost:8080/api/experiments -d '{"action":"add","spec":{...}}'
 curl -s localhost:8080/api/experiments -d '{"action":"run_queue"}'
 ```
 
+## Developing on the pod
+
+A fix doesn't need a new image: sync the source from your checkout into `/src` on the pod and
+build it there. The build reuses the image's compiled dependencies and CUDA kernels, so only the
+`mcts` crate recompiles.
+
+```bash
+rsync -az --delete -e 'ssh -p <port>' Cargo.toml Cargo.lock build.rs src examples root@<ip>:/src/
+```
+
+On the pod:
+
+```bash
+mcts-build    # builds and installs train_alphazero; a running lab keeps the old binary
+```
+
+```bash
+mcts-lab      # restarts the lab with the new binary (stops running training and experiments)
+```
+
+Commit and push from your checkout as usual. The next image build picks the changes up, and
+`/src` on a running pod is replaced only when the pod restarts with a new image.
+
+To work with git on the pod instead, clone the repository and forward your SSH agent, so the pod
+can push with your key without storing it (`ssh -A root@<ip> -p <port>`, then
+`git clone git@github.com:monadegmailcom/mcts.git /workspace/mcts-src`), then build it with
+`mcts-build /workspace/mcts-src`.
+
 ## Notes
+
+- **CPU, not GPU, limits self-play:** each self-play game searches on its own CPU thread, and the
+  network calls of all games are batched on the GPU. A pod with 15 vCPUs and an RTX A4000 kept the
+  GPU at 20–40% load and ran as fast as an Apple M4 (about 260k simulations/s for UTTT with the
+  `block` network). For more speed, pick a pod by its vCPU count first.
 
 - **Multiple GPUs:** self-play and evaluation games spread their network calls over the GPUs, one
   model replica per *inference worker*. Live training takes the worker count from the System

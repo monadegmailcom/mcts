@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Builds train_alphazero and installs it in /usr/local/bin. A running lab keeps its binary;
+# `mcts-lab` restarts it with the new one. Builds the source in /src (updated with rsync, see
+# RUNPOD.md) or the checkout given as argument, e.g. `mcts-build /workspace/mcts-src`. Either way
+# the build goes to /src/target, so it reuses the image's compiled dependencies and CUDA kernels.
+set -euo pipefail
+
+cd "${1:-/src}"
+export CARGO_TARGET_DIR=/src/target
+cargo build --release --locked --features cuda,tch --example train_alphazero
+install "$CARGO_TARGET_DIR/release/examples/train_alphazero" /usr/local/bin/
+echo "Installed train_alphazero; run mcts-lab to restart the lab with it."
