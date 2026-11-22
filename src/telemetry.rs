@@ -731,21 +731,9 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
 }
 
 impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
-    /// Loads checkpoint `file` into the live network, if it has the live network's architecture.
-    fn load_into_live<R: AlphaZeroGame<G, P, N>>(&self, file: &str) -> Result<(), String> {
-        let path = checkpoints::path(file);
-        let config = checkpoints::net_config::<R, G, P, N>(&path)?;
-        if config != self.net_config {
-            return Err(format!(
-                "{file} holds a {} network, but the live network is a {} network",
-                checkpoints::preset_name::<R, G, P, N>(&config),
-                checkpoints::preset_name::<R, G, P, N>(&self.net_config)
-            ));
-        }
-        self.live_service.pause_inference();
-        let loaded = self.live_service.evaluator().load_safetensors(&path);
-        self.live_service.resume_inference();
-        loaded.map_err(|e| e.to_string())
+    /// Preset name of the live network's architecture (`custom` if it matches none).
+    fn live_net_name<R: AlphaZeroGame<G, P, N>>(&self) -> &'static str {
+        checkpoints::preset_name::<R, G, P, N>(&self.net_config)
     }
 
     /// Network for an arena engine: the live model, untrained weights of the live architecture,
@@ -848,6 +836,9 @@ struct HubInner {
     system: SystemSettings,
     /// `system` was changed from the Browser Lab and not yet applied by the training loop.
     system_pending: bool,
+    /// Checkpoint to load into a game's live network, applied by the training loop before its next
+    /// iteration. The live network takes the architecture recorded in the checkpoint.
+    live_load: Option<(LabGame, String)>,
     active_game: LabGame,
     ttt_state: GameLabState,
     uttt_state: GameLabState,
@@ -899,6 +890,7 @@ impl TelemetryHub {
                     infer_workers: 1,
                 },
                 system_pending: false,
+                live_load: None,
                 active_game: LabGame::Uttt,
                 // Auto-save is off by default (0); enable it in the Browser Lab when needed.
                 ttt_state: GameLabState::new(LabGame::Ttt, total_iterations, knobs, 0),
@@ -933,6 +925,11 @@ impl TelemetryHub {
         } else {
             None
         }
+    }
+
+    /// Returns the checkpoint requested for a live network (**Load → Live**) once.
+    pub fn take_live_load(&self) -> Option<(LabGame, String)> {
+        self.inner.lock().expect("telemetry mutex poisoned").live_load.take()
     }
 
     #[inline]
@@ -1008,6 +1005,11 @@ impl TelemetryHub {
         let st = guard.state_for_mut(game);
         st.current_iteration = iteration;
         st.phase = phase.into();
+    }
+
+    /// Sets a game's phase line without changing its iteration.
+    pub fn set_status_for(&self, game: LabGame, phase: impl Into<String>) {
+        self.inner.lock().expect("telemetry mutex poisoned").state_for_mut(game).phase = phase.into();
     }
 
     pub fn record_iteration(&self, record: IterationTelemetry) {
@@ -1396,11 +1398,11 @@ impl TelemetryHub {
         let guard = self.inner.lock().expect("telemetry mutex poisoned");
         let game = guard.active_game;
         let st = guard.state_for(game);
-        let has_live = match game {
-            LabGame::Ttt => guard.ttt_context.is_some(),
-            LabGame::Uttt => guard.uttt_context.is_some(),
+        let live_net = match game {
+            LabGame::Ttt => guard.ttt_context.as_ref().map(|c| c.live_net_name::<TicTacToe>()),
+            LabGame::Uttt => guard.uttt_context.as_ref().map(|c| c.live_net_name::<UltimateTicTacToe>()),
         };
-        let models = discover_game_models(game, has_live, st.current_iteration);
+        let models = discover_game_models(game, live_net.is_some(), st.current_iteration);
         let models_json = models
             .iter()
             .map(ModelInfo::to_json)
@@ -1426,6 +1428,7 @@ impl TelemetryHub {
             concat!(
                 "{{",
                 "\"device_name\":\"{}\",",
+                "\"live_net\":\"{}\",",
                 "\"system\":{},",
                 "\"active_game\":\"{}\",",
                 "\"active_game_title\":\"{}\",",
@@ -1444,6 +1447,7 @@ impl TelemetryHub {
                 "}}"
             ),
             escape_json(&guard.device_name),
+            live_net.unwrap_or_default(),
             guard.system.to_json(guard.system_pending),
             game.as_str(),
             escape_json(game.title()),
@@ -2515,40 +2519,26 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                         "{\"error\":\"Invalid model name\"}",
                     );
                 };
-                let load_res = match game {
-                    LabGame::Ttt => {
-                        let Some(ctx) = ttt_ctx else {
-                            return write_http_response(
-                                &mut stream,
-                                "400 Bad Request",
-                                "application/json",
-                                "{\"error\":\"No live TTT model attached\"}",
-                            );
-                        };
-                        ctx.load_into_live::<TicTacToe>(&filename)
-                    }
+                // The training loop loads it before its next iteration (right away while paused),
+                // in the architecture recorded in the file.
+                let path = checkpoints::path(&filename);
+                let net = match game {
+                    LabGame::Ttt => checkpoints::net_config::<TicTacToe, 27, 9, 2>(&path)
+                        .map(|c| checkpoints::preset_name::<TicTacToe, 27, 9, 2>(&c)),
                     LabGame::Uttt => {
-                        let Some(ctx) = uttt_ctx else {
-                            return write_http_response(
-                                &mut stream,
-                                "400 Bad Request",
-                                "application/json",
-                                "{\"error\":\"No live UTTT model attached\"}",
-                            );
-                        };
-                        ctx.load_into_live::<UltimateTicTacToe>(&filename)
+                        checkpoints::net_config::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81, 2>(&path)
+                            .map(|c| checkpoints::preset_name::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81, 2>(&c))
                     }
                 };
-                if let Err(e) = load_res {
-                    let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e));
-                    return write_http_response(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "application/json",
-                        &msg,
-                    );
-                }
-                hub.set_phase_for(game, cur_iter, format!("Loaded {filename} into Live"));
+                let net = match net {
+                    Ok(net) => net,
+                    Err(e) => {
+                        let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e));
+                        return write_http_response(&mut stream, "400 Bad Request", "application/json", &msg);
+                    }
+                };
+                hub.inner.lock().expect("telemetry mutex poisoned").live_load = Some((game, filename.clone()));
+                hub.set_phase_for(game, cur_iter, format!("Loading {filename} ({net} network) into Live"));
             }
             "delete" => {
                 if let Some(filename) = checkpoints::sanitize_name(&raw_target_name) {
@@ -3168,6 +3158,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
   <div class="badges">
     <span class="badge" id="device-badge">Device: ...</span>
+    <span class="badge" id="net-badge">Network: ...</span>
     <span class="badge paused" id="phase-badge">Phase: Idle</span>
     <span class="badge" id="iter-badge">Iter: 0 / 0</span>
   </div>
@@ -3895,6 +3886,7 @@ function renderDashboard(d) {
 
 
   document.getElementById('device-badge').textContent = 'Device: ' + d.device_name;
+  document.getElementById('net-badge').textContent = 'Network: ' + (d.live_net || '–');
   const phaseEl = document.getElementById('phase-badge');
   phaseEl.textContent = (d.knobs.paused ? '⏸ ' : '🟢 ') + d.phase;
   phaseEl.className = 'badge ' + (d.knobs.paused ? 'paused' : 'live');
@@ -4486,7 +4478,7 @@ async function loadModelToLive(name) {
   const data = await res.json();
   modelsSignature = '';
   if (data.error) {
-    alert(`Could not load ${name} into the live model:\n${data.error}\n\nThe checkpoint must have the live network's architecture.`);
+    alert(`Could not load ${name} into the live model:\n${data.error}`);
     await fetchState();
     return;
   }

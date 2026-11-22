@@ -471,6 +471,54 @@ fn rebuild_model<const G: usize, const P: usize, const N: usize>(
     Ok(())
 }
 
+/// The live checkpoint of a game, rewritten after every iteration.
+fn live_checkpoint<S: LabGameSpec<G, P>, const G: usize, const P: usize>() -> std::path::PathBuf {
+    checkpoints::path(&format!("{}_alphazero.safetensors", S::TAG))
+}
+
+/// A game's live network: in the Browser Lab, the weights and architecture of its live checkpoint,
+/// if there is one; otherwise fresh weights of the game's default architecture.
+fn live_trainer<S: LabGameSpec<G, P>, const G: usize, const P: usize>(
+    resume: bool,
+    lr: f64,
+    train_dev: NnDevice,
+) -> candle_core::Result<AlphaZeroTrainer<G, P, 2>> {
+    let file = live_checkpoint::<S, G, P>();
+    if !(resume && file.exists()) {
+        return AlphaZeroTrainer::new(S::net_config(), lr, 1e-4, train_dev);
+    }
+    let cfg = checkpoints::net_config::<S, G, P, 2>(&file).map_err(candle_core::Error::Msg)?;
+    let mut trainer = AlphaZeroTrainer::new(cfg, lr, 1e-4, train_dev)?;
+    trainer.load_checkpoint(&file)?;
+    let net = checkpoints::preset_name::<S, G, P, 2>(&cfg);
+    println!("📦 Loaded the live {} network ({net}) from {}", S::TAG, file.display());
+    Ok(trainer)
+}
+
+/// Replaces a game's live network with checkpoint `file`, in the architecture recorded in it
+/// (**Load → Live**). The optimizer state restarts; the replay buffer stays, since its positions
+/// don't depend on the network. The live checkpoint is rewritten right away, so a restarted lab
+/// comes back with the loaded network.
+#[allow(clippy::too_many_arguments)]
+fn load_live<S: LabGameSpec<G, P>, const G: usize, const P: usize>(
+    file: &str,
+    trainer: &mut AlphaZeroTrainer<G, P, 2>,
+    service: &mut LiveService<G, P, 2>,
+    knobs: &LiveKnobs,
+    train_dev: NnDevice,
+    infer_devs: &[NnDevice],
+    infer_batch: usize,
+) -> candle_core::Result<()> {
+    let path = checkpoints::path(file);
+    let cfg = checkpoints::net_config::<S, G, P, 2>(&path).map_err(candle_core::Error::Msg)?;
+    let mut fresh = AlphaZeroTrainer::new(cfg, knobs.learning_rate, knobs.weight_decay, train_dev)?;
+    fresh.load_checkpoint(&path)?;
+    fresh.save_checkpoint(live_checkpoint::<S, G, P>())?;
+    *service = Arc::new(fresh.build_inference_service(infer_batch, infer_devs)?);
+    *trainer = fresh;
+    Ok(())
+}
+
 fn main() -> candle_core::Result<()> {
     let interactive_lab =
         std::env::args().any(|a| a == "--serve" || a == "--lab-only");
@@ -533,54 +581,18 @@ fn main() -> candle_core::Result<()> {
     let mut max_batch_size = system.infer_batch;
 
     // 1. Initialize Tic-Tac-Toe (`G=27, P=9, N=2`) Trainer & Live Inference Service
-    let ttt_net_cfg = <TicTacToe as AlphaZeroGame<27, 9, 2>>::net_config();
-    let mut ttt_trainer = AlphaZeroTrainer::<27, 9, 2>::new(
-        ttt_net_cfg,
-        initial_knobs.learning_rate,
-        1e-4,
-        train_device,
-    )?;
-    let ttt_live_file = checkpoints::path("ttt_alphazero.safetensors");
-    if interactive_lab && ttt_live_file.exists() {
-        ttt_trainer.load_checkpoint(&ttt_live_file)?;
-        println!("📦 Loaded existing TTT checkpoint into live model: {}", ttt_live_file.display());
-    }
+    let mut ttt_trainer = live_trainer::<TicTacToe, 27, 9>(interactive_lab, initial_knobs.learning_rate, train_device)?;
     let mut ttt_service = Arc::new(ttt_trainer.build_inference_service(max_batch_size, &infer_devices)?);
-    hub.attach_ttt_service(Arc::clone(&ttt_service), ttt_net_cfg, infer_devices.clone());
+    hub.attach_ttt_service(Arc::clone(&ttt_service), *ttt_trainer.net_config(), infer_devices.clone());
     let mut ttt_buffer = ReplayBuffer::<27, 9, 2>::new(initial_knobs.buffer_capacity)
         .with_symmetries(<TicTacToe as AlphaZeroGame<27, 9, 2>>::symmetries());
 
     // 2. Initialize Ultimate Tic-Tac-Toe (`G=324, P=81, N=2`) Trainer & Live Inference Service
-    let uttt_net_cfg = <UltimateTicTacToe as AlphaZeroGame<{ UTTT_INPUT_SIZE }, 81, 2>>::net_config();
-    let mut uttt_trainer = AlphaZeroTrainer::<{ UTTT_INPUT_SIZE }, 81, 2>::new(
-        uttt_net_cfg,
-        2.0e-3,
-        1e-4,
-        train_device,
-    )?;
-    let uttt_live_file = checkpoints::path("uttt_alphazero.safetensors");
-    if interactive_lab && uttt_live_file.exists() {
-        type Uttt = UltimateTicTacToe;
-        match checkpoints::net_config::<Uttt, { UTTT_INPUT_SIZE }, 81, 2>(&uttt_live_file) {
-            Ok(cfg) if cfg == uttt_net_cfg => {
-                uttt_trainer.load_checkpoint(&uttt_live_file)?;
-                println!("📦 Loaded existing UTTT checkpoint into live model: {}", uttt_live_file.display());
-            }
-            found => println!(
-                "⚠️  Not loading {} (starting fresh): it holds {}, the live UTTT network is a {} network",
-                uttt_live_file.display(),
-                found.map_or_else(|e| e, |c| format!("a {} network", checkpoints::preset_name::<Uttt, { UTTT_INPUT_SIZE }, 81, 2>(&c))),
-                checkpoints::preset_name::<Uttt, { UTTT_INPUT_SIZE }, 81, 2>(&uttt_net_cfg)
-            ),
-        }
-    }
+    let mut uttt_trainer =
+        live_trainer::<UltimateTicTacToe, { UTTT_INPUT_SIZE }, 81>(interactive_lab, 2.0e-3, train_device)?;
     let mut uttt_service =
         Arc::new(uttt_trainer.build_inference_service(max_batch_size, &infer_devices)?);
-    hub.attach_uttt_service(
-        Arc::clone(&uttt_service),
-        uttt_net_cfg,
-        infer_devices.clone(),
-    );
+    hub.attach_uttt_service(Arc::clone(&uttt_service), *uttt_trainer.net_config(), infer_devices.clone());
     // The value head generalizes only across *distinct games* (all ~50 positions of a game share
     // one outcome and nearly the same board, so a small window lets the net memorize which game a
     // position came from). The default 300k positions keep ~6k recent games (~0.8 GB); the 8
@@ -603,10 +615,10 @@ fn main() -> candle_core::Result<()> {
                 let (train_dev, infer_devs) = new_sys.devices();
                 let ttt_k = hub.knobs_for(LabGame::Ttt);
                 rebuild_model("ttt", &mut ttt_trainer, &mut ttt_service, ttt_k.learning_rate, ttt_k.weight_decay, train_dev, &infer_devs, new_sys.infer_batch)?;
-                hub.attach_ttt_service(Arc::clone(&ttt_service), ttt_net_cfg, infer_devs.clone());
+                hub.attach_ttt_service(Arc::clone(&ttt_service), *ttt_trainer.net_config(), infer_devs.clone());
                 let uttt_k = hub.knobs_for(LabGame::Uttt);
                 rebuild_model("uttt", &mut uttt_trainer, &mut uttt_service, uttt_k.learning_rate, uttt_k.weight_decay, train_dev, &infer_devs, new_sys.infer_batch)?;
-                hub.attach_uttt_service(Arc::clone(&uttt_service), uttt_net_cfg, infer_devs.clone());
+                hub.attach_uttt_service(Arc::clone(&uttt_service), *uttt_trainer.net_config(), infer_devs.clone());
                 max_batch_size = new_sys.infer_batch;
                 // Report what is actually in effect (e.g. Metal always uses one worker).
                 let applied = SystemSettings { infer_workers: infer_devs.len(), ..new_sys };
@@ -614,6 +626,26 @@ fn main() -> candle_core::Result<()> {
                 let label = device_label(train_dev, &infer_devs, new_sys.infer_batch);
                 println!("🖥️  Rebuilt both models on {label}");
                 hub.set_device_label(label);
+            }
+            if let Some((game, file)) = hub.take_live_load() {
+                let (train_dev, infer_devs) = hub.system_settings().devices();
+                let knobs = hub.knobs_for(game);
+                let loaded = match game {
+                    LabGame::Ttt => load_live::<TicTacToe, 27, 9>(
+                        &file, &mut ttt_trainer, &mut ttt_service, &knobs, train_dev, &infer_devs, max_batch_size,
+                    )
+                    .map(|()| hub.attach_ttt_service(Arc::clone(&ttt_service), *ttt_trainer.net_config(), infer_devs.clone())),
+                    LabGame::Uttt => load_live::<UltimateTicTacToe, { UTTT_INPUT_SIZE }, 81>(
+                        &file, &mut uttt_trainer, &mut uttt_service, &knobs, train_dev, &infer_devs, max_batch_size,
+                    )
+                    .map(|()| hub.attach_uttt_service(Arc::clone(&uttt_service), *uttt_trainer.net_config(), infer_devs.clone())),
+                };
+                let status = match loaded {
+                    Ok(()) => format!("Loaded {file} into Live"),
+                    Err(e) => format!("Could not load {file} into Live: {e}"),
+                };
+                println!("📦 {status}");
+                hub.set_status_for(game, status);
             }
             match hub.poll_training_command() {
                 TrainingCommand::Idle => {

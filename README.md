@@ -106,8 +106,10 @@ metadata, so loading needs no architecture choice (older files are matched again
 Evaluation opponents are configurable on the training page and per experiment: random, classical
 MCTS (simulations, exploration constant), Minimax (depth) or a saved AlphaZero checkpoint
 (file, simulations). Training can continue from a saved network: **Load → Live** in
-the arena tab (training page), or *Start From* in an experiment. A checkpoint only loads into a
-network of the same architecture; it carries weights only (no replay buffer or optimizer state).
+the arena tab (training page), or *Start From* in an experiment. **Load → Live** gives the live
+network the checkpoint's architecture (shown in the *Network* badge), and the lab starts with the
+live network it last trained; *Start From* needs the experiment's architecture. A checkpoint carries
+weights only (no replay buffer or optimizer state).
 
 The **Play** tab plays single games of Tic-Tac-Toe or Ultimate TTT. Each side is a human or an
 engine (random, Minimax, MCTS, AlphaZero with the live network or a checkpoint and any number of
