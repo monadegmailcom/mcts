@@ -1,22 +1,10 @@
 # Builds the RunPod image (Dockerfile) and pushes it to ghcr.io/<owner>/mcts-runpod, tagged
-# `latest` and with the commit hash. Runs when the code changes on main, or by hand:
+# `latest` and with the commit hash. Runs only on demand:
 #   gh workflow run docker.yml
 name: Docker image (RunPod)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - Dockerfile
-      - .dockerignore
-      - docker/**
-      - Cargo.toml
-      - Cargo.lock
-      - build.rs
-      - src/**
-      - examples/**
-      - .github/workflows/docker.yml
 
 permissions:
   contents: read

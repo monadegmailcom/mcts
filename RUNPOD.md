@@ -16,17 +16,21 @@ On RunPod that is the pod's volume, so it survives restarts and new image versio
 
 GitHub Actions builds the image ([workflow](.github/workflows/docker.yml)) on an x86_64 runner
 and pushes it to `ghcr.io/monadegmailcom/mcts-runpod`. It is tagged `latest` and with the short
-commit hash. A build starts on every push to `main` that changes the code, or by hand:
+commit hash. Builds run only on demand, from `main` or another branch:
 
 ```bash
 gh workflow run docker.yml
 ```
 
 ```bash
+gh workflow run docker.yml --ref <branch>
+```
+
+```bash
 gh run watch
 ```
 
-A build takes about half an hour, most of it compiling candle's CUDA kernels.
+A build takes about 20 minutes.
 
 **One-time step:** after the first build, make the package public, so RunPod can pull it without
 registry credentials. On GitHub, open your profile → **Packages** → `mcts-runpod` → **Package
