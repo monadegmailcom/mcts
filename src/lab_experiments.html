@@ -35,7 +35,7 @@
           <label>Eval Games / Opponent</label><input type="number" id="exp-evalgames" value="48" min="2" step="2"></div>
         <div class="knob-item" title="Maximum positions per batched NN call during self-play. GPUs need large batches (Mac GPU: ~3.5x more positions/s at 256 than at 64).">
           <label>Inference Batch</label><input type="number" id="exp-inferbatch" value="256" min="1" step="32"></div>
-        <div class="knob-item" title="Model replicas serving self-play and evaluation, as for live training: one per GPU on CUDA machines (Apple GPUs always use 1). Defaults to the System panel.">
+        <div class="knob-item" title="Model replicas serving self-play and evaluation, as for live training: spread over the GPUs on CUDA machines, several per GPU allowed (Apple GPUs always use 1). Defaults to the System panel.">
           <label>Inference Workers</label><input type="number" id="exp-inferworkers" value="1" min="1" max="64"></div>
       </div>
       <div style="margin-top:10px;">

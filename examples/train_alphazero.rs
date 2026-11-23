@@ -128,19 +128,23 @@ where
     let held_out = trainer.held_out_losses(buffer)?;
     let train_ms = (train_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
-    // 3. Arena evaluation against the configured opponents (argmax AlphaZero, no noise)
+    // 3. Arena evaluation against the configured opponents (argmax AlphaZero, no noise), after
+    // every `eval_every`-th iteration
     let eval_start = Instant::now();
-    let openings = S::eval_openings(knobs.eval_games.div_ceil(2));
-    let arena = play_opponents::<S, G, P>(
-        service,
-        &openings,
-        knobs.eval_simulations(),
-        &knobs,
-        &hub.eval_opponents_for(game),
-        hub.system_settings().train_device(),
-        S::SEED + 500_000 + iter as u64 * 10,
-        |p| hub.set_phase_for(game, iter, format!("Iter #{iter}: Arena {p}...")),
-    );
+    let arena = if iter.is_multiple_of(knobs.eval_every) {
+        play_opponents::<S, G, P>(
+            service,
+            &S::eval_openings(knobs.eval_games.div_ceil(2)),
+            knobs.eval_simulations(),
+            &knobs,
+            &hub.eval_opponents_for(game),
+            hub.system_settings().train_device(),
+            S::SEED + 500_000 + iter as u64 * 10,
+            |p| hub.set_phase_for(game, iter, format!("Iter #{iter}: Arena {p}...")),
+        )
+    } else {
+        Vec::new()
+    };
     let eval_ms = (eval_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
     let rec = IterationTelemetry {
@@ -546,7 +550,9 @@ fn main() -> candle_core::Result<()> {
         // A network call costs about the same for 16 or 256 positions (fixed per-call overhead), so
         // batches should be as large as the games in flight allow: 512 serves up to 1024 games.
         infer_batch: 512,
-        infer_workers: 8,
+        // Two workers per CUDA GPU overlap one batch's host-side work with the other's GPU work
+        // (about 30% more self-play on a RunPod RTX A4000; three were slower again).
+        infer_workers: 2 * backend.gpu_count().max(1),
     };
     let (train_device, infer_devices) = system.devices();
     system.infer_workers = infer_devices.len();

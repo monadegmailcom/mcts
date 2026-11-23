@@ -160,7 +160,8 @@ can push with your key without storing it (`ssh -A root@<ip> -p <port>`, then
   `block` network). For more speed, pick a pod by its vCPU count first.
 
 - **Multiple GPUs:** self-play and evaluation games spread their network calls over the GPUs, one
-  model replica per *inference worker*. Live training takes the worker count from the System
+  model replica per *inference worker*, round-robin. Several workers per GPU overlap the host-side
+  work of their batches. Live training takes the worker count from the System
   panel. Each experiment has its own *Inference Workers* setting, which defaults to the System
   panel, so experiments run on the same setup as training. Training steps (SGD) run on GPU 0.
 - **GPU architecture:** the candle backend's CUDA kernels are compiled for compute capability 8.0

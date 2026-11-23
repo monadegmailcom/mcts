@@ -274,6 +274,8 @@ pub struct LiveKnobs {
     pub paused: bool,
     /// All tunable hyperparameters (read and written through `Deref`, e.g. `knobs.batch_size`).
     pub hp: AlphaZeroHyperparams,
+    /// Arena evaluation after every `eval_every`-th iteration (experiments have their own setting).
+    pub eval_every: usize,
 }
 
 impl std::ops::Deref for LiveKnobs {
@@ -298,7 +300,7 @@ impl Default for LiveKnobs {
 impl LiveKnobs {
     /// Paused knobs starting from a game's recommended hyperparameters.
     pub const fn new(hp: AlphaZeroHyperparams) -> Self {
-        Self { paused: true, hp }
+        Self { paused: true, hp, eval_every: 1 }
     }
 
     pub fn for_game<R: AlphaZeroGame<G, P, N>, const G: usize, const P: usize, const N: usize>() -> Self {
@@ -337,7 +339,8 @@ impl LiveKnobs {
                 "\"ewa_window\":{},",
                 "\"eval_games\":{},",
                 "\"eval_sims\":{},",
-                "\"eval_threads\":{}",
+                "\"eval_threads\":{},",
+                "\"eval_every\":{}",
                 "}}"
             ),
             self.paused,
@@ -361,6 +364,7 @@ impl LiveKnobs {
             self.eval_games,
             self.eval_sims,
             self.eval_threads,
+            self.eval_every,
         )
     }
 }
@@ -391,7 +395,8 @@ pub struct SystemSettings {
     pub device: DeviceChoice,
     /// Maximum positions per batched NN inference call.
     pub infer_batch: usize,
-    /// Inference worker threads, one model replica each (CUDA: one per GPU; Metal: always 1).
+    /// Inference worker threads, one model replica each (CUDA: spread over the GPUs, several per
+    /// GPU allowed; Metal: always 1).
     pub infer_workers: usize,
 }
 
@@ -2799,6 +2804,9 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
     if let Some(v) = num("eval_threads") {
         knobs.eval_threads = (v as usize).min(256);
     }
+    if let Some(v) = num("eval_every") {
+        knobs.eval_every = (v as usize).clamp(1, 1_000);
+    }
 }
 
 /// Replaces the evaluation opponents if the request body carries a non-empty `eval_opponents` list.
@@ -3312,6 +3320,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
     <h3 class="knob-section">Arena Evaluation</h3>
     <div class="knobs-grid">
+      <div class="knob-item" title="Play the arena after every N-th iteration only: with strong AlphaZero opponents it can take longer than self-play and training together.">
+        <label>Evaluate Every N Iters</label>
+        <input type="number" id="k-eval-every" min="1" max="1000" step="1">
+      </div>
       <div class="knob-item" title="Arena games vs each baseline per iteration. Openings are played twice with colors swapped.">
         <label>Eval Games / Opponent</label>
         <input type="number" id="k-eval-games" min="2" max="2000" step="2">
@@ -3375,7 +3387,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <label>Inference Batch Size</label>
         <input type="number" id="sys-infer-batch" min="1" max="4096" step="8">
       </div>
-      <div class="knob-item" title="Inference worker threads, one model replica each. CUDA: up to one per GPU. Metal: always 1. CPU: any.">
+      <div class="knob-item" title="Inference worker threads, one model replica each. CUDA: spread over the GPUs, several per GPU overlap the host-side work of their batches. Metal: always 1. CPU: any.">
         <label>Inference Workers</label>
         <input type="number" id="sys-infer-workers" min="1" max="64" step="1">
       </div>
@@ -3775,6 +3787,7 @@ const KNOB_FIELDS = [
   ['eval_games', 'k-eval-games', 'int'],
   ['eval_sims', 'k-eval-sims', 'int'],
   ['eval_threads', 'k-eval-threads', 'int'],
+  ['eval_every', 'k-eval-every', 'int'],
 ];
 
 function collectKnobs() {
@@ -4012,7 +4025,11 @@ async function calibrateElo() {
   renderDashboard(stateData);
 }
 
+// Arena and Elo charts show the evaluated iterations only (see the Evaluate Every knob).
+const evaluated = h => h.filter(x => x.arena.length);
+
 function renderEloChart(h, elo) {
+  h = evaluated(h);
   const ratings = h.map(x => x.elo);
   const last = [...ratings].reverse().find(r => r);
   document.getElementById('latest-elo').textContent = last
@@ -4031,6 +4048,7 @@ const WDL_SERIES = [['wins', '#34d399'], ['draws', '#94a3b8'], ['losses', '#fb71
 
 // One card per opponent seen in the history (opponents can change between iterations).
 function renderArenaCards(h) {
+  h = evaluated(h);
   const grid = document.getElementById('arena-cards');
   const labels = [...new Set(h.flatMap(x => x.arena.map(a => a.label)))];
   const sig = labels.join('|');
