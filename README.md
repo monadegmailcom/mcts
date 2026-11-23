@@ -96,7 +96,9 @@ after every iteration and `init=rubiks_rounds.safetensors` continues a run.
 
 `./start_lab.sh [--metal|--cuda] [--tch]` serves the lab at <http://127.0.0.1:8080>: live training
 with all hyperparameters as knobs (one chart per training metric, plus live CPU/GPU utilization per
-phase), an arena for matches between engines and checkpoints, and an
+phase; every 50th self-play game is held out, and its loss is charted for the current weights and
+for their exponentially weighted average, whose gap shows what a lower learning rate would gain),
+an arena for matches between engines and checkpoints, and an
 **Experiments** tab that queues training runs from scratch (architecture, backend, device,
 hyperparameters, training-time budget) and plots their strength against fixed opponents per
 training minute and per self-play game. Results persist in `lab_experiments.json`. Checkpoints are kept in `checkpoints/` (or `$MCTS_CHECKPOINT_DIR`, e.g. a mounted

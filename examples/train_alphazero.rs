@@ -93,6 +93,7 @@ where
     let knobs = hub.knobs_for(game);
     trainer.set_learning_rate(knobs.learning_rate);
     trainer.set_weight_decay(knobs.weight_decay);
+    trainer.set_ewa_window(knobs.ewa_window);
     buffer.set_capacity(knobs.buffer_capacity);
     service.reset_stats();
     let root = S::start();
@@ -107,7 +108,7 @@ where
     let sp_start = Instant::now();
     let sp_res = run_self_play(&root, service, &knobs.self_play_config(S::SEED + iter as u64 * 131));
     let self_play_ms = (sp_start.elapsed().as_secs_f64() * 1000.0) as f32;
-    buffer.extend(&sp_res.positions);
+    buffer.add_games(&sp_res);
 
     let batch_stats = service.batch_size_stats();
     let uniq_batch_stats = service.unique_batch_size_stats();
@@ -124,6 +125,7 @@ where
     );
     let train_start = Instant::now();
     let metrics = trainer.train_epoch(buffer, service, knobs.batch_size, knobs.train_steps, rng)?;
+    let held_out = trainer.held_out_losses(buffer)?;
     let train_ms = (train_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
     // 3. Arena evaluation against the configured opponents (argmax AlphaZero, no noise)
@@ -147,6 +149,7 @@ where
         policy_loss: metrics.policy_loss,
         policy_kl: metrics.policy_kl,
         value_loss: metrics.value_loss,
+        held_out,
         root_entropy_mean: sp_res.root_entropy_stats.mean(),
         game_moves_mean: sp_res.game_moves_stats.mean(),
         self_play_wins: sp_res.wins,
@@ -171,6 +174,10 @@ where
         rec.arena.iter().map(|a| format!("vs {} {}W-{}D-{}L", a.label, a.wdl[0], a.wdl[1], a.wdl[2])).collect();
     if let Some(r) = hub.elo_pool(game).and_then(|pool| pool.estimate(rec.arena.iter().map(|a| (&a.opponent, a.wdl)))) {
         arena_txt.push(format!("Elo {:.0} ± {:.0}", r.elo, r.stderr));
+    }
+    if let Some(h) = rec.held_out {
+        let (cur, ewa) = (h.current.policy_kl + h.current.value_loss, h.ewa.policy_kl + h.ewa.value_loss);
+        arena_txt.push(format!("held-out {cur:.4} / EWA {ewa:.4}"));
     }
     println!(
         "[{tag:<4} #{iter:>3}] Loss {:>5.3} | KL {:>6.4} | MSE {:>6.4} | {} | Dedup {:>4.1}% | {:>7.0} sims/s",
@@ -353,6 +360,7 @@ where
         .unwrap_or_else(|| S::net_presets()[0]);
     let hp = spec.hp;
     let mut trainer = AlphaZeroTrainer::<G, P, 2>::new(cfg, hp.learning_rate, hp.weight_decay, dev)?;
+    trainer.set_ewa_window(hp.ewa_window);
     if !spec.init_checkpoint.is_empty() {
         let path = checkpoints::path(&spec.init_checkpoint);
         let file_cfg = checkpoints::net_config::<S, G, P, 2>(&path).map_err(candle_core::Error::Msg)?;

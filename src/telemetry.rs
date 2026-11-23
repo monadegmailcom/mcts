@@ -38,6 +38,7 @@ use crate::games::ultimate_ttt::{
 use crate::elo::EloPool;
 use crate::experiments::{ExperimentPoint, ExperimentSpec, ExperimentStore, RunStatus, json_value};
 use crate::hyperparams::AlphaZeroHyperparams;
+use crate::training::HeldOutLosses;
 use crate::checkpoints;
 use crate::opponents::{self, OpponentSpec};
 use crate::play::{self, NetService, PlayRequest, PlayableGame};
@@ -157,6 +158,8 @@ pub struct IterationTelemetry {
     pub policy_loss: f32,
     pub policy_kl: f32,
     pub value_loss: f32,
+    /// Losses of the current and the weight-averaged network on held-out games.
+    pub held_out: Option<HeldOutLosses>,
     pub root_entropy_mean: f32,
     pub game_moves_mean: f32,
     pub self_play_wins: [usize; 2],
@@ -193,6 +196,7 @@ impl IterationTelemetry {
                 "\"policy_loss\":{:.6},",
                 "\"policy_kl\":{:.6},",
                 "\"value_loss\":{:.6},",
+                "\"held_out\":{},",
                 "\"root_entropy_mean\":{:.6},",
                 "\"game_moves_mean\":{:.4},",
                 "\"self_play_wins\":[{},{}],",
@@ -219,6 +223,17 @@ impl IterationTelemetry {
             finite_or_zero(self.policy_loss),
             finite_or_zero(self.policy_kl),
             finite_or_zero(self.value_loss),
+            self.held_out.map_or_else(
+                || "null".to_string(),
+                |h| format!(
+                    "{{\"positions\":{},\"kl\":{:.6},\"value\":{:.6},\"ewa_kl\":{:.6},\"ewa_value\":{:.6}}}",
+                    h.positions,
+                    finite_or_zero(h.current.policy_kl),
+                    finite_or_zero(h.current.value_loss),
+                    finite_or_zero(h.ewa.policy_kl),
+                    finite_or_zero(h.ewa.value_loss)
+                )
+            ),
             finite_or_zero(self.root_entropy_mean),
             finite_or_zero(self.game_moves_mean),
             self.self_play_wins[0],
@@ -319,6 +334,7 @@ impl LiveKnobs {
                 "\"learning_rate\":{:.6},",
                 "\"weight_decay\":{:.6},",
                 "\"buffer_capacity\":{},",
+                "\"ewa_window\":{},",
                 "\"eval_games\":{},",
                 "\"eval_sims\":{},",
                 "\"eval_threads\":{}",
@@ -341,6 +357,7 @@ impl LiveKnobs {
             self.learning_rate,
             self.weight_decay,
             self.buffer_capacity,
+            self.ewa_window,
             self.eval_games,
             self.eval_sims,
             self.eval_threads,
@@ -2770,6 +2787,9 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
     if let Some(v) = num("buffer_capacity") {
         knobs.buffer_capacity = (v as usize).clamp(1_024, 5_000_000);
     }
+    if let Some(v) = num("ewa_window") {
+        knobs.ewa_window = (v as usize).clamp(1, 1_000_000);
+    }
     if let Some(v) = num("eval_games") {
         knobs.eval_games = (v as usize).clamp(2, 2_000);
     }
@@ -3285,6 +3305,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <label>Replay Buffer (positions)</label>
         <input type="number" id="k-buffer" min="1024" max="5000000" step="1024">
       </div>
+      <div class="knob-item" title="SGD steps the exponentially weighted average of the weights spans; its held-out loss is charted against the current weights'.">
+        <label>EWA Window (SGD steps)</label>
+        <input type="number" id="k-ewa" min="1" max="1000000" step="100">
+      </div>
     </div>
     <h3 class="knob-section">Arena Evaluation</h3>
     <div class="knobs-grid">
@@ -3747,6 +3771,7 @@ const KNOB_FIELDS = [
   ['learning_rate', 'k-lr', 'float'],
   ['weight_decay', 'k-wd', 'float'],
   ['buffer_capacity', 'k-buffer', 'int'],
+  ['ewa_window', 'k-ewa', 'int'],
   ['eval_games', 'k-eval-games', 'int'],
   ['eval_sims', 'k-eval-sims', 'int'],
   ['eval_threads', 'k-eval-threads', 'int'],
@@ -4028,6 +4053,10 @@ function renderArenaCards(h) {
   });
 }
 
+// Held-out loss (policy KL + value MSE) of the current and the averaged weights; NaN before the first held-out games.
+const heldOut = x => x.held_out ? x.held_out.kl + x.held_out.value : NaN;
+const heldOutEwa = x => x.held_out ? x.held_out.ewa_kl + x.held_out.ewa_value : NaN;
+
 // Training-tab charts, one per metric so each has its own y-axis scale.
 // series: [label, color, value of an iteration record]; latest: text for the newest record.
 const METRIC_CARDS = [
@@ -4037,6 +4066,12 @@ const METRIC_CARDS = [
   { id: 'value', title: 'Value loss (MSE)', latest: x => x.value_loss.toFixed(3),
     hint: 'Squared error of the network\'s outcome prediction against the value targets (game result, blended with the search value by qw). It falls as the network learns who is winning, but never reaches 0: early positions are genuinely uncertain.',
     series: [['MSE', '#fb7185', x => x.value_loss]] },
+  { id: 'heldout', title: 'Held-out loss: current vs. averaged weights', latest: x => x.held_out ? `${heldOut(x).toFixed(3)} / ${heldOutEwa(x).toFixed(3)}` : '—',
+    hint: 'Policy KL + value MSE on held-out games (every 50th self-play game, never trained on; the newest ~8k positions), for the current weights and for their exponentially weighted average (EWA window knob). Unlike the training losses, this measures how well the network generalizes.',
+    series: [['current', '#38bdf8', heldOut], ['EWA', '#34d399', heldOutEwa]] },
+  { id: 'ewagain', title: 'Gain of the averaged weights (held-out loss)', latest: x => x.held_out ? (heldOut(x) - heldOutEwa(x)).toFixed(4) : '—',
+    hint: 'Held-out loss of the current weights minus that of the averaged weights. The weights jitter around a minimum with the noise of each SGD step, the average sits closer to it; a gain that stays clearly above 0 means a lower learning rate would improve the network right away. Near 0: the learning rate is not what holds training back.',
+    series: [['current − EWA', '#fbbf24', x => heldOut(x) - heldOutEwa(x)]] },
   { id: 'entropy', title: 'Search decisiveness (root entropy)', latest: x => x.root_entropy_mean.toFixed(2),
     hint: 'Entropy of the visit distribution at the root, averaged over self-play moves. High = search spreads its visits over many moves, low = it settles on few. Falls as the network gets confident; the root noise keeps it from reaching 0.',
     series: [['H(π)', '#a78bfa', x => x.root_entropy_mean]] },
