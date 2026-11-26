@@ -1255,7 +1255,7 @@ mod tests {
             values.fill([0.0]);
         });
         let service = InferenceService::new(blind, 32, 1);
-        let rounds = RoundGame { max_rounds: 4, moves_per_turn: 0, extra_moves: 3, max_moves: 3 };
+        let rounds = RoundGame { max_rounds: 4, moves_per_turn: 0, extra_moves: 3, max_moves: 3, ..RoundGame::default() };
         let cfg = SelfPlayConfig::new(1, 300, 5).with_workers(1).with_opening_moves(0).with_dirichlet(0.3, 0.0).with_discount(0.9);
         let result = run_chained_self_play(&service, &cfg, &|played, rng| rounds.next_round(played, rng));
 

@@ -16,7 +16,8 @@
 //! - run: `minutes=60` (training time, evaluation excluded), `iterations=0` (`0` = no cap),
 //!   `eval_every=1`, `save=rubiks_rounds`, `init=` (checkpoint to continue from)
 //! - game: `rounds=26`; round `n` allows `budget_per_turn × n + budget_extra` moves, at most
-//!   `budget_max` (`2`, `10`, `100`)
+//!   `budget_max` (`2`, `10`, `100`); `first_round=1`: self-play starts there (evaluation always
+//!   starts at round 1)
 //! - self-play: `games=512`, `sims=200`, `discount=0.9`, `alpha=0.5`, `eps=0.25`
 //! - training: `steps=500`, `batch=512`, `lr=0.001`, `buffer=500000`
 //! - evaluation: `eval_games=128`, `eval_sims=400`
@@ -62,12 +63,14 @@ fn main() -> candle_core::Result<()> {
     let settings = RubiksSettings {
         discount: args.get("discount", defaults.discount),
         rounds: RoundGame {
+            first_round: args.get("first_round", defaults.rounds.first_round),
             max_rounds: args.get("rounds", defaults.rounds.max_rounds),
             moves_per_turn: args.get("budget_per_turn", defaults.rounds.moves_per_turn),
             extra_moves: args.get("budget_extra", defaults.rounds.extra_moves),
             max_moves: args.get("budget_max", defaults.rounds.max_moves),
         },
-    };
+    }
+    .sanitized();
     let minutes: f64 = args.get("minutes", 60.0);
     let max_iterations: usize = args.get("iterations", 0);
     let eval_every: usize = args.get::<usize>("eval_every", 1).max(1);
@@ -98,8 +101,8 @@ fn main() -> candle_core::Result<()> {
 
     let r = settings.rounds;
     println!(
-        "=== Rubik's cube round game: up to {} rounds, round n allows {}n + {} moves (at most {}) ===",
-        r.max_rounds, r.moves_per_turn, r.extra_moves, r.max_moves
+        "=== Rubik's cube round game: rounds {} to {} in self-play, round n allows {}n + {} moves (at most {}) ===",
+        r.first_round, r.max_rounds, r.moves_per_turn, r.extra_moves, r.max_moves
     );
     println!("{device} · {net:?}");
     println!(
@@ -115,7 +118,7 @@ fn main() -> candle_core::Result<()> {
     );
     let evaluate = |iter: usize| {
         let t = Instant::now();
-        let stats = RoundStats::new(&settings.play(&service, &settings.eval_config(&hp, 900_000 + iter as u64)).episodes);
+        let stats = RoundStats::new(&settings.eval_rounds(), &settings.evaluate(&service, &hp, 900_000 + iter as u64).episodes);
         println!(
             "   eval: score {:.2} ± {:.2} · best round {} · {:.0} s\n{}",
             stats.score,
@@ -132,14 +135,14 @@ fn main() -> candle_core::Result<()> {
     while train_secs < minutes * 60.0 && (max_iterations == 0 || iter < max_iterations) {
         iter += 1;
         let t = Instant::now();
-        let sp = settings.play(&service, &settings.self_play_config(&hp, 1000 + iter as u64 * 131));
+        let sp = settings.self_play(&service, &hp, 1000 + iter as u64 * 131);
         let sp_secs = t.elapsed().as_secs_f64();
         buffer.extend(&sp.positions);
         let m = trainer.train_epoch(&buffer, &service, hp.batch_size, hp.train_steps, &mut rng)?;
         train_secs += t.elapsed().as_secs_f64();
         trainer.save_checkpoint(checkpoints::path(&save))?;
 
-        let stats = RoundStats::new(&sp.episodes);
+        let stats = RoundStats::new(&settings.rounds, &sp.episodes);
         println!(
             "iter {iter:>3} | {:>5.1} min | self-play: score {:.2}, best round {}, {} positions, {:.0}k sims/s | KL {:.3} · value loss {:.4} | buffer {}",
             train_secs / 60.0,

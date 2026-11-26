@@ -3494,6 +3494,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       γ<sup>moves to solved</sup>, an estimate of the distance to the solution. Evaluation plays Eval Games round games without noise.</p>
     <div class="knobs-grid">
       <div class="knob-item" title="Per-move discount of search values and value targets"><label>Discount γ</label><input type="number" id="g-discount" step="0.01" min="0.5" max="1"></div>
+      <div class="knob-item" title="Self-play games start at this round; evaluation always starts at round 1"><label>Self-Play First Round</label><input type="number" id="g-first_round" min="1" max="40"></div>
       <div class="knob-item" title="Last round (26 quarter turns reach every cube)"><label>Max Rounds</label><input type="number" id="g-max_rounds" min="1" max="40"></div>
       <div class="knob-item"><label>Budget: Moves per Turn</label><input type="number" id="g-moves_per_turn" min="0" max="10"></div>
       <div class="knob-item"><label>Budget: Extra Moves</label><input type="number" id="g-extra_moves" min="0" max="255"></div>
@@ -3969,7 +3970,7 @@ function collectKnobs() {
 }
 
 // The cube's own settings ([JSON field, parser]); inputs are `g-<field>`.
-const GAME_SETTING_FIELDS = [['discount', parseFloat], ['max_rounds', parseInt], ['moves_per_turn', parseInt], ['extra_moves', parseInt], ['max_moves', parseInt]];
+const GAME_SETTING_FIELDS = [['discount', parseFloat], ['first_round', parseInt], ['max_rounds', parseInt], ['moves_per_turn', parseInt], ['extra_moves', parseInt], ['max_moves', parseInt]];
 
 function collectGameSettings() {
   const out = {};
@@ -4211,6 +4212,7 @@ function renderRoundCharts(h) {
   }
   const e = last.rounds.eval;
   document.getElementById('round-table').innerHTML = e.reached.map((reached, i) => {
+    if (!reached) return '';
     const solved = e.solved[i];
     const moves = solved ? (e.solve_moves[i] / solved).toFixed(1) : '—';
     return `<tr><td style="text-align:left">${i + 1}</td><td>${reached}</td><td>${(100 * solved / Math.max(1, reached)).toFixed(0)}%</td><td>${moves}</td></tr>`;

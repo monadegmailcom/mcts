@@ -601,10 +601,12 @@ impl RubiksSettings {
     /// Clamps the settings to sane ranges.
     pub fn sanitized(self) -> Self {
         let r = self.rounds;
+        let max_rounds = r.max_rounds.clamp(1, 40);
         Self {
             discount: self.discount.clamp(0.5, 1.0),
             rounds: RoundGame {
-                max_rounds: r.max_rounds.clamp(1, 40),
+                first_round: r.first_round.clamp(1, max_rounds),
+                max_rounds,
                 moves_per_turn: r.moves_per_turn.min(10),
                 extra_moves: r.extra_moves,
                 max_moves: r.max_moves.max(1),
@@ -612,28 +614,42 @@ impl RubiksSettings {
         }
     }
 
-    /// Self-play of one iteration: `hp`'s search settings with this discount.
-    pub fn self_play_config(&self, hp: &AlphaZeroHyperparams, seed: u64) -> SelfPlayConfig {
-        hp.self_play_config(seed).with_discount(self.discount)
+    /// The self-play games of one iteration: [`Self::rounds`] with `hp`'s search settings, root
+    /// noise and this discount.
+    pub fn self_play<E>(&self, service: &InferenceService<E, INPUT_SIZE, POLICY_SIZE, 1>, hp: &AlphaZeroHyperparams, seed: u64) -> SelfPlayResult<INPUT_SIZE, POLICY_SIZE, 1>
+    where
+        E: BatchEvaluator<INPUT_SIZE, POLICY_SIZE, 1> + 'static,
+    {
+        Self::play(self.rounds, service, &hp.self_play_config(seed).with_discount(self.discount))
     }
 
-    /// Evaluation: `hp.eval_games` games at `hp.eval_simulations()` per move, without noise.
-    pub fn eval_config(&self, hp: &AlphaZeroHyperparams, seed: u64) -> SelfPlayConfig {
-        SelfPlayConfig::new(hp.eval_games, hp.eval_simulations(), seed)
+    /// The evaluation games: [`Self::eval_rounds`], `hp.eval_games` games at
+    /// `hp.eval_simulations()` per move, without noise.
+    pub fn evaluate<E>(&self, service: &InferenceService<E, INPUT_SIZE, POLICY_SIZE, 1>, hp: &AlphaZeroHyperparams, seed: u64) -> SelfPlayResult<INPUT_SIZE, POLICY_SIZE, 1>
+    where
+        E: BatchEvaluator<INPUT_SIZE, POLICY_SIZE, 1> + 'static,
+    {
+        let config = SelfPlayConfig::new(hp.eval_games, hp.eval_simulations(), seed)
             .with_workers(hp.eval_thread_count())
             .with_opening_moves(0)
             .with_puct(hp.c_base, hp.c_init)
             .with_fpu(hp.fpu)
             .with_dirichlet(0.3, 0.0)
-            .with_discount(self.discount)
+            .with_discount(self.discount);
+        Self::play(self.eval_rounds(), service, &config)
     }
 
-    /// Plays round games with `config` (self-play or evaluation).
-    pub fn play<E>(&self, service: &InferenceService<E, INPUT_SIZE, POLICY_SIZE, 1>, config: &SelfPlayConfig) -> SelfPlayResult<INPUT_SIZE, POLICY_SIZE, 1>
+    /// The rules of evaluation games: those of self-play, but always from round 1, so that
+    /// evaluation scores stay comparable when [`RoundGame::first_round`] changes.
+    pub fn eval_rounds(&self) -> RoundGame {
+        RoundGame { first_round: 1, ..self.rounds }
+    }
+
+    fn play<E>(rounds: RoundGame, service: &InferenceService<E, INPUT_SIZE, POLICY_SIZE, 1>, config: &SelfPlayConfig) -> SelfPlayResult<INPUT_SIZE, POLICY_SIZE, 1>
     where
         E: BatchEvaluator<INPUT_SIZE, POLICY_SIZE, 1> + 'static,
     {
-        run_chained_self_play(service, config, &|played, rng| self.rounds.next_round(played, rng))
+        run_chained_self_play(service, config, &|played, rng| rounds.next_round(played, rng))
     }
 }
 
@@ -647,16 +663,19 @@ pub struct RoundStats {
     /// Highest round solved in any game.
     pub best_round: usize,
     /// Per round, from round 1 to the highest one played: games that played it, solved it, and
-    /// the total moves of those solves.
+    /// the total moves of those solves. Rounds below [`RoundGame::first_round`] count as not
+    /// reached.
     pub reached: Vec<usize>,
     pub solved: Vec<usize>,
     pub solve_moves: Vec<usize>,
 }
 
 impl RoundStats {
-    /// Statistics of round games whose rounds ended as `games` ([`SelfPlayResult::episodes`]).
-    pub fn new(games: &[Vec<Episode<1>>]) -> Self {
-        let rounds = games.iter().map(Vec::len).max().unwrap_or(0);
+    /// Statistics of round games played by `rules`, whose rounds ended as `games`
+    /// ([`SelfPlayResult::episodes`]).
+    pub fn new(rules: &RoundGame, games: &[Vec<Episode<1>>]) -> Self {
+        let skipped = rules.first_round as usize - 1;
+        let rounds = skipped + games.iter().map(Vec::len).max().unwrap_or(0);
         let mut stats = Self {
             games: games.len(),
             reached: vec![0; rounds],
@@ -664,13 +683,13 @@ impl RoundStats {
             solve_moves: vec![0; rounds],
             ..Self::default()
         };
-        let scores: Vec<f64> = games.iter().map(|g| RoundGame::score(g)).collect();
+        let scores: Vec<f64> = games.iter().map(|g| rules.score(g)).collect();
         let n = scores.len() as f64;
         stats.score = scores.iter().sum::<f64>() / n.max(1.0);
         stats.score_stderr =
             (scores.iter().map(|s| (s - stats.score).powi(2)).sum::<f64>() / (n - 1.0).max(1.0) / n.max(1.0)).sqrt();
         for game in games {
-            for (i, round) in game.iter().enumerate() {
+            for (i, round) in game.iter().enumerate().map(|(i, round)| (skipped + i, round)) {
                 stats.reached[i] += 1;
                 if solved(round) {
                     stats.solved[i] += 1;
@@ -686,6 +705,9 @@ impl RoundStats {
     pub fn table(&self) -> String {
         let mut out = String::from("      round | reached | solved | moves (avg)\n");
         for (i, (&reached, &solved)) in self.reached.iter().zip(&self.solved).enumerate() {
+            if reached == 0 {
+                continue;
+            }
             let moves = if solved > 0 { format!("{:.1}", self.solve_moves[i] as f64 / solved as f64) } else { "-".into() };
             let rate = 100.0 * solved as f64 / reached.max(1) as f64;
             out += &format!("      {:>5} | {reached:>7} | {rate:>5.0}% | {moves:>6}\n", i + 1);
@@ -695,11 +717,13 @@ impl RoundStats {
 }
 
 /// A game of rounds of rising difficulty: round `n` is a cube scrambled with `n` quarter turns
-/// ([`RubiksState::scrambled`]) to be solved within [`Self::move_budget`] moves. Solving it leads
-/// to round `n + 1`, up to `max_rounds`; failing ends the game.
+/// ([`RubiksState::scrambled`]) to be solved within [`Self::move_budget`] moves. The game starts
+/// at `first_round`; solving round `n` leads to round `n + 1`, up to `max_rounds`; failing ends
+/// the game.
 ///
 /// Solving round `n` in `r` moves scores `n + 1/r`, and a game scores what its last solved round
-/// scored (`0` if none): a higher round always scores more, and fewer moves earn a bonus.
+/// scored: a higher round always scores more, and fewer moves earn a bonus. Rounds below
+/// `first_round` count as solved, so a game that fails its first round scores `first_round - 1`.
 ///
 /// Each round is one episode of [`crate::alphazero::run_chained_self_play`]. The next scramble is
 /// random, so rounds are searched and learned on their own; the game decides *which* cubes are
@@ -707,6 +731,10 @@ impl RoundStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoundGame {
+    /// First round played. Self-play can skip the rounds the network has mastered, since their
+    /// cubes still come up on the way to solving deeper scrambles (a cube `k` moves from solved is
+    /// a round-`k` cube); evaluation always starts at round 1 ([`RubiksSettings::eval_rounds`]).
+    pub first_round: u8,
     /// Last round (26 quarter turns reach every cube).
     pub max_rounds: u8,
     /// Round `n` allows `moves_per_turn × n + extra_moves` moves, at most `max_moves`: room for
@@ -719,7 +747,7 @@ pub struct RoundGame {
 
 impl Default for RoundGame {
     fn default() -> Self {
-        Self { max_rounds: 26, moves_per_turn: 2, extra_moves: 10, max_moves: 100 }
+        Self { first_round: 1, max_rounds: 26, moves_per_turn: 2, extra_moves: 10, max_moves: 100 }
     }
 }
 
@@ -729,10 +757,10 @@ impl RoundGame {
         (self.moves_per_turn as usize * round + self.extra_moves as usize).min(self.max_moves as usize) as u8
     }
 
-    /// The cube of the round after `played` (round 1 if `played` is empty), or `None` when the
-    /// game is over: the last round failed or `max_rounds` were solved.
+    /// The cube of the round after `played` (`first_round` if `played` is empty), or `None` when
+    /// the game is over: the last round failed or `max_rounds` were solved.
     pub fn next_round(&self, played: &[Episode<1>], rng: &mut impl Rng) -> Option<RubiksGame> {
-        let round = played.len() + 1;
+        let round = self.first_round as usize + played.len();
         if played.last().is_some_and(|r| !solved(r)) || round > self.max_rounds as usize {
             return None;
         }
@@ -745,12 +773,14 @@ impl RoundGame {
         }
     }
 
-    /// Score of a game whose rounds ended as `played`: `n + 1/r` of its last solved round.
-    pub fn score(played: &[Episode<1>]) -> f64 {
+    /// Score of a game whose rounds ended as `played`: `n + 1/r` of its last solved round `n`,
+    /// or `first_round - 1` if it solved none.
+    pub fn score(&self, played: &[Episode<1>]) -> f64 {
+        let skipped = self.first_round as usize - 1;
         played
             .iter()
             .rposition(solved)
-            .map_or(0.0, |i| (i + 1) as f64 + 1.0 / played[i].moves as f64)
+            .map_or(skipped as f64, |i| (skipped + i + 1) as f64 + 1.0 / played[i].moves as f64)
     }
 }
 
@@ -782,10 +812,34 @@ mod tests {
         assert!(game.next_round(&[solved(1), failed], &mut rng).is_none(), "a failed round ends the game");
         assert!(game.next_round(&[solved(1), solved(2), solved(3)], &mut rng).is_none(), "max_rounds reached");
 
-        assert_eq!(RoundGame::score(&[]), 0.0);
-        assert_eq!(RoundGame::score(&[failed]), 0.0);
-        assert_eq!(RoundGame::score(&[solved(1), solved(4), failed]), 2.25);
-        assert_eq!(RoundGame::score(&[solved(1), solved(2), solved(3)]), 3.0 + 1.0 / 3.0);
+        assert_eq!(game.score(&[]), 0.0);
+        assert_eq!(game.score(&[failed]), 0.0);
+        assert_eq!(game.score(&[solved(1), solved(4), failed]), 2.25);
+        assert_eq!(game.score(&[solved(1), solved(2), solved(3)]), 3.0 + 1.0 / 3.0);
+    }
+
+    #[test]
+    fn round_game_can_start_at_a_later_round_and_counts_the_skipped_rounds() {
+        let game = RoundGame { first_round: 5, max_rounds: 7, ..RoundGame::default() };
+        let mut rng = SmallRng::seed_from_u64(2);
+        let solved = |moves| Episode { payoffs: [1.0], moves };
+        let failed = Episode { payoffs: [0.0], moves: 20 };
+
+        let first = game.next_round(&[], &mut rng).unwrap();
+        assert_eq!(first.state().remaining_steps, game.move_budget(5), "the game starts with round 5");
+        assert!(game.next_round(&[solved(5), solved(6), solved(7)], &mut rng).is_none(), "max_rounds reached");
+        assert_eq!(game.score(&[failed]), 4.0, "rounds 1-4 count as solved");
+        assert!((game.score(&[solved(5), failed]) - 5.2).abs() < 1e-12);
+
+        let stats = RoundStats::new(&game, &[vec![solved(5), failed], vec![failed]]);
+        assert_eq!(stats.reached, [0, 0, 0, 0, 2, 1]);
+        assert_eq!(stats.solved, [0, 0, 0, 0, 1, 0]);
+        assert_eq!(stats.best_round, 5);
+        assert!((stats.score - 4.6).abs() < 1e-12);
+        assert_eq!(stats.table().lines().count(), 3, "a header and rounds 5 and 6:\n{}", stats.table());
+
+        let settings = RubiksSettings { rounds: game, ..RubiksSettings::default() };
+        assert_eq!(settings.eval_rounds().first_round, 1, "evaluation always starts at round 1");
     }
 
     #[test]

@@ -82,7 +82,9 @@ is a cube scrambled with `n` quarter turns, solving it within `2n + 10` moves (a
 round `n + 1` (up to 26), failing ends the game, and a game scores `n + 1/r` for its last solved round (solved in `r` moves). Each
 round is searched and labelled on its own with a discounted value (`γ^(moves to solved)`), so the
 network learns how far a cube is from solved; the game moves self-play to deeper scrambles as the
-network improves.
+network improves. Once the early rounds are mastered, self-play can start at a later round
+(`first_round`) to spend its moves where the network still learns; evaluation always starts at
+round 1. Experience and recommended settings: [docs/playbooks/rubiks-cube.md](docs/playbooks/rubiks-cube.md).
 
 ```bash
 LIBTORCH=$PWD/libtorch LIBTORCH_BYPASS_VERSION_CHECK=1 \
@@ -124,7 +126,7 @@ New games implement `play::PlayableGame` (start position, Minimax heuristic, eva
 cell owners). The evaluation openings are shared by the training evaluation, experiments and arena matches.
 
 The **Rubik's cube** is a one-player game in the lab: live training and experiments play the round
-game, with the cube's own settings (discount γ, rounds, move budget) next to the shared knobs, and
+game, with the cube's own settings (discount γ, first and last round, move budget) next to the shared knobs, and
 are evaluated in noise-free round games (game score, solve rate per round) instead of opponents.
 In the Play tab the cube is drawn in 3D (drag to turn the view): turn faces with the buttons or
 keys, scramble it, and let AlphaZero solve it step by step (⏭) or on its own (▶), with the

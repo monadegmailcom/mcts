@@ -86,7 +86,7 @@ trait LabTraining<const G: usize, const P: usize, const N: usize>: AlphaZeroGame
     fn experiment_settings(json: &serde_json::Value) -> Self::Settings;
     fn self_play(service: &LabService<G, P, N>, hp: &AlphaZeroHyperparams, settings: &Self::Settings, seed: u64) -> SelfPlayResult<G, P, N>;
     /// How the self-play games went, for games made of rounds.
-    fn self_play_rounds(_: &SelfPlayResult<G, P, N>) -> Option<RoundStats> {
+    fn self_play_rounds(_: &Self::Settings, _: &SelfPlayResult<G, P, N>) -> Option<RoundStats> {
         None
     }
     #[allow(clippy::too_many_arguments)]
@@ -156,11 +156,11 @@ impl LabTraining<{ CUBE_INPUT_SIZE }, { CUBE_POLICY_SIZE }, 1> for RubiksCube {
     }
 
     fn self_play(service: &CubeService, hp: &AlphaZeroHyperparams, settings: &RubiksSettings, seed: u64) -> CubeSelfPlay {
-        settings.play(service, &settings.self_play_config(hp, seed))
+        settings.self_play(service, hp, seed)
     }
 
-    fn self_play_rounds(games: &CubeSelfPlay) -> Option<RoundStats> {
-        Some(RoundStats::new(&games.episodes))
+    fn self_play_rounds(settings: &RubiksSettings, games: &CubeSelfPlay) -> Option<RoundStats> {
+        Some(RoundStats::new(&settings.rounds, &games.episodes))
     }
 
     fn evaluate(
@@ -173,8 +173,8 @@ impl LabTraining<{ CUBE_INPUT_SIZE }, { CUBE_POLICY_SIZE }, 1> for RubiksCube {
         mut phase: impl FnMut(String),
     ) -> Evaluation {
         phase(format!("in {} round games × {} sims", hp.eval_games, hp.eval_simulations()));
-        let games = settings.play(service, &settings.eval_config(hp, seed));
-        Evaluation { arena: Vec::new(), rounds: Some(RoundStats::new(&games.episodes)) }
+        let games = settings.evaluate(service, hp, seed);
+        Evaluation { arena: Vec::new(), rounds: Some(RoundStats::new(&settings.eval_rounds(), &games.episodes)) }
     }
 }
 
@@ -264,7 +264,7 @@ where
         self_play_wins: std::array::from_fn(|p| sp_res.wins.get(p).copied().unwrap_or(0)),
         self_play_draws: sp_res.draws,
         arena: evaluation.arena,
-        rounds: S::self_play_rounds(&sp_res).map(|self_play| RoundsTelemetry { self_play, eval: evaluation.rounds }),
+        rounds: S::self_play_rounds(&settings, &sp_res).map(|self_play| RoundsTelemetry { self_play, eval: evaluation.rounds }),
         buffer_len: buffer.len(),
         buffer_capacity: buffer.capacity(),
         batch_size_mean: batch_stats.mean(),
