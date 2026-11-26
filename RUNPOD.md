@@ -104,6 +104,9 @@ Optional environment variables:
 
 ## Workflow: tune with experiments, then train
 
+The playbooks in [docs/playbooks](docs/playbooks) describe each step in detail: tuning the engine,
+supervising a run, and what has been learned about Ultimate Tic-Tac-Toe.
+
 1. Start the pod and open the lab, through the proxy URL or the SSH tunnel.
 2. **Tune with experiments.** In the Experiments tab, queue short runs that differ in one
    setting at a time: inference batch, inference workers, games per iteration, replay buffer
@@ -154,10 +157,11 @@ can push with your key without storing it (`ssh -A root@<ip> -p <port>`, then
 
 ## Notes
 
-- **CPU, not GPU, limits self-play:** each self-play game searches on its own CPU thread, and the
-  network calls of all games are batched on the GPU. A pod with 15 vCPUs and an RTX A4000 kept the
-  GPU at 20–40% load and ran as fast as an Apple M4 (about 260k simulations/s for UTTT with the
-  `block` network). For more speed, pick a pod by its vCPU count first.
+- **Neither CPU nor GPU is saturated:** self-play is a closed loop of one network request per
+  game, and the inference workers' serial host-side work sets its pace. A pod with 15 vCPUs and an
+  RTX A4000 kept CPU and GPU below 40% and, with one inference worker, ran as fast as an Apple M4
+  (about 260k simulations/s for UTTT with the `block` network). Tune a new pod with the
+  [engine tuning playbook](docs/playbooks/engine-tuning.md).
 
 - **Multiple GPUs:** self-play and evaluation games spread their network calls over the GPUs, one
   model replica per *inference worker*, round-robin. Several workers per GPU overlap the host-side
