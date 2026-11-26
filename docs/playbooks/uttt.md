@@ -41,7 +41,7 @@ This playbook collects experience and recommendations for UTTT, from Nov 14 to N
 
 | Knob | Code default | Proven on the A4000 pod | Note |
 |---|---|---|---|
-| `games_per_iteration` | 1024 | 1024 | 256 leaves the batches half empty; 2048 didn't help |
+| `games_per_iteration` | 1024 | 1024 (A4000); 2048 with 400 train steps (A40, run5) | 256 leaves the batches half empty; 2048 didn't help on the A4000 at 64 sims, but gave +37% games per minute on the A40 at 200 sims |
 | `simulations_per_move` | 64 | **200** | 64 is best from scratch for short budgets; 200 helped late in training; 400 didn't |
 | `train_steps` × `batch_size` | 800 × 256 | 200 × 1024 | Same samples, 3.7× faster SGD; reuse ≈ 3.8. Run5: reuse 1.9–7.6 all equal at the plateau |
 | `learning_rate` | 2e-3 | 2e-3 from scratch, 6e-4 to continue, 2e-4 for the final hours | See §5 |
