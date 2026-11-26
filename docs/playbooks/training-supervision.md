@@ -3,7 +3,8 @@
 This playbook covers watching a long live-training run and stepping in. It applies to any game.
 
 - Tune the engine first, with [engine-tuning.md](engine-tuning.md).
-- Game-specific experience is in the game's playbook, e.g. [uttt.md](uttt.md).
+- Game-specific experience is in the game's playbook: [uttt.md](uttt.md),
+  [rubiks-cube.md](rubiks-cube.md).
 - Tool: [`experiments/lab_checkin.py`](../../experiments/lab_checkin.py), which saves a snapshot
   and prints the window table.
 

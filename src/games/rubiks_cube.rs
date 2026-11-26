@@ -551,8 +551,10 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 1> for RubiksCube {
     /// - search: 200 simulations per move, no temperature moves (a wrong move only costs moves)
     ///   and root noise for exploration;
     /// - `fpu` 0: an untried move is assumed to lead nowhere (worth what an unsolved cube is worth);
-    /// - training: a game of rounds yields ~50-500 positions; 512 games and 500 steps of 512
-    ///   positions use every new position about twice; the buffer holds a few iterations.
+    /// - training: 500 steps of 512 positions; a game yields about 20 positions at first and about
+    ///   90 once the network reaches round 11, so SGD sees each new position about 25 times in the
+    ///   first iteration and about 6 times later; the buffer holds about 11 iterations of 44k
+    ///   positions (see `docs/playbooks/rubiks-cube.md`).
     fn hyperparams() -> AlphaZeroHyperparams {
         AlphaZeroHyperparams {
             games_per_iteration: 512,
