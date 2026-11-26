@@ -11,7 +11,8 @@ if [[ -n "${PUBLIC_KEY:-}" ]]; then
 fi
 
 # SSH sessions start with a clean environment; give them the container's.
-printenv | grep -E '^(PATH|LD_LIBRARY_PATH|NVIDIA_[A-Z_]+|CUDA_[A-Z_]+|MCTS_[A-Z_]+|RUNPOD_[A-Z_]+)=' > /etc/environment || true
+printenv | grep -E '^(PATH|LD_LIBRARY_PATH|(NVIDIA|CUDA|MCTS|RUNPOD|LIBTORCH)_[A-Z_]+|LIBTORCH|RUSTUP_HOME|CARGO_HOME)=' \
+    > /etc/environment || true
 
 ssh-keygen -A
 mkdir -p /run/sshd

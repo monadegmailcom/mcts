@@ -471,10 +471,12 @@ impl TchEvaluator {
     }
 }
 
-/// AdamW trainer over the shared replica-0 model.
+/// AdamW trainer over the shared replica-0 model, plus the exponentially weighted average (EWA)
+/// of its weights in a second model.
 pub struct TchTrainer {
     model: SharedModel,
     opt: nn::Optimizer,
+    ewa: Box<TchModel>,
     cfg: AlphaZeroNetConfig,
     dims: (usize, usize, usize),
 }
@@ -483,7 +485,36 @@ impl TchTrainer {
     pub fn new(cfg: AlphaZeroNetConfig, lr: f64, wd: f64, device: NnDevice, dims: (usize, usize, usize)) -> Result<Self> {
         let model = TchModel::new(&cfg, tch_device(device), dims.0, dims.1, dims.2);
         let opt = Self::optimizer(&model.vs, lr, wd)?;
-        Ok(Self { model: Arc::new(Mutex::new(model)), opt, cfg, dims })
+        let ewa = Box::new(TchModel::new(&cfg, model.device, dims.0, dims.1, dims.2));
+        let mut trainer = Self { model: Arc::new(Mutex::new(model)), opt, ewa, cfg, dims };
+        trainer.reset_ewa()?;
+        Ok(trainer)
+    }
+
+    /// Restarts the average at the current weights (after loading or resetting them).
+    fn reset_ewa(&mut self) -> Result<()> {
+        let m = lock(&self.model);
+        let _mps = mps_guard(m.device);
+        self.ewa.vs.copy(&m.vs).map_err(err)
+    }
+
+    /// Policy cross-entropy, value MSE and their sum of `net` on a batch.
+    fn losses(net: &TchNet, x: &Tensor, pi: &Tensor, z: &Tensor, b: usize) -> [Tensor; 3] {
+        let (logits, v) = net.forward(x);
+        let policy_loss = -(pi * logits.log_softmax(1, Kind::Float)).sum(Kind::Float) / b as f64;
+        let value_loss = (&v - z).square().mean(Kind::Float);
+        [&policy_loss + &value_loss, policy_loss, value_loss]
+    }
+
+    fn batch(&self, dev: Device, states: &[f32], policies: &[f32], values: &[f32], b: usize) -> [Tensor; 3] {
+        let (g, p, n) = self.dims;
+        [(states, g), (policies, p), (values, n)].map(|(data, width)| Tensor::from_slice(data).view([b as i64, width as i64]).to_device(dev))
+    }
+
+    fn to_host(losses: [Tensor; 3]) -> (f32, f32, f32) {
+        let mut out = [0f32; 3];
+        Tensor::stack(&losses, 0).detach().to_device(Device::Cpu).copy_data(&mut out, 3);
+        (out[0], out[1], out[2])
     }
 
     fn optimizer(vs: &nn::VarStore, lr: f64, wd: f64) -> Result<nn::Optimizer> {
@@ -502,29 +533,42 @@ impl TchTrainer {
         self.opt.set_weight_decay(wd);
     }
 
-    /// Re-creates the optimizer (fresh moment estimates), e.g. after the weights were reset.
+    /// Re-creates the optimizer (fresh moment estimates) and restarts the weight average, e.g.
+    /// after the weights were reset.
     pub fn reset_optimizer(&mut self, lr: f64, wd: f64) -> Result<()> {
-        let m = lock(&self.model);
-        self.opt = Self::optimizer(&m.vs, lr, wd)?;
-        Ok(())
+        {
+            let m = lock(&self.model);
+            self.opt = Self::optimizer(&m.vs, lr, wd)?;
+        }
+        self.reset_ewa()
     }
 
-    pub fn train_step(&mut self, states: &[f32], policies: &[f32], values: &[f32], b: usize) -> Result<(f32, f32, f32)> {
-        let (g, p, n) = self.dims;
+    /// Forward + backward + AdamW step, then the EWA update with factor `ewa_decay`; returns
+    /// `(total, policy, value)` losses.
+    pub fn train_step(&mut self, states: &[f32], policies: &[f32], values: &[f32], b: usize, ewa_decay: f64) -> Result<(f32, f32, f32)> {
         let m = lock(&self.model);
         let _mps = mps_guard(m.device);
-        let dev = m.device;
-        let x = Tensor::from_slice(states).view([b as i64, g as i64]).to_device(dev);
-        let pi = Tensor::from_slice(policies).view([b as i64, p as i64]).to_device(dev);
-        let z = Tensor::from_slice(values).view([b as i64, n as i64]).to_device(dev);
-        let (logits, v) = m.net.forward(&x);
-        let policy_loss = -(&pi * logits.log_softmax(1, Kind::Float)).sum(Kind::Float) / b as f64;
-        let value_loss = (&v - &z).square().mean(Kind::Float);
-        let total = &policy_loss + &value_loss;
-        self.opt.backward_step(&total);
-        let mut out = [0f32; 3];
-        Tensor::stack(&[total, policy_loss, value_loss], 0).detach().to_device(Device::Cpu).copy_data(&mut out, 3);
-        Ok((out[0], out[1], out[2]))
+        let [x, pi, z] = self.batch(m.device, states, policies, values, b);
+        let losses = Self::losses(&m.net, &x, &pi, &z, b);
+        self.opt.backward_step(&losses[0]);
+        {
+            // `ewa = decay * ewa + (1 - decay) * weights`
+            let _ng = tch::no_grad_guard();
+            let weights = m.vs.variables();
+            for (name, mut e) in self.ewa.vs.variables() {
+                let _ = e.lerp_(&weights[&name], 1.0 - ewa_decay);
+            }
+        }
+        Ok(Self::to_host(losses))
+    }
+
+    /// `(total, policy, value)` losses of the current and of the EWA weights, without training.
+    pub fn eval_losses(&self, states: &[f32], policies: &[f32], values: &[f32], b: usize) -> Result<[(f32, f32, f32); 2]> {
+        let m = lock(&self.model);
+        let _mps = mps_guard(m.device);
+        let _ng = tch::no_grad_guard();
+        let [x, pi, z] = self.batch(m.device, states, policies, values, b);
+        Ok([&m.net, &self.ewa.net].map(|net| Self::to_host(Self::losses(net, &x, &pi, &z, b))))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -533,10 +577,14 @@ impl TchTrainer {
         m.vs.save(path).map_err(err)
     }
 
+    /// Loads weights; the weight average restarts at them.
     pub fn load(&mut self, path: &Path) -> Result<()> {
-        let mut m = lock(&self.model);
-        let _mps = mps_guard(m.device);
-        m.vs.load(path).map_err(err)
+        {
+            let mut m = lock(&self.model);
+            let _mps = mps_guard(m.device);
+            m.vs.load(path).map_err(err)?;
+        }
+        self.reset_ewa()
     }
 
     pub const fn net_config(&self) -> &AlphaZeroNetConfig {

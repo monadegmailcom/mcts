@@ -36,6 +36,11 @@ pub struct AlphaZeroHyperparams {
     pub weight_decay: f64,
     /// Replay buffer capacity in positions (oldest positions are dropped first).
     pub buffer_capacity: usize,
+    /// Window of the exponentially weighted average (EWA) of the weights, in SGD steps: each step
+    /// moves the average `1 / window` of the way to the new weights. The held-out loss of the
+    /// averaged weights shows how much the learning rate's step noise costs (see
+    /// [`crate::training::AlphaZeroTrainer::held_out_losses`]).
+    pub ewa_window: usize,
     // --- Arena evaluation ---
     /// Games per arena opponent (each opening is played once per seat).
     pub eval_games: usize,
@@ -64,6 +69,7 @@ impl AlphaZeroHyperparams {
         learning_rate: 1e-3,
         weight_decay: 1e-4,
         buffer_capacity: 100_000,
+        ewa_window: 2_000,
         eval_games: 40,
         eval_sims: 0,
         eval_threads: 0,

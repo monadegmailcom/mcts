@@ -46,8 +46,8 @@ pub struct ExperimentSpec {
     pub eval_games: usize,
     /// Maximum positions per batched NN inference call (larger batches use GPUs much better).
     pub infer_batch: usize,
-    /// Inference workers, one model replica each, as for live training (CUDA: one per GPU, so
-    /// self-play and evaluation use up to this many GPUs; Apple GPUs: always 1).
+    /// Inference workers, one model replica each, as for live training (CUDA: spread over the
+    /// GPUs, several per GPU allowed; Apple GPUs: always 1).
     pub infer_workers: usize,
     /// Evaluation opponents (empty = the game's defaults).
     pub opponents: Vec<OpponentSpec>,

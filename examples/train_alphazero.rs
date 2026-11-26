@@ -201,6 +201,7 @@ where
     let settings = S::live_settings(hub);
     trainer.set_learning_rate(knobs.learning_rate);
     trainer.set_weight_decay(knobs.weight_decay);
+    trainer.set_ewa_window(knobs.ewa_window);
     buffer.set_capacity(knobs.buffer_capacity);
     service.reset_stats();
 
@@ -214,7 +215,7 @@ where
     let sp_start = Instant::now();
     let sp_res = S::self_play(service, &knobs, &settings, S::SEED + iter as u64 * 131);
     let self_play_ms = (sp_start.elapsed().as_secs_f64() * 1000.0) as f32;
-    buffer.extend(&sp_res.positions);
+    buffer.add_games(&sp_res);
 
     let batch_stats = service.batch_size_stats();
     let uniq_batch_stats = service.unique_batch_size_stats();
@@ -231,19 +232,24 @@ where
     );
     let train_start = Instant::now();
     let metrics = trainer.train_epoch(buffer, service, knobs.batch_size, knobs.train_steps, rng)?;
+    let held_out = trainer.held_out_losses(buffer)?;
     let train_ms = (train_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
-    // 3. Evaluation (argmax AlphaZero, no noise)
+    // 3. Evaluation (argmax AlphaZero, no noise) after every `eval_every`-th iteration
     let eval_start = Instant::now();
-    let evaluation = S::evaluate(
-        service,
-        &knobs,
-        &settings,
-        &hub.eval_opponents_for(game),
-        hub.system_settings().train_device(),
-        S::SEED + 500_000 + iter as u64 * 10,
-        |p| hub.set_phase_for(game, iter, format!("Iter #{iter}: Evaluation {p}...")),
-    );
+    let evaluation = if iter.is_multiple_of(knobs.eval_every) {
+        S::evaluate(
+            service,
+            &knobs,
+            &settings,
+            &hub.eval_opponents_for(game),
+            hub.system_settings().train_device(),
+            S::SEED + 500_000 + iter as u64 * 10,
+            |p| hub.set_phase_for(game, iter, format!("Iter #{iter}: Evaluation {p}...")),
+        )
+    } else {
+        Evaluation::default()
+    };
     let eval_ms = (eval_start.elapsed().as_secs_f64() * 1000.0) as f32;
 
     let rec = IterationTelemetry {
@@ -252,12 +258,13 @@ where
         policy_loss: metrics.policy_loss,
         policy_kl: metrics.policy_kl,
         value_loss: metrics.value_loss,
+        held_out,
         root_entropy_mean: sp_res.root_entropy_stats.mean(),
         game_moves_mean: sp_res.game_moves_stats.mean(),
         self_play_wins: std::array::from_fn(|p| sp_res.wins.get(p).copied().unwrap_or(0)),
         self_play_draws: sp_res.draws,
         arena: evaluation.arena,
-        rounds: evaluation.rounds.zip(S::self_play_rounds(&sp_res)).map(|(eval, self_play)| RoundsTelemetry { self_play, eval }),
+        rounds: S::self_play_rounds(&sp_res).map(|self_play| RoundsTelemetry { self_play, eval: evaluation.rounds }),
         buffer_len: buffer.len(),
         buffer_capacity: buffer.capacity(),
         batch_size_mean: batch_stats.mean(),
@@ -278,8 +285,12 @@ where
     if let Some(r) = hub.elo_pool(game).and_then(|pool| pool.estimate(rec.arena.iter().map(|a| (&a.opponent, a.wdl)))) {
         eval_txt.push(format!("Elo {:.0} ± {:.0}", r.elo, r.stderr));
     }
-    if let Some(r) = &rec.rounds {
-        eval_txt.push(format!("score {:.2} ± {:.2}, best round {}", r.eval.score, r.eval.score_stderr, r.eval.best_round));
+    if let Some(r) = rec.rounds.as_ref().and_then(|r| r.eval.as_ref()) {
+        eval_txt.push(format!("score {:.2} ± {:.2}, best round {}", r.score, r.score_stderr, r.best_round));
+    }
+    if let Some(h) = rec.held_out {
+        let (cur, ewa) = (h.current.policy_kl + h.current.value_loss, h.ewa.policy_kl + h.ewa.value_loss);
+        eval_txt.push(format!("held-out {cur:.4} / EWA {ewa:.4}"));
     }
     println!(
         "[{tag:<4} #{iter:>3}] Loss {:>5.3} | KL {:>6.4} | MSE {:>6.4} | {} | Dedup {:>4.1}% | {:>7.0} sims/s",
@@ -291,7 +302,7 @@ where
         rec.simulations_per_sec,
     );
 
-    trainer.save_checkpoint(checkpoints::path(&format!("{}alphazero.safetensors", game.prefix())))?;
+    trainer.save_checkpoint(live_checkpoint(game))?;
     let auto_every = hub.auto_save_every_for(game);
     if auto_every > 0 && iter.is_multiple_of(auto_every) {
         let snap = format!("{}iter_{iter:03}.safetensors", game.prefix());
@@ -461,6 +472,7 @@ where
         .unwrap_or_else(|| S::net_presets()[0]);
     let hp = spec.hp;
     let mut trainer = AlphaZeroTrainer::<G, P, N>::new(cfg, hp.learning_rate, hp.weight_decay, dev)?;
+    trainer.set_ewa_window(hp.ewa_window);
     if !spec.init_checkpoint.is_empty() {
         let path = checkpoints::path(&spec.init_checkpoint);
         let file_cfg = checkpoints::net_config::<S, G, P, N>(&path).map_err(candle_core::Error::Msg)?;
@@ -571,35 +583,50 @@ type UtttModel = LiveModel<{ UTTT_INPUT_SIZE }, 81, 2>;
 type CubeModel = LiveModel<{ CUBE_INPUT_SIZE }, { CUBE_POLICY_SIZE }, 1>;
 
 impl<const G: usize, const P: usize, const N: usize> LiveModel<G, P, N> {
-    /// A fresh network of `R`'s architecture; with `resume`, the game's saved live checkpoint is
-    /// loaded if it holds that architecture.
+    /// The live network of game `R`: with `resume`, the weights and architecture of its live
+    /// checkpoint, if there is one; otherwise fresh weights of the game's default architecture.
     fn new<R: LabTraining<G, P, N>>(
         resume: bool,
         train_device: NnDevice,
         infer_devices: &[NnDevice],
         infer_batch: usize,
     ) -> candle_core::Result<Self> {
-        let (cfg, hp) = (R::net_config(), R::hyperparams());
+        let hp = R::hyperparams();
+        let file = live_checkpoint(R::LAB);
+        let resume = resume && file.exists();
+        let cfg = if resume { checkpoints::net_config::<R, G, P, N>(&file).map_err(candle_core::Error::Msg)? } else { R::net_config() };
         let mut trainer = AlphaZeroTrainer::<G, P, N>::new(cfg, hp.learning_rate, hp.weight_decay, train_device)?;
-        let file = checkpoints::path(&format!("{}alphazero.safetensors", R::LAB.prefix()));
-        if resume && file.exists() {
-            match checkpoints::net_config::<R, G, P, N>(&file) {
-                Ok(found) if found == cfg => {
-                    trainer.load_checkpoint(&file)?;
-                    println!("📦 Loaded {} into the live {} model", file.display(), R::LAB.title());
-                }
-                found => println!(
-                    "⚠️  Not loading {} (starting fresh): it holds {}, the live {} network is a {} network",
-                    file.display(),
-                    found.map_or_else(|e| e, |c| format!("a {} network", checkpoints::preset_name::<R, G, P, N>(&c))),
-                    R::LAB.title(),
-                    checkpoints::preset_name::<R, G, P, N>(&cfg)
-                ),
-            }
+        if resume {
+            trainer.load_checkpoint(&file)?;
+            let net = checkpoints::preset_name::<R, G, P, N>(&cfg);
+            println!("📦 Loaded the live {} network ({net}) from {}", R::LAB.title(), file.display());
         }
         let service = Arc::new(trainer.build_inference_service(infer_batch, infer_devices)?);
         let buffer = ReplayBuffer::<G, P, N>::new(hp.buffer_capacity).with_symmetries(R::symmetries());
         Ok(Self { trainer, service, buffer })
+    }
+
+    /// Replaces the network with checkpoint `file`, in the architecture recorded in it
+    /// (**Load → Live**). The optimizer state restarts; the replay buffer stays, since its
+    /// positions don't depend on the network. The live checkpoint is rewritten right away, so a
+    /// restarted lab comes back with the loaded network.
+    fn load<R: LabTraining<G, P, N>>(
+        &mut self,
+        file: &str,
+        hub: &TelemetryHub,
+        train_dev: NnDevice,
+        infer_devs: &[NnDevice],
+        infer_batch: usize,
+    ) -> candle_core::Result<()> {
+        let knobs = hub.knobs_for(R::LAB);
+        let path = checkpoints::path(file);
+        let cfg = checkpoints::net_config::<R, G, P, N>(&path).map_err(candle_core::Error::Msg)?;
+        let mut fresh = AlphaZeroTrainer::<G, P, N>::new(cfg, knobs.learning_rate, knobs.weight_decay, train_dev)?;
+        fresh.load_checkpoint(&path)?;
+        fresh.save_checkpoint(live_checkpoint(R::LAB))?;
+        self.service = Arc::new(fresh.build_inference_service(infer_batch, infer_devs)?);
+        self.trainer = fresh;
+        Ok(())
     }
 
     /// Moves the model onto new devices: copies the weights into a fresh trainer on `train_dev`
@@ -643,6 +670,11 @@ impl<const G: usize, const P: usize, const N: usize> LiveModel<G, P, N> {
     }
 }
 
+/// The live checkpoint of a game, rewritten after every iteration.
+fn live_checkpoint(game: LabGame) -> std::path::PathBuf {
+    checkpoints::path(&format!("{}alphazero.safetensors", game.prefix()))
+}
+
 fn main() -> candle_core::Result<()> {
     let interactive_lab =
         std::env::args().any(|a| a == "--serve" || a == "--lab-only");
@@ -662,7 +694,9 @@ fn main() -> candle_core::Result<()> {
         // A network call costs about the same for 16 or 256 positions (fixed per-call overhead), so
         // batches should be as large as the games in flight allow: 512 serves up to 1024 games.
         infer_batch: 512,
-        infer_workers: 8,
+        // Two workers per CUDA GPU overlap one batch's host-side work with the other's GPU work
+        // (about 30% more self-play on a RunPod RTX A4000; three were slower again).
+        infer_workers: 2 * backend.gpu_count().max(1),
     };
     let (train_device, infer_devices) = system.devices();
     system.infer_workers = infer_devices.len();
@@ -744,6 +778,21 @@ fn main() -> candle_core::Result<()> {
                 let label = device_label(train_dev, &infer_devs, new_sys.infer_batch);
                 println!("🖥️  Rebuilt all models on {label}");
                 hub.set_device_label(label);
+            }
+            if let Some((game, file)) = hub.take_live_load() {
+                let (train_dev, infer_devs) = hub.system_settings().devices();
+                let loaded = match game {
+                    LabGame::Ttt => ttt.load::<TicTacToe>(&file, &hub, train_dev, &infer_devs, max_batch_size),
+                    LabGame::Uttt => uttt.load::<UltimateTicTacToe>(&file, &hub, train_dev, &infer_devs, max_batch_size),
+                    LabGame::Rubiks => cube.load::<RubiksCube>(&file, &hub, train_dev, &infer_devs, max_batch_size),
+                };
+                attach_all(&ttt, &uttt, Some(cube), &infer_devs);
+                let status = match loaded {
+                    Ok(()) => format!("Loaded {file} into Live"),
+                    Err(e) => format!("Could not load {file} into Live: {e}"),
+                };
+                println!("📦 {status}");
+                hub.set_status_for(game, status);
             }
             match hub.poll_training_command() {
                 TrainingCommand::Idle => {

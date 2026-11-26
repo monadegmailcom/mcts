@@ -6,6 +6,8 @@ The [Dockerfile](Dockerfile) builds an image for NVIDIA GPUs:
   2.9.1 (CUDA 12.8 build) as the default.
 - An SSH server that accepts your RunPod SSH key.
 - The Browser Lab, started in the background on port 8080.
+- The build environment (Rust, the CUDA compiler, libtorch with headers) and the build in `/src`,
+  so code changes are built on the pod ([Developing on the pod](#developing-on-the-pod)).
 
 Lab state lives in `/workspace/mcts`: `checkpoints/`, `lab_experiments.json` and the Elo pools.
 On RunPod that is the pod's volume, so it survives restarts and new image versions.
@@ -14,17 +16,21 @@ On RunPod that is the pod's volume, so it survives restarts and new image versio
 
 GitHub Actions builds the image ([workflow](.github/workflows/docker.yml)) on an x86_64 runner
 and pushes it to `ghcr.io/monadegmailcom/mcts-runpod`. It is tagged `latest` and with the short
-commit hash. A build starts on every push to `main` that changes the code, or by hand:
+commit hash. Builds run only on demand, from `main` or another branch:
 
 ```bash
 gh workflow run docker.yml
 ```
 
 ```bash
+gh workflow run docker.yml --ref <branch>
+```
+
+```bash
 gh run watch
 ```
 
-A build takes about half an hour, most of it compiling candle's CUDA kernels.
+A build takes about 20 minutes.
 
 **One-time step:** after the first build, make the package public, so RunPod can pull it without
 registry credentials. On GitHub, open your profile → **Packages** → `mcts-runpod` → **Package
@@ -98,6 +104,9 @@ Optional environment variables:
 
 ## Workflow: tune with experiments, then train
 
+The playbooks in [docs/playbooks](docs/playbooks) describe each step in detail: tuning the engine,
+supervising a run, and what has been learned about Ultimate Tic-Tac-Toe.
+
 1. Start the pod and open the lab, through the proxy URL or the SSH tunnel.
 2. **Tune with experiments.** In the Experiments tab, queue short runs that differ in one
    setting at a time: inference batch, inference workers, games per iteration, replay buffer
@@ -118,10 +127,45 @@ curl -s localhost:8080/api/experiments -d '{"action":"add","spec":{...}}'
 curl -s localhost:8080/api/experiments -d '{"action":"run_queue"}'
 ```
 
+## Developing on the pod
+
+A fix doesn't need a new image: sync the source from your checkout into `/src` on the pod and
+build it there. The build reuses the image's compiled dependencies and CUDA kernels, so only the
+`mcts` crate recompiles.
+
+```bash
+rsync -az --delete -e 'ssh -p <port>' Cargo.toml Cargo.lock build.rs src examples root@<ip>:/src/
+```
+
+On the pod:
+
+```bash
+mcts-build    # builds and installs train_alphazero; a running lab keeps the old binary
+```
+
+```bash
+mcts-lab      # restarts the lab with the new binary (stops running training and experiments)
+```
+
+Commit and push from your checkout as usual. The next image build picks the changes up, and
+`/src` on a running pod is replaced only when the pod restarts with a new image.
+
+To work with git on the pod instead, clone the repository and forward your SSH agent, so the pod
+can push with your key without storing it (`ssh -A root@<ip> -p <port>`, then
+`git clone git@github.com:monadegmailcom/mcts.git /workspace/mcts-src`), then build it with
+`mcts-build /workspace/mcts-src`.
+
 ## Notes
 
+- **Neither CPU nor GPU is saturated:** self-play is a closed loop of one network request per
+  game, and the inference workers' serial host-side work sets its pace. A pod with 15 vCPUs and an
+  RTX A4000 kept CPU and GPU below 40% and, with one inference worker, ran as fast as an Apple M4
+  (about 260k simulations/s for UTTT with the `block` network). Tune a new pod with the
+  [engine tuning playbook](docs/playbooks/engine-tuning.md).
+
 - **Multiple GPUs:** self-play and evaluation games spread their network calls over the GPUs, one
-  model replica per *inference worker*. Live training takes the worker count from the System
+  model replica per *inference worker*, round-robin. Several workers per GPU overlap the host-side
+  work of their batches. Live training takes the worker count from the System
   panel. Each experiment has its own *Inference Workers* setting, which defaults to the System
   panel, so experiments run on the same setup as training. Training steps (SGD) run on GPU 0.
 - **GPU architecture:** the candle backend's CUDA kernels are compiled for compute capability 8.0

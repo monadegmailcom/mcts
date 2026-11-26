@@ -1,15 +1,17 @@
 //! Pure-Rust AlphaZero Replay Buffer, Combined Policy-Value Loss, and `AdamW` Training Loop
 //! (port & evolution of `train/main.py` and `train/utils.py` without Python or C-FFI).
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap, ops::log_softmax};
 use rand::prelude::RngExt;
 
-use crate::alphazero::TrainingPosition;
+use crate::alphazero::{SelfPlayResult, TrainingPosition};
 use crate::inference::InferenceService;
 use crate::backend::{Backend, NetEvaluator, NnDevice};
+use crate::hyperparams::AlphaZeroHyperparams;
 use crate::nn::{AlphaZeroNet, AlphaZeroNetConfig, CandleEvaluator, metal_guard};
 
 /// Circular experience replay buffer storing [`TrainingPosition<G, P, N>`] examples
@@ -20,7 +22,15 @@ pub struct ReplayBuffer<const G: usize, const P: usize, const N: usize> {
     capacity: usize,
     write_pos: usize,
     symmetries: Vec<Symmetry>,
+    /// Recent positions of the games held out by [`Self::add_games`]: never trained on, they
+    /// measure the loss on unseen positions.
+    held_out: VecDeque<TrainingPosition<G, P, N>>,
 }
+
+/// [`ReplayBuffer::add_games`] holds out every `HELD_OUT_EVERY`-th game (2%).
+const HELD_OUT_EVERY: usize = 50;
+/// Held-out positions kept (the newest), about 8 UTTT iterations of 1024 games.
+const HELD_OUT_CAPACITY: usize = 8_192;
 
 /// A board symmetry expressed as index permutations of the encoded state and the policy vector:
 /// the transformed sample is `state'[i] = state[state_src[i]]`, `policy'[a] = policy[policy_src[a]]`.
@@ -84,6 +94,7 @@ impl<const G: usize, const P: usize, const N: usize> ReplayBuffer<G, P, N> {
             capacity,
             write_pos: 0,
             symmetries: Vec::new(),
+            held_out: VecDeque::new(),
         }
     }
 
@@ -154,9 +165,34 @@ impl<const G: usize, const P: usize, const N: usize> ReplayBuffer<G, P, N> {
         }
     }
 
-    /// Clears all stored self-play positions and resets the ring cursor.
+    /// Adds the games of a self-play result, holding out every 50th game: its positions go to
+    /// [`Self::held_out`] instead of training. Whole games, because the positions of a game share
+    /// its outcome, so a network that trained on some of them would partly know the others.
+    pub fn add_games(&mut self, result: &SelfPlayResult<G, P, N>) {
+        let mut start = 0;
+        for (game, episodes) in result.episodes.iter().enumerate() {
+            let positions = &result.positions[start..start + episodes.iter().map(|e| e.moves).sum::<usize>()];
+            start += positions.len();
+            if game % HELD_OUT_EVERY == HELD_OUT_EVERY - 1 {
+                self.held_out.extend(positions.iter().cloned());
+            } else {
+                self.extend(positions);
+            }
+        }
+        debug_assert_eq!(start, result.positions.len(), "positions do not match the games' moves");
+        let excess = self.held_out.len().saturating_sub(HELD_OUT_CAPACITY);
+        self.held_out.drain(..excess);
+    }
+
+    /// The held-out positions (see [`Self::add_games`]), oldest first.
+    pub const fn held_out(&self) -> &VecDeque<TrainingPosition<G, P, N>> {
+        &self.held_out
+    }
+
+    /// Clears all stored self-play positions (held-out ones too) and resets the ring cursor.
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.held_out.clear();
         self.write_pos = 0;
     }
 
@@ -210,11 +246,44 @@ pub struct TrainMetrics {
     pub value_loss: f32,
 }
 
-/// candle half of [`AlphaZeroTrainer`]: master [`VarMap`], network and [`AdamW`] optimizer.
+impl TrainMetrics {
+    /// Metrics from the mean `total`, `policy` (cross-entropy) and `value` losses of `b` positions
+    /// with search policies `policies` (`b * P` values).
+    fn new(total: f32, policy: f32, value: f32, policies: &[f32], b: usize) -> Self {
+        let entropy: f32 = policies.iter().filter(|&&q| q > 1e-8).map(|&q| -q * q.ln()).sum::<f32>() / b as f32;
+        Self {
+            total_loss: total,
+            policy_loss: policy,
+            // `KL(pi || p) = CE - H(pi)`, floored at 0 against rounding.
+            policy_kl: (policy - entropy).max(0.0),
+            value_loss: value,
+        }
+    }
+}
+
+/// Losses on held-out positions (see [`AlphaZeroTrainer::held_out_losses`]).
+#[derive(Clone, Copy, Debug)]
+pub struct HeldOutLosses {
+    pub positions: usize,
+    /// The current weights.
+    pub current: TrainMetrics,
+    /// The exponentially weighted average of the weights.
+    pub ewa: TrainMetrics,
+}
+
+/// Per-step factor of an exponentially weighted average over `window` steps.
+fn ewa_decay(window: usize) -> f64 {
+    1.0 - 1.0 / window.max(1) as f64
+}
+
+/// candle half of [`AlphaZeroTrainer`]: master [`VarMap`], network and [`AdamW`] optimizer, plus
+/// the exponentially weighted average (EWA) of the weights in a second network.
 struct CandleTrainer<const G: usize, const P: usize, const N: usize> {
     varmap: VarMap,
     net: AlphaZeroNet<G, P, N>,
     optimizer: AdamW,
+    ewa_varmap: VarMap,
+    ewa_net: Box<AlphaZeroNet<G, P, N>>,
     device: Device,
 }
 
@@ -222,34 +291,82 @@ impl<const G: usize, const P: usize, const N: usize> CandleTrainer<G, P, N> {
     fn new(net_config: &AlphaZeroNetConfig, lr: f64, weight_decay: f64, device: Device) -> Result<Self> {
         let _metal = metal_guard(&device);
         let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let net = AlphaZeroNet::new(vb, net_config)?;
+        let net = AlphaZeroNet::new(VarBuilder::from_varmap(&varmap, DType::F32, &device), net_config)?;
+        let ewa_varmap = VarMap::new();
+        let ewa_net = Box::new(AlphaZeroNet::new(VarBuilder::from_varmap(&ewa_varmap, DType::F32, &device), net_config)?);
         let optimizer = Self::optimizer(&varmap, lr, weight_decay)?;
-        Ok(Self { varmap, net, optimizer, device })
+        let trainer = Self { varmap, net, optimizer, ewa_varmap, ewa_net, device };
+        trainer.reset_ewa()?;
+        Ok(trainer)
     }
 
     fn optimizer(varmap: &VarMap, lr: f64, weight_decay: f64) -> Result<AdamW> {
         AdamW::new(varmap.all_vars(), ParamsAdamW { lr, weight_decay, ..Default::default() })
     }
 
-    /// Forward + backward + AdamW step; returns `(total, policy, value)` losses.
-    fn train_step(&mut self, states: &[f32], policies: &[f32], values: &[f32], b: usize) -> Result<(f32, f32, f32)> {
-        let _metal = metal_guard(&self.device);
-        let states = Tensor::from_slice(states, (b, G), &self.device)?;
-        let target_policies = Tensor::from_slice(policies, (b, P), &self.device)?;
-        let target_values = Tensor::from_slice(values, (b, N), &self.device)?;
-
-        let (pred_logits, pred_values) = self.net.forward(&states)?;
-
+    /// Policy cross-entropy, value MSE and their sum of `net` on a batch.
+    fn losses(net: &AlphaZeroNet<G, P, N>, batch: &[Tensor; 3], b: usize) -> Result<(Tensor, Tensor, Tensor)> {
+        let [states, target_policies, target_values] = batch;
+        let (pred_logits, pred_values) = net.forward(states)?;
         // Policy cross-entropy loss: `- (1 / B) * sum(pi * log_softmax(logits))`
         let log_probs = log_softmax(&pred_logits, 1)?;
-        let policy_loss = (&target_policies * &log_probs)?.sum_all()?.affine(-1.0 / (b as f64), 0.0)?;
+        let policy_loss = (target_policies * &log_probs)?.sum_all()?.affine(-1.0 / (b as f64), 0.0)?;
         // Value MSE loss: `mean((v_pred - v_target)^2)`
-        let value_loss = (&pred_values - &target_values)?.sqr()?.mean_all()?;
-        let total_loss = (&policy_loss + &value_loss)?;
+        let value_loss = (&pred_values - target_values)?.sqr()?.mean_all()?;
+        Ok(((&policy_loss + &value_loss)?, policy_loss, value_loss))
+    }
 
+    fn batch(&self, states: &[f32], policies: &[f32], values: &[f32], b: usize) -> Result<[Tensor; 3]> {
+        Ok([
+            Tensor::from_slice(states, (b, G), &self.device)?,
+            Tensor::from_slice(policies, (b, P), &self.device)?,
+            Tensor::from_slice(values, (b, N), &self.device)?,
+        ])
+    }
+
+    /// Forward + backward + AdamW step, then the EWA update with factor `ewa_decay`; returns
+    /// `(total, policy, value)` losses.
+    fn train_step(&mut self, states: &[f32], policies: &[f32], values: &[f32], b: usize, ewa_decay: f64) -> Result<(f32, f32, f32)> {
+        let _metal = metal_guard(&self.device);
+        let batch = self.batch(states, policies, values, b)?;
+        let (total_loss, policy_loss, value_loss) = Self::losses(&self.net, &batch, b)?;
         self.optimizer.backward_step(&total_loss)?;
+        self.update_ewa(ewa_decay)?;
         Ok((total_loss.to_scalar::<f32>()?, policy_loss.to_scalar::<f32>()?, value_loss.to_scalar::<f32>()?))
+    }
+
+    /// `(total, policy, value)` losses of the current and of the EWA weights, without training.
+    fn eval_losses(&self, states: &[f32], policies: &[f32], values: &[f32], b: usize) -> Result<[(f32, f32, f32); 2]> {
+        let _metal = metal_guard(&self.device);
+        let batch = self.batch(states, policies, values, b)?;
+        let mut out = [(0.0, 0.0, 0.0); 2];
+        for (net, slot) in [&self.net, &*self.ewa_net].into_iter().zip(&mut out) {
+            let (t, p, v) = Self::losses(net, &batch, b)?;
+            *slot = (t.to_scalar()?, p.to_scalar()?, v.to_scalar()?);
+        }
+        Ok(out)
+    }
+
+    /// `ewa = decay * ewa + (1 - decay) * weights`.
+    fn update_ewa(&self, decay: f64) -> Result<()> {
+        let weights = self.varmap.data().lock().expect("varmap mutex poisoned");
+        let ewa = self.ewa_varmap.data().lock().expect("EWA varmap mutex poisoned");
+        for (name, w) in weights.iter() {
+            let e = &ewa[name];
+            e.set(&(e.as_tensor().affine(decay, 0.0)? + w.as_tensor().affine(1.0 - decay, 0.0)?)?)?;
+        }
+        Ok(())
+    }
+
+    /// Restarts the average at the current weights (after loading or resetting them).
+    fn reset_ewa(&self) -> Result<()> {
+        let _metal = metal_guard(&self.device);
+        let weights = self.varmap.data().lock().expect("varmap mutex poisoned");
+        let ewa = self.ewa_varmap.data().lock().expect("EWA varmap mutex poisoned");
+        for (name, w) in weights.iter() {
+            ewa[name].set(w.as_tensor())?;
+        }
+        Ok(())
     }
 }
 
@@ -265,6 +382,8 @@ pub struct AlphaZeroTrainer<const G: usize, const P: usize, const N: usize> {
     imp: TrainerImpl<G, P, N>,
     device: NnDevice,
     net_config: AlphaZeroNetConfig,
+    /// Factor of the EWA weights per step, `1 - 1 / window` (see [`Self::set_ewa_window`]).
+    ewa_decay: f64,
     states_scratch: Vec<f32>,
     policies_scratch: Vec<f32>,
     values_scratch: Vec<f32>,
@@ -285,6 +404,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
             imp,
             device,
             net_config,
+            ewa_decay: ewa_decay(AlphaZeroHyperparams::GENERIC.ewa_window),
             states_scratch: Vec::new(),
             policies_scratch: Vec::new(),
             values_scratch: Vec::new(),
@@ -299,6 +419,11 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
     #[inline]
     pub const fn net_config(&self) -> &AlphaZeroNetConfig {
         &self.net_config
+    }
+
+    /// Sets the window (in SGD steps) of the exponentially weighted average of the weights.
+    pub fn set_ewa_window(&mut self, steps: usize) {
+        self.ewa_decay = ewa_decay(steps);
     }
 
     pub fn set_learning_rate(&mut self, lr: f64) {
@@ -355,19 +480,53 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
         batch_size: usize,
     ) -> Result<TrainMetrics> {
         let (total, policy, value) = match &mut self.imp {
-            TrainerImpl::Candle(t) => t.train_step(states_flat, policies_flat, values_flat, batch_size)?,
+            TrainerImpl::Candle(t) => t.train_step(states_flat, policies_flat, values_flat, batch_size, self.ewa_decay)?,
             #[cfg(feature = "tch")]
-            TrainerImpl::Tch(t) => t.train_step(states_flat, policies_flat, values_flat, batch_size)?,
+            TrainerImpl::Tch(t) => t.train_step(states_flat, policies_flat, values_flat, batch_size, self.ewa_decay)?,
         };
-        let entropy: f32 = policies_flat.iter().filter(|&&q| q > 1e-8).map(|&q| -q * q.ln()).sum::<f32>()
-            / batch_size as f32;
-        Ok(TrainMetrics {
-            total_loss: total,
-            policy_loss: policy,
-            // `KL(pi || p) = CE - H(pi)`, floored at 0 against rounding.
-            policy_kl: (policy - entropy).max(0.0),
-            value_loss: value,
-        })
+        Ok(TrainMetrics::new(total, policy, value, policies_flat, batch_size))
+    }
+
+    /// Losses on `buffer`'s held-out positions of the current weights and of their
+    /// exponentially weighted average (EWA); `None` without held-out positions. The current
+    /// weights jitter around a minimum with the learning rate's step noise, the average sits
+    /// closer to it: `current - EWA` estimates what a lower learning rate would gain right away.
+    pub fn held_out_losses(&mut self, buffer: &ReplayBuffer<G, P, N>) -> Result<Option<HeldOutLosses>> {
+        const BATCH: usize = 1024;
+        let held_out = buffer.held_out();
+        if held_out.is_empty() {
+            return Ok(None);
+        }
+        let (mut st, mut pol, mut val) = (Vec::new(), Vec::new(), Vec::new());
+        let mut sums = [[0.0f64; 3]; 2];
+        let positions: Vec<_> = held_out.iter().collect();
+        for chunk in positions.chunks(BATCH) {
+            st.clear();
+            pol.clear();
+            val.clear();
+            for pos in chunk {
+                st.extend_from_slice(&pos.state);
+                pol.extend_from_slice(&pos.policy);
+                val.extend_from_slice(&pos.value);
+            }
+            let losses = match &self.imp {
+                TrainerImpl::Candle(t) => t.eval_losses(&st, &pol, &val, chunk.len())?,
+                #[cfg(feature = "tch")]
+                TrainerImpl::Tch(t) => t.eval_losses(&st, &pol, &val, chunk.len())?,
+            };
+            for (sum, (t, p, v)) in sums.iter_mut().zip(losses) {
+                for (s, x) in sum.iter_mut().zip([t, p, v]) {
+                    *s += f64::from(x) * chunk.len() as f64;
+                }
+            }
+        }
+        let n = positions.len();
+        let policies: Vec<f32> = held_out.iter().flat_map(|p| p.policy).collect();
+        let metrics = |[t, p, v]: [f64; 3]| {
+            let mean = |x: f64| (x / n as f64) as f32;
+            TrainMetrics::new(mean(t), mean(p), mean(v), &policies, n)
+        };
+        Ok(Some(HeldOutLosses { positions: n, current: metrics(sums[0]), ewa: metrics(sums[1]) }))
     }
 
     /// Runs `steps` mini-batch gradient updates sampled uniformly from `buffer`, pausing
@@ -434,12 +593,16 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
         crate::checkpoints::write_net_config(path, &self.net_config).map_err(candle_core::Error::wrap)
     }
 
-    /// Loads model weights from a `.safetensors` checkpoint at `path` (written by either backend).
+    /// Loads model weights from a `.safetensors` checkpoint at `path` (written by either backend);
+    /// the weight average restarts at them.
     pub fn load_checkpoint<Pth: AsRef<Path>>(&mut self, path: Pth) -> Result<()> {
         match &mut self.imp {
             TrainerImpl::Candle(t) => {
-                let _metal = metal_guard(&t.device);
-                t.varmap.load(path)
+                {
+                    let _metal = metal_guard(&t.device);
+                    t.varmap.load(path)?;
+                }
+                t.reset_ewa()
             }
             #[cfg(feature = "tch")]
             TrainerImpl::Tch(t) => t.load(path.as_ref()),
@@ -459,8 +622,11 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroTrainer<G, P, N> {
             service.evaluator().reset_random_weights(&self.net_config)?;
             match &mut self.imp {
                 TrainerImpl::Candle(t) => {
-                    let _metal = metal_guard(&t.device);
-                    t.optimizer = CandleTrainer::<G, P, N>::optimizer(&t.varmap, lr, weight_decay)?;
+                    {
+                        let _metal = metal_guard(&t.device);
+                        t.optimizer = CandleTrainer::<G, P, N>::optimizer(&t.varmap, lr, weight_decay)?;
+                    }
+                    t.reset_ewa()?;
                 }
                 #[cfg(feature = "tch")]
                 TrainerImpl::Tch(t) => t.reset_optimizer(lr, weight_decay)?,
@@ -728,6 +894,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn held_out_games_and_weight_average() {
+        for dev in cpu_devices() {
+            held_out_and_ewa_on(dev);
+        }
+    }
+
+    fn held_out_and_ewa_on(dev: NnDevice) {
+        let mut trainer = AlphaZeroTrainer::<27, 9, 2>::new(crate::games::tic_tac_toe::net_mlp(), 3e-3, 1e-4, dev)
+            .expect("failed to initialize trainer");
+        let service = trainer.build_inference_service(32, &[dev]).expect("failed to start InferenceService");
+        let root_game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+        let sp_res = run_self_play(&root_game, &service, &SelfPlayConfig::new(120, 8, 7).with_workers(2));
+
+        // Games 49 and 99 (every 50th) are held out whole; the rest goes to training.
+        let mut buffer = ReplayBuffer::<27, 9, 2>::new(4096);
+        buffer.add_games(&sp_res);
+        let game_len = |g: usize| sp_res.episodes[g].iter().map(|e| e.moves).sum::<usize>();
+        assert_eq!(buffer.held_out().len(), game_len(49) + game_len(99));
+        assert_eq!(buffer.len() + buffer.held_out().len(), sp_res.positions.len());
+
+        let losses = |t: &mut AlphaZeroTrainer<27, 9, 2>| {
+            let h = t.held_out_losses(&buffer).expect("held-out losses").expect("held-out positions");
+            (h.current.total_loss, h.ewa.total_loss)
+        };
+        // The average starts at the current weights ...
+        let (cur, ewa) = losses(&mut trainer);
+        assert!((cur - ewa).abs() < 1e-5, "{cur} vs {ewa}");
+        // ... lags behind them over a long window ...
+        let mut rng = SmallRng::seed_from_u64(3);
+        trainer.set_ewa_window(10_000);
+        trainer.train_epoch(&buffer, &service, 32, 20, &mut rng).expect("training failed");
+        let (cur, ewa) = losses(&mut trainer);
+        assert!((cur - ewa).abs() > 1e-4, "the average should still be near the initial weights: {cur} vs {ewa}");
+        // ... and follows them exactly with a window of one step.
+        trainer.set_ewa_window(1);
+        trainer.train_epoch(&buffer, &service, 32, 1, &mut rng).expect("training failed");
+        let (cur, ewa) = losses(&mut trainer);
+        assert!((cur - ewa).abs() < 1e-5, "{cur} vs {ewa}");
     }
 
     fn training_loop_on(dev: NnDevice) {

@@ -40,6 +40,7 @@ use crate::play_cube::{self, CubePlayRequest};
 use crate::elo::EloPool;
 use crate::experiments::{ExperimentPoint, ExperimentSpec, ExperimentStore, RunStatus, json_value};
 use crate::hyperparams::AlphaZeroHyperparams;
+use crate::training::HeldOutLosses;
 use crate::checkpoints;
 use crate::opponents::{self, OpponentSpec};
 use crate::play::{self, PlayRequest, PlayableGame};
@@ -174,7 +175,8 @@ pub fn default_eval_opponents(game: LabGame) -> Vec<OpponentSpec> {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct RoundsTelemetry {
     pub self_play: RoundStats,
-    pub eval: RoundStats,
+    /// Noise-free round games; `None` in iterations without evaluation (`eval_every`).
+    pub eval: Option<RoundStats>,
 }
 
 /// Per-iteration training, search, arena, and system pipeline telemetry record.
@@ -185,6 +187,8 @@ pub struct IterationTelemetry {
     pub policy_loss: f32,
     pub policy_kl: f32,
     pub value_loss: f32,
+    /// Losses of the current and the weight-averaged network on held-out games.
+    pub held_out: Option<HeldOutLosses>,
     pub root_entropy_mean: f32,
     pub game_moves_mean: f32,
     pub self_play_wins: [usize; 2],
@@ -223,6 +227,7 @@ impl IterationTelemetry {
                 "\"policy_loss\":{:.6},",
                 "\"policy_kl\":{:.6},",
                 "\"value_loss\":{:.6},",
+                "\"held_out\":{},",
                 "\"root_entropy_mean\":{:.6},",
                 "\"game_moves_mean\":{:.4},",
                 "\"self_play_wins\":[{},{}],",
@@ -250,6 +255,17 @@ impl IterationTelemetry {
             finite_or_zero(self.policy_loss),
             finite_or_zero(self.policy_kl),
             finite_or_zero(self.value_loss),
+            self.held_out.map_or_else(
+                || "null".to_string(),
+                |h| format!(
+                    "{{\"positions\":{},\"kl\":{:.6},\"value\":{:.6},\"ewa_kl\":{:.6},\"ewa_value\":{:.6}}}",
+                    h.positions,
+                    finite_or_zero(h.current.policy_kl),
+                    finite_or_zero(h.current.value_loss),
+                    finite_or_zero(h.ewa.policy_kl),
+                    finite_or_zero(h.ewa.value_loss)
+                )
+            ),
             finite_or_zero(self.root_entropy_mean),
             finite_or_zero(self.game_moves_mean),
             self.self_play_wins[0],
@@ -291,6 +307,8 @@ pub struct LiveKnobs {
     pub paused: bool,
     /// All tunable hyperparameters (read and written through `Deref`, e.g. `knobs.batch_size`).
     pub hp: AlphaZeroHyperparams,
+    /// Arena evaluation after every `eval_every`-th iteration (experiments have their own setting).
+    pub eval_every: usize,
 }
 
 impl std::ops::Deref for LiveKnobs {
@@ -315,7 +333,7 @@ impl Default for LiveKnobs {
 impl LiveKnobs {
     /// Paused knobs starting from a game's recommended hyperparameters.
     pub const fn new(hp: AlphaZeroHyperparams) -> Self {
-        Self { paused: true, hp }
+        Self { paused: true, hp, eval_every: 1 }
     }
 
     pub fn for_game<R: AlphaZeroGame<G, P, N>, const G: usize, const P: usize, const N: usize>() -> Self {
@@ -355,9 +373,11 @@ impl LiveKnobs {
                 "\"learning_rate\":{:.6},",
                 "\"weight_decay\":{:.6},",
                 "\"buffer_capacity\":{},",
+                "\"ewa_window\":{},",
                 "\"eval_games\":{},",
                 "\"eval_sims\":{},",
-                "\"eval_threads\":{}",
+                "\"eval_threads\":{},",
+                "\"eval_every\":{}",
                 "}}"
             ),
             self.paused,
@@ -377,9 +397,11 @@ impl LiveKnobs {
             self.learning_rate,
             self.weight_decay,
             self.buffer_capacity,
+            self.ewa_window,
             self.eval_games,
             self.eval_sims,
             self.eval_threads,
+            self.eval_every,
         )
     }
 }
@@ -410,7 +432,8 @@ pub struct SystemSettings {
     pub device: DeviceChoice,
     /// Maximum positions per batched NN inference call.
     pub infer_batch: usize,
-    /// Inference worker threads, one model replica each (CUDA: one per GPU; Metal: always 1).
+    /// Inference worker threads, one model replica each (CUDA: spread over the GPUs, several per
+    /// GPU allowed; Metal: always 1).
     pub infer_workers: usize,
 }
 
@@ -767,21 +790,9 @@ impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
 }
 
 impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
-    /// Loads checkpoint `file` into the live network, if it has the live network's architecture.
-    fn load_into_live<R: AlphaZeroGame<G, P, N>>(&self, file: &str) -> Result<(), String> {
-        let path = checkpoints::path(file);
-        let config = checkpoints::net_config::<R, G, P, N>(&path)?;
-        if config != self.net_config {
-            return Err(format!(
-                "{file} holds a {} network, but the live network is a {} network",
-                checkpoints::preset_name::<R, G, P, N>(&config),
-                checkpoints::preset_name::<R, G, P, N>(&self.net_config)
-            ));
-        }
-        self.live_service.pause_inference();
-        let loaded = self.live_service.evaluator().load_safetensors(&path);
-        self.live_service.resume_inference();
-        loaded.map_err(|e| e.to_string())
+    /// Preset name of the live network's architecture (`custom` if it matches none).
+    fn live_net_name<R: AlphaZeroGame<G, P, N>>(&self) -> &'static str {
+        checkpoints::preset_name::<R, G, P, N>(&self.net_config)
     }
 
     /// Network for an arena engine: the live model, untrained weights of the live architecture,
@@ -884,6 +895,9 @@ struct HubInner {
     system: SystemSettings,
     /// `system` was changed from the Browser Lab and not yet applied by the training loop.
     system_pending: bool,
+    /// Checkpoint to load into a game's live network, applied by the training loop before its next
+    /// iteration. The live network takes the architecture recorded in the checkpoint.
+    live_load: Option<(LabGame, String)>,
     active_game: LabGame,
     ttt_state: GameLabState,
     uttt_state: GameLabState,
@@ -919,11 +933,12 @@ impl HubInner {
         self.state_for(self.active_game)
     }
 
-    fn has_live_model(&self, game: LabGame) -> bool {
+    /// Preset name of a game's live network; `None` before a live model is attached.
+    fn live_net_name(&self, game: LabGame) -> Option<&'static str> {
         match game {
-            LabGame::Ttt => self.ttt_context.is_some(),
-            LabGame::Uttt => self.uttt_context.is_some(),
-            LabGame::Rubiks => self.rubiks_context.is_some(),
+            LabGame::Ttt => self.ttt_context.as_ref().map(|c| c.live_net_name::<TicTacToe>()),
+            LabGame::Uttt => self.uttt_context.as_ref().map(|c| c.live_net_name::<UltimateTicTacToe>()),
+            LabGame::Rubiks => self.rubiks_context.as_ref().map(|c| c.live_net_name::<RubiksCube>()),
         }
     }
 }
@@ -951,6 +966,7 @@ impl TelemetryHub {
                     infer_workers: 1,
                 },
                 system_pending: false,
+                live_load: None,
                 active_game: LabGame::Uttt,
                 // Auto-save is off by default (0); enable it in the Browser Lab when needed.
                 ttt_state: GameLabState::new(LabGame::Ttt, total_iterations, knobs, 0),
@@ -988,6 +1004,11 @@ impl TelemetryHub {
         } else {
             None
         }
+    }
+
+    /// Returns the checkpoint requested for a live network (**Load → Live**) once.
+    pub fn take_live_load(&self) -> Option<(LabGame, String)> {
+        self.inner.lock().expect("telemetry mutex poisoned").live_load.take()
     }
 
     #[inline]
@@ -1079,6 +1100,11 @@ impl TelemetryHub {
         let st = guard.state_for_mut(game);
         st.current_iteration = iteration;
         st.phase = phase.into();
+    }
+
+    /// Sets a game's phase line without changing its iteration.
+    pub fn set_status_for(&self, game: LabGame, phase: impl Into<String>) {
+        self.inner.lock().expect("telemetry mutex poisoned").state_for_mut(game).phase = phase.into();
     }
 
     pub fn record_iteration(&self, record: IterationTelemetry) {
@@ -1269,7 +1295,7 @@ impl TelemetryHub {
         let guard = self.inner.lock().expect("telemetry mutex poisoned");
         let game = guard.active_game;
         let iter = guard.state_for(game).current_iteration;
-        discover_game_models(game, guard.has_live_model(game), iter)
+        discover_game_models(game, guard.live_net_name(game).is_some(), iter)
     }
 
     /// Runs a fast empirical timing calibration for `game` (`Tic-Tac-Toe` or `Ultimate Tic-Tac-Toe`),
@@ -1465,7 +1491,8 @@ impl TelemetryHub {
         let guard = self.inner.lock().expect("telemetry mutex poisoned");
         let game = guard.active_game;
         let st = guard.state_for(game);
-        let models = discover_game_models(game, guard.has_live_model(game), st.current_iteration);
+        let live_net = guard.live_net_name(game);
+        let models = discover_game_models(game, live_net.is_some(), st.current_iteration);
         let models_json = models
             .iter()
             .map(ModelInfo::to_json)
@@ -1491,6 +1518,7 @@ impl TelemetryHub {
             concat!(
                 "{{",
                 "\"device_name\":\"{}\",",
+                "\"live_net\":\"{}\",",
                 "\"system\":{},",
                 "\"active_game\":\"{}\",",
                 "\"active_game_title\":\"{}\",",
@@ -1510,6 +1538,7 @@ impl TelemetryHub {
                 "}}"
             ),
             escape_json(&guard.device_name),
+            live_net.unwrap_or_default(),
             guard.system.to_json(guard.system_pending),
             game.as_str(),
             escape_json(game.title()),
@@ -2613,51 +2642,30 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
                         "{\"error\":\"Invalid model name\"}",
                     );
                 };
-                let load_res = match game {
-                    LabGame::Ttt => {
-                        let Some(ctx) = ttt_ctx else {
-                            return write_http_response(
-                                &mut stream,
-                                "400 Bad Request",
-                                "application/json",
-                                "{\"error\":\"No live TTT model attached\"}",
-                            );
-                        };
-                        ctx.load_into_live::<TicTacToe>(&filename)
-                    }
+                // The training loop loads it before its next iteration (right away while paused),
+                // in the architecture recorded in the file.
+                let path = checkpoints::path(&filename);
+                let net = match game {
+                    LabGame::Ttt => checkpoints::net_config::<TicTacToe, 27, 9, 2>(&path)
+                        .map(|c| checkpoints::preset_name::<TicTacToe, 27, 9, 2>(&c)),
                     LabGame::Uttt => {
-                        let Some(ctx) = uttt_ctx else {
-                            return write_http_response(
-                                &mut stream,
-                                "400 Bad Request",
-                                "application/json",
-                                "{\"error\":\"No live UTTT model attached\"}",
-                            );
-                        };
-                        ctx.load_into_live::<UltimateTicTacToe>(&filename)
+                        checkpoints::net_config::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81, 2>(&path)
+                            .map(|c| checkpoints::preset_name::<UltimateTicTacToe, { ultimate_ttt::INPUT_SIZE }, 81, 2>(&c))
                     }
                     LabGame::Rubiks => {
-                        let Some(ctx) = rubiks_ctx else {
-                            return write_http_response(
-                                &mut stream,
-                                "400 Bad Request",
-                                "application/json",
-                                "{\"error\":\"No live cube model attached\"}",
-                            );
-                        };
-                        ctx.load_into_live::<RubiksCube>(&filename)
+                        checkpoints::net_config::<RubiksCube, { rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>(&path)
+                            .map(|c| checkpoints::preset_name::<RubiksCube, { rubiks_cube::INPUT_SIZE }, { rubiks_cube::POLICY_SIZE }, 1>(&c))
                     }
                 };
-                if let Err(e) = load_res {
-                    let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e));
-                    return write_http_response(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "application/json",
-                        &msg,
-                    );
-                }
-                hub.set_phase_for(game, cur_iter, format!("Loaded {filename} into Live"));
+                let net = match net {
+                    Ok(net) => net,
+                    Err(e) => {
+                        let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e));
+                        return write_http_response(&mut stream, "400 Bad Request", "application/json", &msg);
+                    }
+                };
+                hub.inner.lock().expect("telemetry mutex poisoned").live_load = Some((game, filename.clone()));
+                hub.set_phase_for(game, cur_iter, format!("Loading {filename} ({net} network) into Live"));
             }
             "delete" => {
                 if let Some(filename) = checkpoints::sanitize_name(&raw_target_name) {
@@ -2889,6 +2897,9 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
     if let Some(v) = num("buffer_capacity") {
         knobs.buffer_capacity = (v as usize).clamp(1_024, 5_000_000);
     }
+    if let Some(v) = num("ewa_window") {
+        knobs.ewa_window = (v as usize).clamp(1, 1_000_000);
+    }
     if let Some(v) = num("eval_games") {
         knobs.eval_games = (v as usize).clamp(2, 2_000);
     }
@@ -2897,6 +2908,9 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
     }
     if let Some(v) = num("eval_threads") {
         knobs.eval_threads = (v as usize).min(256);
+    }
+    if let Some(v) = num("eval_every") {
+        knobs.eval_every = (v as usize).clamp(1, 1_000);
     }
 }
 
@@ -3298,6 +3312,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
   <div class="badges">
     <span class="badge" id="device-badge">Device: ...</span>
+    <span class="badge" id="net-badge">Network: ...</span>
     <span class="badge paused" id="phase-badge">Phase: Idle</span>
     <span class="badge" id="iter-badge">Iter: 0 / 0</span>
   </div>
@@ -3443,9 +3458,17 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <label>Replay Buffer (positions)</label>
         <input type="number" id="k-buffer" min="1024" max="5000000" step="1024">
       </div>
+      <div class="knob-item" title="SGD steps the exponentially weighted average of the weights spans; its held-out loss is charted against the current weights'.">
+        <label>EWA Window (SGD steps)</label>
+        <input type="number" id="k-ewa" min="1" max="1000000" step="100">
+      </div>
     </div>
     <h3 class="knob-section">Arena Evaluation</h3>
     <div class="knobs-grid">
+      <div class="knob-item" title="Play the arena after every N-th iteration only: with strong AlphaZero opponents it can take longer than self-play and training together.">
+        <label>Evaluate Every N Iters</label>
+        <input type="number" id="k-eval-every" min="1" max="1000" step="1">
+      </div>
       <div class="knob-item" title="Arena games vs each baseline per iteration. Openings are played twice with colors swapped.">
         <label>Eval Games / Opponent</label>
         <input type="number" id="k-eval-games" min="2" max="2000" step="2">
@@ -3526,7 +3549,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <label>Inference Batch Size</label>
         <input type="number" id="sys-infer-batch" min="1" max="4096" step="8">
       </div>
-      <div class="knob-item" title="Inference worker threads, one model replica each. CUDA: up to one per GPU. Metal: always 1. CPU: any.">
+      <div class="knob-item" title="Inference worker threads, one model replica each. CUDA: spread over the GPUs, several per GPU overlap the host-side work of their batches. Metal: always 1. CPU: any.">
         <label>Inference Workers</label>
         <input type="number" id="sys-infer-workers" min="1" max="64" step="1">
       </div>
@@ -3922,9 +3945,11 @@ const KNOB_FIELDS = [
   ['learning_rate', 'k-lr', 'float'],
   ['weight_decay', 'k-wd', 'float'],
   ['buffer_capacity', 'k-buffer', 'int'],
+  ['ewa_window', 'k-ewa', 'int'],
   ['eval_games', 'k-eval-games', 'int'],
   ['eval_sims', 'k-eval-sims', 'int'],
   ['eval_threads', 'k-eval-threads', 'int'],
+  ['eval_every', 'k-eval-every', 'int'],
 ];
 
 function collectKnobs() {
@@ -4088,6 +4113,7 @@ function renderDashboard(d) {
 
 
   document.getElementById('device-badge').textContent = 'Device: ' + d.device_name;
+  document.getElementById('net-badge').textContent = 'Network: ' + (d.live_net || '–');
   const phaseEl = document.getElementById('phase-badge');
   phaseEl.textContent = (d.knobs.paused ? '⏸ ' : '🟢 ') + d.phase;
   phaseEl.className = 'badge ' + (d.knobs.paused ? 'paused' : 'live');
@@ -4159,7 +4185,8 @@ function renderDashboard(d) {
 // ---- Rubik's cube: round-game score and solve rate per round ----
 function renderRoundCharts(h) {
   const rows = h.filter(x => x.rounds);
-  const last = rows[rows.length - 1];
+  const evaluated = rows.filter(x => x.rounds.eval);
+  const last = evaluated[evaluated.length - 1];
   document.getElementById('latest-round-score').textContent = last
     ? `${last.rounds.eval.score.toFixed(2)} ± ${last.rounds.eval.score_stderr.toFixed(2)}` : '—';
   document.getElementById('latest-best-round').textContent = last ? `best round ${last.rounds.eval.best_round}` : '—';
@@ -4169,14 +4196,19 @@ function renderRoundCharts(h) {
     document.getElementById('round-table').innerHTML = '';
     return;
   }
-  const evals = rows.map(x => x.rounds.eval);
+  // Iterations without evaluation have no evaluation point; its lines connect across them.
+  const evalLine = f => rows.map(x => (x.rounds.eval ? f(x.rounds.eval) : null));
   drawChart('chart-round-score', rows.map(x => x.iteration), [
-    { data: evals.map(e => e.score + e.score_stderr), color: '#1f6f55', width: 1 },
-    { data: evals.map(e => e.score - e.score_stderr), color: '#1f6f55', width: 1 },
+    { data: evalLine(e => e.score + e.score_stderr), color: '#1f6f55', width: 1, connect: true },
+    { data: evalLine(e => e.score - e.score_stderr), color: '#1f6f55', width: 1, connect: true },
     { data: rows.map(x => x.rounds.self_play.score), color: '#38bdf8' },
-    { data: evals.map(e => e.score), color: '#34d399' },
+    { data: evalLine(e => e.score), color: '#34d399', connect: true },
   ], 0);
-  drawRoundHeat('chart-round-heat', evals);
+  drawRoundHeat('chart-round-heat', evaluated.map(x => x.rounds.eval));
+  if (!last) {
+    document.getElementById('round-table').innerHTML = '';
+    return;
+  }
   const e = last.rounds.eval;
   document.getElementById('round-table').innerHTML = e.reached.map((reached, i) => {
     const solved = e.solved[i];
@@ -4246,7 +4278,11 @@ async function calibrateElo() {
   renderDashboard(stateData);
 }
 
+// Arena and Elo charts show the evaluated iterations only (see the Evaluate Every knob).
+const evaluated = h => h.filter(x => x.arena.length);
+
 function renderEloChart(h, elo) {
+  h = evaluated(h);
   const ratings = h.map(x => x.elo);
   const last = [...ratings].reverse().find(r => r);
   document.getElementById('latest-elo').textContent = last
@@ -4265,6 +4301,7 @@ const WDL_SERIES = [['wins', '#34d399'], ['draws', '#94a3b8'], ['losses', '#fb71
 
 // One card per opponent seen in the history (opponents can change between iterations).
 function renderArenaCards(h) {
+  h = evaluated(h);
   const grid = document.getElementById('arena-cards');
   const labels = [...new Set(h.flatMap(x => x.arena.map(a => a.label)))];
   const sig = labels.join('|');
@@ -4287,6 +4324,10 @@ function renderArenaCards(h) {
   });
 }
 
+// Held-out loss (policy KL + value MSE) of the current and the averaged weights; NaN before the first held-out games.
+const heldOut = x => x.held_out ? x.held_out.kl + x.held_out.value : NaN;
+const heldOutEwa = x => x.held_out ? x.held_out.ewa_kl + x.held_out.ewa_value : NaN;
+
 // Training-tab charts, one per metric so each has its own y-axis scale.
 // series: [label, color, value of an iteration record]; latest: text for the newest record.
 const METRIC_CARDS = [
@@ -4296,6 +4337,12 @@ const METRIC_CARDS = [
   { id: 'value', title: 'Value loss (MSE)', latest: x => x.value_loss.toFixed(3),
     hint: 'Squared error of the network\'s outcome prediction against the value targets (game result, blended with the search value by qw). It falls as the network learns who is winning, but never reaches 0: early positions are genuinely uncertain.',
     series: [['MSE', '#fb7185', x => x.value_loss]] },
+  { id: 'heldout', title: 'Held-out loss: current vs. averaged weights', latest: x => x.held_out ? `${heldOut(x).toFixed(3)} / ${heldOutEwa(x).toFixed(3)}` : '—',
+    hint: 'Policy KL + value MSE on held-out games (every 50th self-play game, never trained on; the newest ~8k positions), for the current weights and for their exponentially weighted average (EWA window knob). Unlike the training losses, this measures how well the network generalizes.',
+    series: [['current', '#38bdf8', heldOut], ['EWA', '#34d399', heldOutEwa]] },
+  { id: 'ewagain', title: 'Gain of the averaged weights (held-out loss)', latest: x => x.held_out ? (heldOut(x) - heldOutEwa(x)).toFixed(4) : '—',
+    hint: 'Held-out loss of the current weights minus that of the averaged weights. The weights jitter around a minimum with the noise of each SGD step, the average sits closer to it; a gain that stays clearly above 0 means a lower learning rate would improve the network right away. Near 0: the learning rate is not what holds training back.',
+    series: [['current − EWA', '#fbbf24', x => heldOut(x) - heldOutEwa(x)]] },
   { id: 'entropy', title: 'Search decisiveness (root entropy)', latest: x => x.root_entropy_mean.toFixed(2),
     hint: 'Entropy of the visit distribution at the root, averaged over self-play moves. High = search spreads its visits over many moves, low = it settles on few. Falls as the network gets confident; the root noise keeps it from reaching 0.',
     series: [['H(π)', '#a78bfa', x => x.root_entropy_mean]] },
@@ -4737,7 +4784,7 @@ async function loadModelToLive(name) {
   const data = await res.json();
   modelsSignature = '';
   if (data.error) {
-    alert(`Could not load ${name} into the live model:\n${data.error}\n\nThe checkpoint must have the live network's architecture.`);
+    alert(`Could not load ${name} into the live model:\n${data.error}`);
     await fetchState();
     return;
   }
@@ -4796,7 +4843,8 @@ function drawChart(canvasId, xs, series, fixedMin, fixedMax) {
     ctx.beginPath();
     let penDown = false;
     s.data.forEach((v, idx) => {
-      if (!Number.isFinite(v)) { penDown = false; return; }
+      // A missing point lifts the pen, unless the series connects across gaps.
+      if (!Number.isFinite(v)) { penDown = penDown && Boolean(s.connect); return; }
       const x = padL + (xs.length === 1 ? plotW / 2 : (plotW * idx) / (xs.length - 1));
       const y = padT + plotH * (1 - (v - minY) / (maxY - minY));
       if (!penDown) ctx.moveTo(x, y);

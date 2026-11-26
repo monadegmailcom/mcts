@@ -117,8 +117,9 @@ impl NnDevice {
         if backend.gpu_count() > 0 { Self::gpu(backend, 0) } else { Self::cpu(backend) }
     }
 
-    /// Training device plus `workers` inference replica devices: GPUs round-robin for CUDA,
-    /// a single replica on Apple GPUs, `workers` CPU replicas on CPU.
+    /// Devices of `workers` inference replicas: the CUDA GPUs round-robin (several replicas
+    /// per GPU overlap the host-side work of their batches), a single replica on Apple GPUs,
+    /// `workers` CPU replicas on CPU.
     pub fn replicas(self, workers: usize) -> Vec<Self> {
         let workers = workers.max(1);
         match self.gpu {
@@ -126,7 +127,7 @@ impl NnDevice {
             Some(_) if !self.backend.parallel_gpus() => vec![self],
             Some(_) => {
                 let n = self.backend.gpu_count().max(1);
-                (0..workers.min(n)).map(|i| Self::gpu(self.backend, i)).collect()
+                (0..workers).map(|i| Self::gpu(self.backend, i % n)).collect()
             }
         }
     }
