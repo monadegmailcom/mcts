@@ -193,6 +193,15 @@ pub enum AlphaZeroNetConfig {
         hidden_dim: usize,
         num_res_blocks: usize,
         head_hidden: usize,
+        /// Project the global state into one policy context per block instead of one shared by
+        /// all blocks. With a shared context the policy head sees only a block's contents, not
+        /// where the block sits, so two blocks with equal contents get equal logits even when one
+        /// of them decides the board (e.g. a free move in Ultimate Tic-Tac-Toe). Per block, the
+        /// projection's bias acts as a learned position embedding. Costs
+        /// `(blocks - 1) * local_dim * (hidden_dim + 1)` parameters (+132k for UTTT's 10 x 256 net)
+        /// and negligible compute. Files written before the field existed read as `false`.
+        #[serde(default)]
+        per_block_context: bool,
     },
 }
 
@@ -344,6 +353,8 @@ struct ResMlpTrunk {
 struct BlockTrunk {
     layout: BlockLayout,
     local_dim: usize,
+    /// Policy contexts: 1 (shared by all blocks) or one per block.
+    ctx_blocks: usize,
     local_fc1: Linear,
     local_norm1: LayerNorm,
     local_fc2: Linear,
@@ -468,6 +479,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroNet<G, P, N> {
                 hidden_dim,
                 num_res_blocks,
                 head_hidden,
+                per_block_context,
             } => {
                 let layout = BlockLayout {
                     planes: in_planes,
@@ -483,6 +495,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroNet<G, P, N> {
                 assert_eq!(in_planes * board_height * board_width, G, "BlockNet requires G == in_planes * H * W");
                 assert_eq!(board_height * board_width, P, "BlockNet requires P == H * W");
                 let (num_tokens, cells) = (layout.num_blocks(), layout.cells());
+                let ctx_blocks = if per_block_context { num_tokens } else { 1 };
                 let mut blocks = Vec::with_capacity(num_res_blocks);
                 for idx in 0..num_res_blocks {
                     blocks.push(MlpResidualBlock::new(hidden_dim, vb.pp(format!("res_{idx}")))?);
@@ -491,6 +504,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroNet<G, P, N> {
                     trunk: Trunk::Block(Box::new(BlockTrunk {
                         layout,
                         local_dim,
+                        ctx_blocks,
                         local_fc1: linear(in_planes * cells, local_dim, vb.pp("local_fc1"))?,
                         local_norm1: layer_norm(local_dim, 1e-5, vb.pp("local_norm1"))?,
                         local_fc2: linear(local_dim, local_dim, vb.pp("local_fc2"))?,
@@ -498,7 +512,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroNet<G, P, N> {
                         global_fc: linear(num_tokens * local_dim, hidden_dim, vb.pp("global_fc"))?,
                         global_norm: layer_norm(hidden_dim, 1e-5, vb.pp("global_norm"))?,
                         blocks,
-                        policy_ctx: linear(hidden_dim, local_dim, vb.pp("policy_ctx"))?,
+                        policy_ctx: linear(hidden_dim, ctx_blocks * local_dim, vb.pp("policy_ctx"))?,
                         policy_fc1: linear(local_dim, head_hidden, vb.pp("policy_fc1"))?,
                         policy_fc2: linear_zero(head_hidden, cells, vb.pp("policy_fc2"))?,
                         value_fc1: linear(hidden_dim, head_hidden, vb.pp("value_fc1"))?,
@@ -588,7 +602,7 @@ impl<const G: usize, const P: usize, const N: usize> AlphaZeroNet<G, P, N> {
                     g = block.forward(&g)?;
                 }
 
-                let ctx = net.policy_ctx.forward(&g)?.unsqueeze(1)?;
+                let ctx = net.policy_ctx.forward(&g)?.reshape((b_sz, net.ctx_blocks, net.local_dim))?;
                 let p = t.broadcast_add(&ctx)?.relu()?;
                 let p = net.policy_fc1.forward(&p)?.relu()?;
                 let policy_logits = net.layout.logits_to_grid(&net.policy_fc2.forward(&p)?)?;

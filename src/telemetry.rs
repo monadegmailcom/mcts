@@ -12,7 +12,8 @@
 //!   `reset`, `set_game`, `set_targets`).
 //! - `POST /api/knobs`: Updates live training hyperparameter knobs for the active game.
 //! - `POST /api/models`: Saves the live NN to `checkpoints/<game>_<name>.safetensors`, takes a 1-click
-//!   iteration snapshot, loads a `.safetensors` checkpoint into the live model, or deletes a checkpoint.
+//!   iteration snapshot, loads a `.safetensors` checkpoint into the live model, deletes a checkpoint,
+//!   or converts a block network to one policy context per block (`widen_policy_context`).
 //! - `POST /api/calibrate`: Benchmarks actual per-move thinking times (`µs/sim`, `µs/eval`, and
 //!   per-depth Minimax `µs/move`) on the current hardware for fair equal-compute matches.
 //! - `POST /api/match`: Runs a parallel role-swapped multi-match (`ttt` or `uttt`) between any two
@@ -2597,6 +2598,41 @@ fn handle_http_connection(mut stream: TcpStream, hub: &TelemetryHub) -> std::io:
             "delete" => {
                 if let Some(filename) = checkpoints::sanitize_name(&raw_target_name) {
                     let _ = std::fs::remove_file(checkpoints::path(&filename));
+                }
+            }
+            "widen_policy_context" => {
+                // `name` -> `target` (default `<name>_ctx`): the same network with one policy
+                // context per block, computing the same outputs (see `checkpoints::widen_policy_context`).
+                let target = extract_json_str(body, "target").unwrap_or_else(|| {
+                    format!("{}_ctx", raw_target_name.trim().trim_end_matches(checkpoints::EXTENSION))
+                });
+                let (Some(src), Some(dst)) =
+                    (checkpoints::sanitize_name(&raw_target_name), checkpoints::sanitize_name(&target))
+                else {
+                    return write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        "{\"error\":\"Invalid model name\"}",
+                    );
+                };
+                let (src, dst) = (checkpoints::path(&src), checkpoints::path(&dst));
+                let res = if dst.exists() {
+                    Err(format!("{} already exists", dst.display()))
+                } else {
+                    match game {
+                        LabGame::Ttt => checkpoints::widen_policy_context::<TicTacToe, 27, 9, 2>(&src, &dst),
+                        LabGame::Uttt => checkpoints::widen_policy_context::<
+                            UltimateTicTacToe,
+                            { ultimate_ttt::INPUT_SIZE },
+                            81,
+                            2,
+                        >(&src, &dst),
+                    }
+                };
+                if let Err(e) = res {
+                    let msg = format!("{{\"error\":\"{}\"}}", escape_json(&e));
+                    return write_http_response(&mut stream, "400 Bad Request", "application/json", &msg);
                 }
             }
             _ => {}

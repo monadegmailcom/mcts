@@ -520,6 +520,7 @@ pub const fn net_block() -> AlphaZeroNetConfig {
         hidden_dim: 256,
         num_res_blocks: 3,
         head_hidden: 64,
+        per_block_context: false,
     }
 }
 
@@ -536,6 +537,7 @@ pub const fn net_block_deep() -> AlphaZeroNetConfig {
         hidden_dim: 256,
         num_res_blocks: 6,
         head_hidden: 64,
+        per_block_context: false,
     }
 }
 
@@ -553,6 +555,27 @@ pub const fn net_block_deeper() -> AlphaZeroNetConfig {
         hidden_dim: 256,
         num_res_blocks: 10,
         head_hidden: 64,
+        per_block_context: false,
+    }
+}
+
+/// [`net_block_deeper`] with one policy context per sub-board (see
+/// `AlphaZeroNetConfig::BlockNet::per_block_context`): the policy head knows which sub-board it
+/// scores, which matters on free moves, where it must rank sub-boards by their weight on the macro
+/// board. A prototype; [`crate::checkpoints::widen_policy_context`] converts a `block_deeper`
+/// checkpoint into it without changing its outputs.
+pub const fn net_block_ctx() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::BlockNet {
+        in_planes: INPUT_PLANES,
+        board_height: 9,
+        board_width: 9,
+        block_height: 3,
+        block_width: 3,
+        local_dim: 64,
+        hidden_dim: 256,
+        num_res_blocks: 10,
+        head_hidden: 64,
+        per_block_context: true,
     }
 }
 
@@ -600,6 +623,7 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 2> for UltimateTicTacToe {
     fn net_presets() -> Vec<(&'static str, AlphaZeroNetConfig)> {
         vec![
             ("block_deeper", net_block_deeper()),
+            ("block_ctx", net_block_ctx()),
             ("block", net_block()),
             ("block_deep", net_block_deep()),
             ("resnet", net_resnet()),

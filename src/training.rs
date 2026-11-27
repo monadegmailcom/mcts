@@ -792,6 +792,7 @@ mod tests {
             std::array::from_fn(|i| ((i * 7919) % 5 == 0) as u8 as f32);
         for cfg in [
             crate::games::ultimate_ttt::net_block(),
+            crate::games::ultimate_ttt::net_block_ctx(),
             crate::games::ultimate_ttt::net_resnet(),
             crate::games::ultimate_ttt::net_mlp(),
         ] {
@@ -822,6 +823,48 @@ mod tests {
         }
     }
 
+    /// Widening a block net's shared policy context to one per block keeps its outputs, on every
+    /// backend, and records the new architecture.
+    #[test]
+    fn widened_policy_context_computes_the_same_function() {
+        use crate::games::ultimate_ttt::{self, UltimateTicTacToe};
+        use crate::inference::BatchEvaluator;
+        const G: usize = ultimate_ttt::INPUT_SIZE;
+        let (st, pol, val) = uttt_batch(16);
+        let cfg = ultimate_ttt::net_block();
+        let mut trainer = AlphaZeroTrainer::<G, 81, 2>::new(cfg, 1e-3, 1e-4, NnDevice::CPU).unwrap();
+        // Train the zero-initialized heads away from zero, so the policy depends on the context.
+        for _ in 0..3 {
+            trainer.train_step_flat(&st, &pol, &val, 16).unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("mcts_widen_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, dst) = (dir.join("shared.safetensors"), dir.join("per_block.safetensors"));
+        trainer.save_checkpoint(&src).unwrap();
+
+        let widened = crate::checkpoints::widen_policy_context::<UltimateTicTacToe, G, 81, 2>(&src, &dst).unwrap();
+        let AlphaZeroNetConfig::BlockNet { per_block_context: true, .. } = widened else { panic!("{widened:?}") };
+        assert_eq!(crate::checkpoints::read_net_config(&dst), Some(widened));
+        assert!(crate::checkpoints::widen_policy_context::<UltimateTicTacToe, G, 81, 2>(&dst, &src).is_err());
+
+        let states: Vec<[f32; G]> = st.chunks(G).map(|c| c.try_into().unwrap()).collect();
+        let outputs = |cfg: &AlphaZeroNetConfig, path: &std::path::Path, dev: NnDevice| {
+            let ev = NetEvaluator::<G, 81, 2>::standalone(cfg, &[dev], Some(path)).unwrap();
+            let (mut p, mut v) = (vec![[0f32; 81]; states.len()], vec![[0f32; 2]; states.len()]);
+            ev.evaluate_batch(0, &states, &mut p, &mut v);
+            (p, v)
+        };
+        for dev in cpu_devices() {
+            let (p0, v0) = outputs(&cfg, &src, dev);
+            let (p1, v1) = outputs(&widened, &dst, dev);
+            assert!(p0.iter().flatten().any(|&x| x.abs() > 1e-3), "the policy head should be trained");
+            for (a, b) in p0.iter().flatten().zip(p1.iter().flatten()).chain(v0.iter().flatten().zip(v1.iter().flatten())) {
+                assert!((a - b).abs() < 1e-5, "{dev:?}: shared {a} vs per-block {b}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn uttt_batch(b: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         const G: usize = crate::games::ultimate_ttt::INPUT_SIZE;
         let states = (0..b * G).map(|i| ((i * 7919 + i / 13) % 5 == 0) as u8 as f32).collect();
@@ -838,6 +881,7 @@ mod tests {
         let (st, pol, val) = uttt_batch(16);
         for cfg in [
             crate::games::ultimate_ttt::net_block(),
+            crate::games::ultimate_ttt::net_block_ctx(),
             crate::games::ultimate_ttt::net_mlp(),
             crate::games::ultimate_ttt::net_resnet(),
         ] {
@@ -875,7 +919,11 @@ mod tests {
     fn backends_train_identically() {
         const G: usize = crate::games::ultimate_ttt::INPUT_SIZE;
         let (st, pol, val) = uttt_batch(32);
-        for cfg in [crate::games::ultimate_ttt::net_block(), crate::games::ultimate_ttt::net_resnet()] {
+        for cfg in [
+            crate::games::ultimate_ttt::net_block(),
+            crate::games::ultimate_ttt::net_block_ctx(),
+            crate::games::ultimate_ttt::net_resnet(),
+        ] {
             let path = std::env::temp_dir().join(format!("mcts_init_{}.safetensors", std::process::id()));
             let mut candle = AlphaZeroTrainer::<G, 81, 2>::new(cfg, 2e-3, 1e-4, NnDevice::CPU).unwrap();
             candle.save_checkpoint(&path).unwrap();

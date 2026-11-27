@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 use crate::alphazero::AlphaZeroGame;
@@ -122,6 +122,39 @@ pub fn net_config<R: AlphaZeroGame<G, P, N>, const G: usize, const P: usize, con
         .ok_or_else(|| format!("{} matches none of the game's network presets", path.display()))
 }
 
+/// Converts the block-network checkpoint `src`, whose policy head shares one context among all
+/// blocks, into the same network with one context per block (`per_block_context`) and writes it to
+/// `dst`. Every block starts with a copy of the shared projection, so the result computes exactly
+/// what `src` computes and can then learn block-specific contexts, e.g. to continue a run with the
+/// wider head. Returns the new architecture.
+pub fn widen_policy_context<R: AlphaZeroGame<G, P, N>, const G: usize, const P: usize, const N: usize>(
+    src: &Path,
+    dst: &Path,
+) -> Result<AlphaZeroNetConfig, String> {
+    let mut config = net_config::<R, G, P, N>(src)?;
+    let AlphaZeroNetConfig::BlockNet { board_height, board_width, block_height, block_width, per_block_context, .. } =
+        &mut config
+    else {
+        return Err(format!("{} is not a block network", src.display()));
+    };
+    if *per_block_context {
+        return Err(format!("{} already has one policy context per block", src.display()));
+    }
+    *per_block_context = true;
+    let blocks = (*board_height / *block_height) * (*board_width / *block_width);
+
+    let mut tensors = candle_core::safetensors::load(src, &Device::Cpu).map_err(|e| e.to_string())?;
+    for name in ["policy_ctx.weight", "policy_ctx.bias"] {
+        let shared = tensors.get(name).ok_or_else(|| format!("{} has no {name}", src.display()))?;
+        // Output rows are block-major: rows `k * local_dim..(k + 1) * local_dim` are block `k`'s.
+        let tiled = Tensor::cat(&vec![shared; blocks], 0).map_err(|e| e.to_string())?;
+        tensors.insert(name.to_string(), tiled);
+    }
+    candle_core::safetensors::save(&tensors, dst).map_err(|e| e.to_string())?;
+    write_net_config(dst, &config).map_err(|e| e.to_string())?;
+    Ok(config)
+}
+
 /// Name of the game preset with this architecture, or `"custom"`.
 pub fn preset_name<R: AlphaZeroGame<G, P, N>, const G: usize, const P: usize, const N: usize>(
     config: &AlphaZeroNetConfig,
@@ -168,6 +201,13 @@ mod tests {
         assert_eq!(read_net_config(&bare), None);
         assert_eq!(net_config::<UltimateTicTacToe, G, 81, 2>(&bare), Ok(mlp));
         assert_eq!(preset_name::<UltimateTicTacToe, G, 81, 2>(&mlp), "mlp");
+
+        // Metadata written before `per_block_context` existed reads as the shared context.
+        let old_json = r#"{"kind":"block_net","in_planes":7,"board_height":9,"board_width":9,"block_height":3,"block_width":3,"local_dim":64,"hidden_dim":256,"num_res_blocks":10,"head_hidden":64}"#;
+        let old: AlphaZeroNetConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old, ultimate_ttt::net_block_deeper());
+        assert_eq!(preset_name::<UltimateTicTacToe, G, 81, 2>(&old), "block_deeper");
+        assert_eq!(preset_name::<UltimateTicTacToe, G, 81, 2>(&ultimate_ttt::net_block_ctx()), "block_ctx");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

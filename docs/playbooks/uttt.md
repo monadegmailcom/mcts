@@ -34,6 +34,7 @@ This playbook collects experience and recommendations for UTTT, from Nov 14 to N
 | `block` | Shared encoder per 3 × 3 sub-board (local 64, hidden 256), 3 residual blocks, about 590k parameters | Fast; plateaus at about 1370–1390 Elo |
 | `block_deep` | The same with 6 residual blocks, about 1M parameters | Learns as fast per minute as `block` early on; reached about 1500 and more after hours; costs only 14% sims/s on CUDA. Plateaued at deep27h's strength through runs 3–5 |
 | `block_deeper` | The same with 10 residual blocks | **The default since Nov 27.** Run6 reached deep27h's level in about 7 h from scratch, but not beyond it before its lr decay (§5) |
+| `block_ctx` | `block_deeper` with one policy context per sub-board (+132k parameters): the policy head knows which sub-board it scores | Prototype, Nov 28; not trained yet. Aimed at free moves: 12% of all moves and in 199 of 200 games (run6_iter1073, argmax at 100 sims). `POST /api/models` with `"action":"widen_policy_context"` converts a `block_deeper` checkpoint into it with identical outputs |
 | `resnet` | 4 × 64 convolutions | 6.6× slower than `block`, not better per game |
 | `mlp` | Flat MLP | Learned poorly |
 

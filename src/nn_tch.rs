@@ -169,6 +169,8 @@ enum Trunk {
     Block {
         layout: BlockLayout,
         local_dim: usize,
+        /// Policy contexts: 1 (shared by all blocks) or one per block.
+        ctx_blocks: usize,
         local_fc1: nn::Linear,
         local_norm1: nn::LayerNorm,
         local_fc2: nn::Linear,
@@ -249,6 +251,7 @@ impl TchNet {
                 hidden_dim,
                 num_res_blocks,
                 head_hidden,
+                per_block_context,
             } => {
                 let layout = BlockLayout {
                     planes: in_planes,
@@ -260,9 +263,11 @@ impl TchNet {
                 assert_eq!(in_planes * board_height * board_width, g, "BlockNet requires G == in_planes * H * W");
                 assert_eq!(board_height * board_width, pol, "BlockNet requires P == H * W");
                 let (tokens, cells) = (layout.num_blocks(), layout.cells());
+                let ctx_blocks = if per_block_context { tokens } else { 1 };
                 Trunk::Block {
                     layout,
                     local_dim,
+                    ctx_blocks,
                     local_fc1: linear(p / "local_fc1", in_planes * cells, local_dim),
                     local_norm1: layer_norm(p / "local_norm1", local_dim),
                     local_fc2: linear(p / "local_fc2", local_dim, local_dim),
@@ -270,7 +275,7 @@ impl TchNet {
                     global_fc: linear(p / "global_fc", tokens * local_dim, hidden_dim),
                     global_norm: layer_norm(p / "global_norm", hidden_dim),
                     blocks: (0..num_res_blocks).map(|i| MlpBlock::new(p / format!("res_{i}"), hidden_dim)).collect(),
-                    policy_ctx: linear(p / "policy_ctx", hidden_dim, local_dim),
+                    policy_ctx: linear(p / "policy_ctx", hidden_dim, ctx_blocks * local_dim),
                     policy_fc1: linear(p / "policy_fc1", local_dim, head_hidden),
                     policy_fc2: linear_zero(p / "policy_fc2", head_hidden, cells),
                     value_fc1: linear(p / "value_fc1", hidden_dim, head_hidden),
@@ -318,6 +323,7 @@ impl TchNet {
             Trunk::Block {
                 layout: l,
                 local_dim,
+                ctx_blocks,
                 local_fc1,
                 local_norm1,
                 local_fc2,
@@ -342,7 +348,7 @@ impl TchNet {
                 for blk in blocks {
                     g = blk.forward(&g);
                 }
-                let pt = (&t + g.apply(policy_ctx).unsqueeze(1)).relu();
+                let pt = (&t + g.apply(policy_ctx).view([b, *ctx_blocks as i64, *local_dim as i64])).relu();
                 let logits = pt
                     .apply(policy_fc1)
                     .relu()
