@@ -1430,6 +1430,11 @@ impl TelemetryHub {
             LabGame::Ttt => guard.ttt_context.as_ref().map(|c| c.live_net_name::<TicTacToe>()),
             LabGame::Uttt => guard.uttt_context.as_ref().map(|c| c.live_net_name::<UltimateTicTacToe>()),
         };
+        let live_size = match game {
+            LabGame::Ttt => guard.ttt_context.as_ref().map(|c| c.net_config.size()),
+            LabGame::Uttt => guard.uttt_context.as_ref().map(|c| c.net_config.size()),
+        };
+        let knobs_effective = effective_knobs_json(game, &st.knobs, live_size);
         let models = discover_game_models(game, live_net.is_some(), st.current_iteration);
         let models_json = models
             .iter()
@@ -1465,6 +1470,7 @@ impl TelemetryHub {
                 "\"total_iterations\":{},",
                 "\"auto_save_every\":{},",
                 "\"knobs\":{},",
+                "\"knobs_effective\":{},",
                 "\"eval_opponents\":{},",
                 "\"models\":[{}],",
                 "\"utilization\":{},",
@@ -1484,6 +1490,7 @@ impl TelemetryHub {
             st.total_iterations,
             st.auto_save_every,
             st.knobs.to_json(),
+            knobs_effective,
             serde_json::to_string(&st.eval_opponents).unwrap_or_else(|_| "[]".into()),
             models_json,
             guard.utilization.as_ref().map_or_else(|| "null".to_string(), |u| u.to_json().to_string()),
@@ -2821,6 +2828,29 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
     }
 }
 
+/// The values the knobs where `0` means "auto" or "default" resolve to (`self_play_threads`,
+/// `eval_threads`, `eval_sims`, `net_blocks`, `net_width`), for the dashboard to show next to them.
+/// `net_blocks` / `net_width`: the size the next Reset creates; `live_net`: the running network's
+/// `[blocks, width]`.
+fn effective_knobs_json(game: LabGame, knobs: &LiveKnobs, live_size: Option<(usize, usize)>) -> String {
+    let default_net = match game {
+        LabGame::Ttt => <TicTacToe as AlphaZeroGame<27, 9, 2>>::net_config(),
+        LabGame::Uttt => {
+            <UltimateTicTacToe as AlphaZeroGame<{ ultimate_ttt::INPUT_SIZE }, { ultimate_ttt::POLICY_SIZE }, 2>>::net_config()
+        }
+    };
+    let (blocks, width) = knobs.sized_net(default_net).size();
+    serde_json::json!({
+        "self_play_threads": crate::hyperparams::resolve_threads(knobs.self_play_threads),
+        "eval_threads": knobs.eval_thread_count(),
+        "eval_sims": knobs.eval_simulations(),
+        "net_blocks": blocks,
+        "net_width": width,
+        "live_net": live_size.map(|(b, w)| [b, w]),
+    })
+    .to_string()
+}
+
 /// Replaces the evaluation opponents if the request body carries a non-empty `eval_opponents` list.
 fn apply_opponent_updates(opponents: &mut Vec<OpponentSpec>, body: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return };
@@ -3085,6 +3115,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     letter-spacing: 0.05em;
     margin: 12px 0 6px;
   }
+  .knob-eff {
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 3px;
+    min-height: 0.9em;
+  }
   .knob-item label {
     display: block;
     font-size: 0.73rem;
@@ -3267,6 +3303,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="knob-item" title="CPU worker threads running self-play games. 0 = all cores but two.">
         <label>Self-Play Threads (0 = auto)</label>
         <input type="number" id="k-sp-threads" min="0" max="256" step="1">
+        <div class="knob-eff" id="k-sp-threads-eff"></div>
       </div>
       <div class="knob-item" title="The first N moves of each game are sampled from the visit counts (exploration); later moves play the most-visited move.">
         <label>Sampled Opening Moves</label>
@@ -3335,10 +3372,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="knob-item" title="Residual blocks of the network that the next Reset creates. 0 = the game's default architecture (UTTT: block_deeper, 10 blocks). The running network keeps its size; Load → Live takes the size stored in the checkpoint.">
         <label>Residual Blocks (0 = default)</label>
         <input type="number" id="k-net-blocks" min="0" max="64" step="1">
+        <div class="knob-eff" id="k-net-blocks-eff"></div>
       </div>
       <div class="knob-item" title="Width (hidden size) of the residual tower of the network that the next Reset creates. 0 = the game's default (UTTT: 256). Cost per network call grows about with width², parameters too.">
         <label>Tower Width (0 = default)</label>
         <input type="number" id="k-net-width" min="0" max="4096" step="32">
+        <div class="knob-eff" id="k-net-width-eff"></div>
       </div>
     </div>
     <h3 class="knob-section">Arena Evaluation</h3>
@@ -3354,10 +3393,12 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       <div class="knob-item" title="AlphaZero simulations per move in the arena.">
         <label>Eval Sims / Move (0 = self-play)</label>
         <input type="number" id="k-eval-sims" min="0" max="10000" step="8">
+        <div class="knob-eff" id="k-eval-sims-eff"></div>
       </div>
       <div class="knob-item" title="Arena worker threads. 0 = all cores but two.">
         <label>Eval Threads (0 = auto)</label>
         <input type="number" id="k-eval-threads" min="0" max="256" step="1">
+        <div class="knob-eff" id="k-eval-threads-eff"></div>
       </div>
     </div>
   </div>
@@ -3815,6 +3856,23 @@ const KNOB_FIELDS = [
   ['eval_every', 'k-eval-every', 'int'],
 ];
 
+// What the knobs where 0 means "auto" / "default" resolve to (server values, so they reflect the
+// applied knobs, not unsaved edits in the form).
+function renderEffectiveKnobs(d) {
+  const eff = d.knobs_effective || {};
+  const k = d.knobs || {};
+  const set = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+  const resolved = (key, zeroWord) => eff[key] === undefined ? ''
+    : (k[key] === 0 ? `${zeroWord} → ${eff[key]}` : `in effect: ${eff[key]}`);
+  set('k-sp-threads-eff', resolved('self_play_threads', 'auto'));
+  set('k-eval-threads-eff', resolved('eval_threads', 'auto'));
+  set('k-eval-sims-eff', resolved('eval_sims', 'self-play'));
+  set('k-net-blocks-eff', eff.net_blocks === undefined ? ''
+    : `${k.net_blocks === 0 ? 'default → ' : ''}next Reset: ${eff.net_blocks}` + (eff.live_net ? ` · live: ${eff.live_net[0]}` : ''));
+  set('k-net-width-eff', eff.net_width === undefined ? ''
+    : `${k.net_width === 0 ? 'default → ' : ''}next Reset: ${eff.net_width}` + (eff.live_net ? ` · live: ${eff.live_net[1]}` : ''));
+}
+
 function collectKnobs() {
   const out = {};
   const opps = oppRead('live-opps');
@@ -3986,6 +4044,7 @@ function renderDashboard(d) {
   }
   document.getElementById('iter-badge').textContent = `Iter: ${d.current_iteration} / ${d.total_iterations}`;
 
+  renderEffectiveKnobs(d);
   if (knobsInitializedForGame !== activeGame) {
     for (const [key, id] of KNOB_FIELDS) {
       if (d.knobs[key] !== undefined) document.getElementById(id).value = d.knobs[key];
@@ -4649,6 +4708,27 @@ mod tests {
     use super::*;
     use crate::training::AlphaZeroTrainer;
     use rand::SeedableRng;
+
+    #[test]
+    fn effective_knobs_resolve_zero_to_auto_and_default_values() {
+        let mut knobs = LiveKnobs::default_uttt();
+        knobs.self_play_threads = 0;
+        knobs.eval_threads = 3;
+        knobs.eval_sims = 0;
+        knobs.simulations_per_move = 200;
+        let eff: serde_json::Value =
+            serde_json::from_str(&effective_knobs_json(LabGame::Uttt, &knobs, Some((6, 256)))).unwrap();
+        assert_eq!(eff["self_play_threads"], crate::hyperparams::resolve_threads(0));
+        assert_eq!(eff["eval_threads"], 3);
+        assert_eq!(eff["eval_sims"], 200);
+        assert_eq!((eff["net_blocks"].as_u64(), eff["net_width"].as_u64()), (Some(10), Some(256)));
+        assert_eq!(eff["live_net"], serde_json::json!([6, 256]));
+        knobs.net_blocks = 8;
+        knobs.net_width = 384;
+        let eff: serde_json::Value = serde_json::from_str(&effective_knobs_json(LabGame::Uttt, &knobs, None)).unwrap();
+        assert_eq!((eff["net_blocks"].as_u64(), eff["net_width"].as_u64()), (Some(8), Some(384)));
+        assert!(eff["live_net"].is_null());
+    }
 
     #[test]
     fn telemetry_hub_json_and_play_analysis_work() {
