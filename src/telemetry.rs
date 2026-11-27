@@ -634,6 +634,10 @@ pub struct TttMatchRecord {
     pub wins_a: usize,
     pub draws: usize,
     pub wins_b: usize,
+    /// Engine A's wins, draws and losses when it moved first from the opening position.
+    pub a_first_wdl: [usize; 3],
+    /// Engine A's wins, draws and losses when it moved second.
+    pub a_second_wdl: [usize; 3],
     pub score_a_pct: f32,
     pub avg_moves: f32,
     pub duration_ms: f32,
@@ -662,6 +666,8 @@ impl TttMatchRecord {
                 "\"wins_a\":{},",
                 "\"draws\":{},",
                 "\"wins_b\":{},",
+                "\"a_first_wdl\":[{},{},{}],",
+                "\"a_second_wdl\":[{},{},{}],",
                 "\"score_a_pct\":{:.2},",
                 "\"avg_moves\":{:.2},",
                 "\"duration_ms\":{:.2},",
@@ -683,6 +689,12 @@ impl TttMatchRecord {
             self.wins_a,
             self.draws,
             self.wins_b,
+            self.a_first_wdl[0],
+            self.a_first_wdl[1],
+            self.a_first_wdl[2],
+            self.a_second_wdl[0],
+            self.a_second_wdl[1],
+            self.a_second_wdl[2],
             finite_or_zero(self.score_a_pct),
             finite_or_zero(self.avg_moves),
             finite_or_zero(self.duration_ms),
@@ -1662,6 +1674,11 @@ fn summarize_match_outcome<const G: usize, const P: usize>(
     let wins_a = outcome.wins[0];
     let wins_b = outcome.wins[1];
     let draws = outcome.draws;
+    // Engine A's record from seat `a_seat`; engine B then sits at the other seat.
+    let a_wdl = |a_seat: usize| {
+        let (w, l) = (outcome.seat_wins[0][a_seat], outcome.seat_wins[1][1 - a_seat]);
+        [w, outcome.seat_rounds[0][a_seat] - w - l, l]
+    };
     let score_a_pct = (((wins_a as f32) + 0.5 * (draws as f32)) / (games as f32).max(1.0)) * 100.0;
     let total_moves = outcome.choose_time_us[0].count() + outcome.choose_time_us[1].count();
     let avg_moves = (total_moves as f32) / (games as f32).max(1.0);
@@ -1676,6 +1693,8 @@ fn summarize_match_outcome<const G: usize, const P: usize>(
         wins_a,
         draws,
         wins_b,
+        a_first_wdl: a_wdl(0),
+        a_second_wdl: a_wdl(1),
         score_a_pct,
         avg_moves,
         duration_ms,
@@ -3775,6 +3794,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <th>Engine A vs Engine B</th>
           <th>Games</th>
           <th>A Wins / Draws / B Wins</th>
+          <th>A First / A Second (W-D-L)</th>
           <th>A Score %</th>
           <th>Actual Compute (A vs B µs/mv)</th>
           <th>Speed</th>
@@ -4499,6 +4519,7 @@ function renderMatches(matches) {
       <td><span style="color:var(--accent)">${m.engine_a}</span> <span style="color:var(--muted)">vs</span> <span style="color:var(--rose)">${m.engine_b}</span></td>
       <td>${m.num_games}</td>
       <td><b>${m.wins_a}W</b> - ${m.draws}D - <b>${m.wins_b}L</b></td>
+      <td>${m.a_first_wdl.join('-')} / ${m.a_second_wdl.join('-')}</td>
       <td style="color:${m.score_a_pct >= 50 ? 'var(--green)' : 'var(--rose)'}"><b>${m.score_a_pct.toFixed(1)}%</b></td>
       <td>${computeText}</td>
       <td>${m.games_per_sec.toFixed(0)} g/s (${m.duration_ms.toFixed(0)} ms)</td>

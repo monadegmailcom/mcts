@@ -172,6 +172,11 @@ pub struct MultiMatchSummary<const N: usize> {
     pub wins: [usize; N],
     /// Rounds where all `N` participants tied (for `N == 1`, rounds with `payoffs[0] == 0.0`).
     pub draws: usize,
+    /// Rounds per participant and seat: `seat_rounds[p][s]` counts the rounds participant `p`
+    /// played from seat `s` (seat 0 moves first from the initial position).
+    pub seat_rounds: [[usize; N]; N],
+    /// Sole first-place finishes per participant and seat, indexed like `seat_rounds`.
+    pub seat_wins: [[usize; N]; N],
     /// Rounds in `N >= 3` games where `2..N` participants tied for highest payoff.
     pub partial_ties: usize,
     /// Sum of terminal payoffs earned by each participant across all rounds.
@@ -188,6 +193,8 @@ impl<const N: usize> MultiMatchSummary<N> {
             rounds: 0,
             wins: [0; N],
             draws: 0,
+            seat_rounds: [[0; N]; N],
+            seat_wins: [[0; N]; N],
             partial_ties: 0,
             payoff_sums: [0.0; N],
             durations: [Duration::ZERO; N],
@@ -211,6 +218,7 @@ impl<const N: usize> MultiMatchSummary<N> {
         // Participant `p` sat at seat `(p + round_idx) % N`.
         for p in 0..N {
             let seat = (p + round_idx) % N;
+            self.seat_rounds[p][seat] += 1;
             self.payoff_sums[p] += outcome.payoffs[seat] as f64;
             self.durations[p] += outcome.seat_durations[seat];
             self.choose_time_us[p].join(&outcome.choose_time_us[seat]);
@@ -219,6 +227,7 @@ impl<const N: usize> MultiMatchSummary<N> {
         if N == 1 {
             if outcome.payoffs[0] > 0.0 {
                 self.wins[0] += 1;
+                self.seat_wins[0][0] += 1;
             } else if outcome.payoffs[0] == 0.0 {
                 self.draws += 1;
             }
@@ -245,6 +254,7 @@ impl<const N: usize> MultiMatchSummary<N> {
             // Invert `seat = (p + round_idx) % N` -> `p = (seat + N - (round_idx % N)) % N`.
             let winner_participant = (last_top_seat + N - (round_idx % N)) % N;
             self.wins[winner_participant] += 1;
+            self.seat_wins[winner_participant][last_top_seat] += 1;
         } else if top_count == N {
             self.draws += 1;
         } else {
@@ -258,6 +268,10 @@ impl<const N: usize> MultiMatchSummary<N> {
         self.partial_ties += other.partial_ties;
         for p in 0..N {
             self.wins[p] += other.wins[p];
+            for seat in 0..N {
+                self.seat_rounds[p][seat] += other.seat_rounds[p][seat];
+                self.seat_wins[p][seat] += other.seat_wins[p][seat];
+            }
             self.payoff_sums[p] += other.payoff_sums[p];
             self.durations[p] += other.durations[p];
             self.choose_time_us[p].join(&other.choose_time_us[p]);
@@ -658,6 +672,23 @@ mod tests {
         assert_eq!(single.draws, multi.draws);
         assert!((single.payoff_sums[0] - multi.payoff_sums[0]).abs() < 1e-9);
         assert!((single.payoff_sums[1] - multi.payoff_sums[1]).abs() < 1e-9);
+        assert_eq!(single.seat_wins, multi.seat_wins);
+    }
+
+    #[test]
+    fn seat_tallies_split_results_by_who_moved_first() {
+        let game = TttGame::new(PlayerIndex::PLAYER1, EMPTY_STATE);
+        let f = |g: &TttGame, seed: u64| -> Box<dyn Player<TicTacToe, 2>> { Box::new(RandomPlayer::new(*g, seed)) };
+        let r = run_multi_match(&game, [&f, &f], 400, 2, 7);
+
+        assert_eq!(r.seat_rounds, [[200, 200], [200, 200]]);
+        for p in 0..2 {
+            assert_eq!(r.seat_wins[p][0] + r.seat_wins[p][1], r.wins[p]);
+        }
+        // Random tic-tac-toe: the first mover wins about 58% of the games, the second about 29%.
+        let first_mover_wins = r.seat_wins[0][0] + r.seat_wins[1][0];
+        let second_mover_wins = r.seat_wins[0][1] + r.seat_wins[1][1];
+        assert!(first_mover_wins > 3 * second_mover_wins / 2, "{first_mover_wins} vs {second_mover_wins}");
     }
 
     #[test]
