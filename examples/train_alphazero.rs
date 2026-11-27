@@ -315,7 +315,8 @@ where
 }
 
 /// Plays a round-robin between `anchors` (`games_per_pair` games per pairing from the evaluation
-/// openings, colors swapped) and fits their Elo ratings.
+/// openings, colors swapped) and fits their Elo ratings. Pairings the current pool already holds
+/// with the same number of games are reused, so adding anchors plays only their new pairings.
 fn calibrate_elo<S, const G: usize, const P: usize>(
     hub: &TelemetryHub,
     anchors: Vec<OpponentSpec>,
@@ -333,8 +334,24 @@ where
     let openings = S::eval_openings(games_per_pair.div_ceil(2));
     let threads = hub.knobs_for(S::LAB).eval_thread_count();
     let pairs: Vec<(usize, usize)> = (0..anchors.len()).flat_map(|a| (a + 1..anchors.len()).map(move |b| (a, b))).collect();
+    let old = hub.elo_pool(S::LAB).filter(|p| p.games_per_pair == openings.len() * 2);
+    let known = |a: usize, b: usize| -> Option<[usize; 3]> {
+        let pool = old.as_ref()?;
+        let ia = pool.anchors.iter().position(|x| x.opponent == anchors[a])?;
+        let ib = pool.anchors.iter().position(|x| x.opponent == anchors[b])?;
+        pool.pairings.iter().find_map(|p| match (p.a, p.b) {
+            (x, y) if x == ia && y == ib => Some(p.wdl),
+            (x, y) if x == ib && y == ia => Some([p.wdl[2], p.wdl[1], p.wdl[0]]),
+            _ => None,
+        })
+    };
     let mut pairings = Vec::with_capacity(pairs.len());
     for (k, &(a, b)) in pairs.iter().enumerate() {
+        if let Some(wdl) = known(a, b) {
+            println!("⚖️  {} vs {}: {}W-{}D-{}L (kept from the current pool)", anchors[a].label(), anchors[b].label(), wdl[0], wdl[1], wdl[2]);
+            pairings.push(Pairing { a, b, wdl });
+            continue;
+        }
         hub.set_elo_status(S::LAB, format!("Pairing {}/{}: {} vs {}", k + 1, pairs.len(), anchors[a].label(), anchors[b].label()));
         let f_a = |g: &Game<S, 2>, seed: u64| opponent_player::<S, G, P>(&anchors[a], g, seed, nets[a].as_ref());
         let f_b = |g: &Game<S, 2>, seed: u64| opponent_player::<S, G, P>(&anchors[b], g, seed, nets[b].as_ref());
@@ -358,11 +375,12 @@ where
 {
     let backend = Backend::parse(&spec.backend).filter(|b| b.is_available()).unwrap_or(Backend::Candle);
     let dev = if spec.device == "cpu" { NnDevice::cpu(backend) } else { NnDevice::best(backend) };
-    let (net_name, cfg) = S::net_presets()
+    let (net_name, preset) = S::net_presets()
         .into_iter()
         .find(|(n, _)| *n == spec.net)
         .unwrap_or_else(|| S::net_presets()[0]);
     let hp = spec.hp;
+    let cfg = hp.sized_net(preset);
     let mut trainer = AlphaZeroTrainer::<G, P, 2>::new(cfg, hp.learning_rate, hp.weight_decay, dev)?;
     trainer.set_ewa_window(hp.ewa_window);
     if !spec.init_checkpoint.is_empty() {
@@ -531,6 +549,29 @@ fn load_live<S: LabGameSpec<G, P>, const G: usize, const P: usize>(
     Ok(())
 }
 
+/// Replaces a game's live network with fresh random weights in the architecture the knobs ask for
+/// (the game's default resized by `net_blocks` / `net_width`; **Reset**), with a new optimizer and
+/// inference service. The live checkpoint is rewritten right away, so a restarted lab comes back
+/// with the new network.
+fn reset_live<S: LabGameSpec<G, P>, const G: usize, const P: usize>(
+    trainer: &mut AlphaZeroTrainer<G, P, 2>,
+    service: &mut LiveService<G, P, 2>,
+    knobs: &LiveKnobs,
+    train_dev: NnDevice,
+    infer_devs: &[NnDevice],
+    infer_batch: usize,
+) -> candle_core::Result<()> {
+    let cfg = knobs.sized_net(S::net_config());
+    let mut fresh = AlphaZeroTrainer::new(cfg, knobs.learning_rate, knobs.weight_decay, train_dev)?;
+    fresh.set_ewa_window(knobs.ewa_window);
+    fresh.save_checkpoint(live_checkpoint::<S, G, P>())?;
+    *service = Arc::new(fresh.build_inference_service(infer_batch, infer_devs)?);
+    *trainer = fresh;
+    let (blocks, width) = cfg.size();
+    println!("🧱 New {} network: {} {blocks}×{width}", S::TAG, checkpoints::preset_name::<S, G, P, 2>(&cfg));
+    Ok(())
+}
+
 fn main() -> candle_core::Result<()> {
     let interactive_lab =
         std::env::args().any(|a| a == "--serve" || a == "--lab-only");
@@ -666,14 +707,20 @@ fn main() -> candle_core::Result<()> {
                     std::thread::sleep(Duration::from_millis(80));
                 }
                 TrainingCommand::Reset(LabGame::Ttt) => {
-                    let lr = hub.knobs_for(LabGame::Ttt).learning_rate;
-                    ttt_trainer.reset(&ttt_service, lr, 1e-4)?;
+                    let (train_dev, infer_devs) = hub.system_settings().devices();
+                    let knobs = hub.knobs_for(LabGame::Ttt);
+                    reset_live::<TicTacToe, 27, 9>(&mut ttt_trainer, &mut ttt_service, &knobs, train_dev, &infer_devs, max_batch_size)?;
+                    hub.attach_ttt_service(Arc::clone(&ttt_service), *ttt_trainer.net_config(), infer_devs.clone());
                     ttt_buffer.clear();
                     println!("🔄 Reset Tic-Tac-Toe model to fresh random weights and cleared replay buffer.");
                 }
                 TrainingCommand::Reset(LabGame::Uttt) => {
-                    let lr = hub.knobs_for(LabGame::Uttt).learning_rate;
-                    uttt_trainer.reset(&uttt_service, lr, 1e-4)?;
+                    let (train_dev, infer_devs) = hub.system_settings().devices();
+                    let knobs = hub.knobs_for(LabGame::Uttt);
+                    reset_live::<UltimateTicTacToe, { UTTT_INPUT_SIZE }, 81>(
+                        &mut uttt_trainer, &mut uttt_service, &knobs, train_dev, &infer_devs, max_batch_size,
+                    )?;
+                    hub.attach_uttt_service(Arc::clone(&uttt_service), *uttt_trainer.net_config(), infer_devs.clone());
                     uttt_buffer.clear();
                     println!("🔄 Reset Ultimate Tic-Tac-Toe model to fresh random weights and cleared replay buffer.");
                 }

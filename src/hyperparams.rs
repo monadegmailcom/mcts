@@ -41,6 +41,14 @@ pub struct AlphaZeroHyperparams {
     /// averaged weights shows how much the learning rate's step noise costs (see
     /// [`crate::training::AlphaZeroTrainer::held_out_losses`]).
     pub ewa_window: usize,
+    // --- Network size ---
+    /// Residual blocks of a *fresh* network (`0` = the architecture's default). Takes effect when
+    /// a network is created: Reset in the live lab, or the start of an experiment. A loaded
+    /// checkpoint keeps the architecture stored in it.
+    pub net_blocks: usize,
+    /// Width of a fresh network's residual tower (hidden size; channels for a ResNet; `0` = the
+    /// architecture's default). Takes effect like [`Self::net_blocks`].
+    pub net_width: usize,
     // --- Arena evaluation ---
     /// Games per arena opponent (each opening is played once per seat).
     pub eval_games: usize,
@@ -70,6 +78,8 @@ impl AlphaZeroHyperparams {
         weight_decay: 1e-4,
         buffer_capacity: 100_000,
         ewa_window: 2_000,
+        net_blocks: 0,
+        net_width: 0,
         eval_games: 40,
         eval_sims: 0,
         eval_threads: 0,
@@ -94,6 +104,11 @@ impl AlphaZeroHyperparams {
 
     pub fn eval_thread_count(&self) -> usize {
         resolve_threads(self.eval_threads)
+    }
+
+    /// `base` resized by [`Self::net_blocks`] and [`Self::net_width`] (the architecture of a fresh network).
+    pub fn sized_net(&self, base: crate::nn::AlphaZeroNetConfig) -> crate::nn::AlphaZeroNetConfig {
+        base.with_size(self.net_blocks, self.net_width)
     }
 }
 

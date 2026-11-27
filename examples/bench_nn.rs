@@ -42,6 +42,7 @@ fn net_by_name(name: &str) -> AlphaZeroNetConfig {
         "resnet4" => ultimate_ttt::net_resnet(),
         "block" => ultimate_ttt::net_block(),
         "block_deep" => ultimate_ttt::net_block_deep(),
+        "block_deeper" => ultimate_ttt::net_block_deeper(),
         "mlp" => ultimate_ttt::net_mlp(),
         other => panic!("unknown net {other}"),
     }

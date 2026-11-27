@@ -37,6 +37,9 @@ This playbook covers watching a long live-training run and stepping in. It appli
    - SSH tunnel to the pod's lab: `ssh -f -N -L 18080:localhost:8080 ...`.
    - The pod's SSH port changes when it restarts.
 8. **Run length:** `total_iterations` is clamped to 1..10000.
+9. **Network size** (only for a run from scratch): set the knobs `net_blocks` (residual blocks)
+   and `net_width` (width of the residual tower), then Reset. `0` means the game's default
+   architecture. See §4, "Capacity".
 
 ## 2. The metrics and how to read them
 
@@ -106,7 +109,7 @@ new positions per iteration = games_per_iteration × positions per game
 | Score drops by > 2 SE over 2 h after a change | Revert the change; if the drop persists, load the last good snapshot |
 | Losses spike, NaN, game length or draws collapse | Load the last good snapshot, revert the last change, check the lr |
 | Score vs reference > 65–70% | Saturated: take a stronger reference, e.g. a snapshot of this run; calibrate it as an anchor (`POST /api/elo`) |
-| All levers flat over several hours | The network is at capacity: train a bigger preset from scratch |
+| All levers flat over several hours | The network is at capacity: train a bigger network from scratch (`net_blocks` / `net_width`, then Reset) |
 | Last ~3 h of a run | lr down to about 1/10 for the one-time gain |
 
 **What each lever did so far** (mostly UTTT; see [uttt.md](uttt.md)):
@@ -121,11 +124,34 @@ new positions per iteration = games_per_iteration × positions per game
     scratch.
   - Late in training more sims help, up to a point: 64 → 200 gave about +30 Elo within an hour.
     200 → 400 gave nothing at a 100-sim evaluation, and each iteration took twice as long.
-- **Sample reuse and buffer:** not cleanly tested yet. Reuse was about 4× in all runs.
+- **Sample reuse:** at a plateau it is not the lever. UTTT run5: reuse 1.9, 3.8 and 7.6 scored
+  49.7%, 49.7% and 47.6% (±1.0–1.4) vs deep27h. Take the lowest reuse that holds the score: it is
+  the fastest.
+- **Buffer:** not tested yet.
 - **Exploration** (`dirichlet_alpha`, `dirichlet_epsilon`, `c_init`, `opening_moves`),
   **`value_q_weight`** and **FPU:** never compared cleanly. Try them last, one at a time.
 - **Capacity:** the 3-block net plateaued at about 1370–1390 Elo. The 6-block net reached about
-  1500 and more.
+  1500 and more, then plateaued at deep27h's strength through three runs (UTTT runs 3–5) while
+  lr, sims and reuse were varied.
+
+**Capacity: the network-size knobs.**
+
+- `net_blocks` and `net_width` resize the game's default architecture: residual blocks and the
+  hidden size of the residual tower (channels for a ResNet). Encoders and heads keep their size.
+  `0` keeps the default.
+- They act only when a network is **created**:
+  - **Live:** on Reset, which also clears the buffer and the history. Changing them during a run
+    changes nothing until the next Reset.
+  - **Experiments:** they resize the chosen preset at the start of the run.
+  - **Load → Live** always takes the architecture stored in the checkpoint.
+- The dashboard's network badge and `live_net` in `/api/state` show the live size, e.g.
+  `block_deeper 10×256` (`custom` when it matches no preset). Check it after the Reset.
+- A bigger network trains from scratch: there is no growth from a smaller one.
+  - Use the from-scratch settings: lr 2e-3 and few sims (64).
+  - Plan at least 24 h; the 6-block UTTT net needed about 15 h to plateau.
+  - Before the run, measure the speed cost in Experiments (15 minutes is enough), not live.
+- Cost: inference and SGD time grow about linearly with `net_blocks` and about with the square of
+  `net_width`. On CUDA the call overhead hides part of it (3 → 6 blocks cost only 14% sims/s).
 
 ## 5. Operating rules and pitfalls
 

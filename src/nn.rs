@@ -207,6 +207,42 @@ impl AlphaZeroNetConfig {
             head_hidden: 128,
         }
     }
+
+    /// Depth (residual blocks) and width (hidden size of the residual tower: `hidden_dim`, or
+    /// `channels` for [`Self::ResNet2d`]).
+    pub const fn size(&self) -> (usize, usize) {
+        match *self {
+            Self::ResNet2d { channels, num_res_blocks, .. } => (num_res_blocks, channels),
+            Self::ResMlp { hidden_dim, num_res_blocks, .. } | Self::BlockNet { hidden_dim, num_res_blocks, .. } => {
+                (num_res_blocks, hidden_dim)
+            }
+        }
+    }
+
+    /// This architecture with `blocks` residual blocks and a residual tower `width` wide (see
+    /// [`Self::size`]); `0` keeps the current value. Heads and encoders keep their sizes.
+    #[must_use]
+    pub fn with_size(mut self, blocks: usize, width: usize) -> Self {
+        match &mut self {
+            Self::ResNet2d { channels, num_res_blocks, .. } => {
+                if blocks > 0 {
+                    *num_res_blocks = blocks;
+                }
+                if width > 0 {
+                    *channels = width;
+                }
+            }
+            Self::ResMlp { hidden_dim, num_res_blocks, .. } | Self::BlockNet { hidden_dim, num_res_blocks, .. } => {
+                if blocks > 0 {
+                    *num_res_blocks = blocks;
+                }
+                if width > 0 {
+                    *hidden_dim = width;
+                }
+            }
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug)]

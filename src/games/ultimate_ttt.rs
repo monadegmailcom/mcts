@@ -507,8 +507,8 @@ pub fn format_board(game: &UtttGame) -> String {
 // AlphaZero integration
 // ---------------------------------------------------------------------------------------------
 
-/// Block network: one shared encoder per `3x3` sub-board plus a global MLP (the default; learns
-/// as much per game as [`net_resnet`] at a fraction of its compute).
+/// Block network: one shared encoder per `3x3` sub-board plus a global MLP (learns as much per
+/// game as [`net_resnet`] at a fraction of its compute).
 pub const fn net_block() -> AlphaZeroNetConfig {
     AlphaZeroNetConfig::BlockNet {
         in_planes: INPUT_PLANES,
@@ -535,6 +535,23 @@ pub const fn net_block_deep() -> AlphaZeroNetConfig {
         local_dim: 64,
         hidden_dim: 256,
         num_res_blocks: 6,
+        head_hidden: 64,
+    }
+}
+
+/// [`net_block`] with 10 residual blocks: the default since [`net_block_deep`] plateaued at about
+/// the strength of `uttt_deep27h` over three runs (runs 3–5, Nov 2026) with every training lever
+/// tried. Depth and width can be changed per run with the `net_blocks` / `net_width` knobs.
+pub const fn net_block_deeper() -> AlphaZeroNetConfig {
+    AlphaZeroNetConfig::BlockNet {
+        in_planes: INPUT_PLANES,
+        board_height: 9,
+        board_width: 9,
+        block_height: 3,
+        block_width: 3,
+        local_dim: 64,
+        hidden_dim: 256,
+        num_res_blocks: 10,
         head_hidden: 64,
     }
 }
@@ -576,11 +593,18 @@ impl AlphaZeroGame<INPUT_SIZE, POLICY_SIZE, 2> for UltimateTicTacToe {
     }
 
     fn net_config() -> AlphaZeroNetConfig {
-        net_block()
+        net_block_deeper()
     }
 
+    /// The default ([`net_block_deeper`]) first: Experiments fall back to the first preset.
     fn net_presets() -> Vec<(&'static str, AlphaZeroNetConfig)> {
-        vec![("block", net_block()), ("block_deep", net_block_deep()), ("resnet", net_resnet()), ("mlp", net_mlp())]
+        vec![
+            ("block_deeper", net_block_deeper()),
+            ("block", net_block()),
+            ("block_deep", net_block_deep()),
+            ("resnet", net_resnet()),
+            ("mlp", net_mlp()),
+        ]
     }
 
     /// The 8 dihedral symmetries of Ultimate Tic-Tac-Toe for replay-buffer augmentation.
@@ -654,6 +678,22 @@ mod tests {
     use crate::minimax::{MinimaxBudget, MinimaxPlayer, TreeMinimaxPayload, TreeMinimaxPlayer};
     use crate::player::Player;
     use crate::tree::Node;
+
+    #[test]
+    fn net_size_knobs_resize_only_the_residual_tower() {
+        assert_eq!(net_block_deeper().size(), (10, 256));
+        assert_eq!(net_block().with_size(10, 0), net_block_deeper());
+        assert_eq!(net_block().with_size(0, 0), net_block());
+        let hp = AlphaZeroHyperparams { net_blocks: 8, net_width: 384, ..AlphaZeroHyperparams::GENERIC };
+        let AlphaZeroNetConfig::BlockNet { local_dim, hidden_dim, num_res_blocks, head_hidden, .. } =
+            hp.sized_net(UltimateTicTacToe::net_config())
+        else {
+            panic!("UTTT's default is a block network")
+        };
+        assert_eq!((local_dim, hidden_dim, num_res_blocks, head_hidden), (64, 384, 8, 64));
+        let resnet = net_resnet().with_size(6, 96);
+        assert_eq!(resnet.size(), (6, 96));
+    }
 
     #[test]
     fn uttt_node_sizes_are_20_and_12_bytes() {

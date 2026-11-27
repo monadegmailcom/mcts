@@ -337,6 +337,8 @@ impl LiveKnobs {
                 "\"weight_decay\":{:.6},",
                 "\"buffer_capacity\":{},",
                 "\"ewa_window\":{},",
+                "\"net_blocks\":{},",
+                "\"net_width\":{},",
                 "\"eval_games\":{},",
                 "\"eval_sims\":{},",
                 "\"eval_threads\":{},",
@@ -361,6 +363,8 @@ impl LiveKnobs {
             self.weight_decay,
             self.buffer_capacity,
             self.ewa_window,
+            self.net_blocks,
+            self.net_width,
             self.eval_games,
             self.eval_sims,
             self.eval_threads,
@@ -753,9 +757,11 @@ impl<const G: usize, const P: usize> ModelContext<G, P, 2> {
 }
 
 impl<const G: usize, const P: usize, const N: usize> ModelContext<G, P, N> {
-    /// Preset name of the live network's architecture (`custom` if it matches none).
-    fn live_net_name<R: AlphaZeroGame<G, P, N>>(&self) -> &'static str {
-        checkpoints::preset_name::<R, G, P, N>(&self.net_config)
+    /// Preset name of the live network's architecture (`custom` if it matches none) with its
+    /// depth × width, e.g. `block_deeper 10×256`.
+    fn live_net_name<R: AlphaZeroGame<G, P, N>>(&self) -> String {
+        let (blocks, width) = self.net_config.size();
+        format!("{} {blocks}×{width}", checkpoints::preset_name::<R, G, P, N>(&self.net_config))
     }
 
     /// Network for an arena engine: the live model, untrained weights of the live architecture,
@@ -2795,6 +2801,12 @@ fn apply_knob_updates(knobs: &mut LiveKnobs, json: &str) {
     if let Some(v) = num("ewa_window") {
         knobs.ewa_window = (v as usize).clamp(1, 1_000_000);
     }
+    if let Some(v) = num("net_blocks") {
+        knobs.net_blocks = (v as usize).min(64);
+    }
+    if let Some(v) = num("net_width") {
+        knobs.net_width = (v as usize).min(4096);
+    }
     if let Some(v) = num("eval_games") {
         knobs.eval_games = (v as usize).clamp(2, 2_000);
     }
@@ -3318,6 +3330,17 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <input type="number" id="k-ewa" min="1" max="1000000" step="100">
       </div>
     </div>
+    <h3 class="knob-section">Network Size (applies on Reset)</h3>
+    <div class="knobs-grid">
+      <div class="knob-item" title="Residual blocks of the network that the next Reset creates. 0 = the game's default architecture (UTTT: block_deeper, 10 blocks). The running network keeps its size; Load → Live takes the size stored in the checkpoint.">
+        <label>Residual Blocks (0 = default)</label>
+        <input type="number" id="k-net-blocks" min="0" max="64" step="1">
+      </div>
+      <div class="knob-item" title="Width (hidden size) of the residual tower of the network that the next Reset creates. 0 = the game's default (UTTT: 256). Cost per network call grows about with width², parameters too.">
+        <label>Tower Width (0 = default)</label>
+        <input type="number" id="k-net-width" min="0" max="4096" step="32">
+      </div>
+    </div>
     <h3 class="knob-section">Arena Evaluation</h3>
     <div class="knobs-grid">
       <div class="knob-item" title="Play the arena after every N-th iteration only: with strong AlphaZero opponents it can take longer than self-play and training together.">
@@ -3784,6 +3807,8 @@ const KNOB_FIELDS = [
   ['weight_decay', 'k-wd', 'float'],
   ['buffer_capacity', 'k-buffer', 'int'],
   ['ewa_window', 'k-ewa', 'int'],
+  ['net_blocks', 'k-net-blocks', 'int'],
+  ['net_width', 'k-net-width', 'int'],
   ['eval_games', 'k-eval-games', 'int'],
   ['eval_sims', 'k-eval-sims', 'int'],
   ['eval_threads', 'k-eval-threads', 'int'],

@@ -27,13 +27,15 @@ This playbook collects experience and recommendations for UTTT, from Nov 14 to N
 | Preset | Architecture | Verdict |
 |---|---|---|
 | `block` | Shared encoder per 3 × 3 sub-board (local 64, hidden 256), 3 residual blocks, about 590k parameters | Fast; plateaus at about 1370–1390 Elo |
-| `block_deep` | The same with 6 residual blocks | **Use this for long runs.** Learns as fast per minute as `block` early on; reached about 1500 and more after hours; costs only 14% sims/s on CUDA |
+| `block_deep` | The same with 6 residual blocks, about 1M parameters | Learns as fast per minute as `block` early on; reached about 1500 and more after hours; costs only 14% sims/s on CUDA. Plateaued at deep27h's strength through runs 3–5 |
+| `block_deeper` | The same with 10 residual blocks | **The default since Nov 27**, for run6. Not measured yet |
 | `resnet` | 4 × 64 convolutions | 6.6× slower than `block`, not better per game |
 | `mlp` | Flat MLP | Learned poorly |
 
 - There is no growth from `block` to `block_deep`; a deeper net trains from scratch.
-- A wider or deeper net than `block_deep` is the obvious next capacity step. It has not been built
-  yet.
+- **Any size:** the knobs `net_blocks` and `net_width` resize the default (`block_deeper`, 10 × 256)
+  for the next Reset or experiment, e.g. 8 × 384. See
+  [training-supervision.md](training-supervision.md) §4, "Capacity".
 
 ## 3. Hyperparameters
 
@@ -41,9 +43,10 @@ This playbook collects experience and recommendations for UTTT, from Nov 14 to N
 |---|---|---|---|
 | `games_per_iteration` | 1024 | 1024 | 256 leaves the batches half empty; 2048 didn't help |
 | `simulations_per_move` | 64 | **200** | 64 is best from scratch for short budgets; 200 helped late in training; 400 didn't |
-| `train_steps` × `batch_size` | 800 × 256 | 200 × 1024 | Same samples, 3.7× faster SGD; reuse ≈ 3.8 |
+| `train_steps` × `batch_size` | 800 × 256 | 200 × 1024 | Same samples, 3.7× faster SGD; reuse ≈ 3.8. Run5: reuse 1.9–7.6 all equal at the plateau |
 | `learning_rate` | 2e-3 | 2e-3 from scratch, 6e-4 to continue, 2e-4 for the final hours | See §5 |
 | `weight_decay` | 1e-4 | 1e-4 | Never varied |
+| `net_blocks` / `net_width` | 0 / 0 (= 10 × 256) | 6 × 256 (`block_deep`) through run5 | Act on Reset only |
 | `buffer_capacity` | 300k | 300k | About 5.5 iterations; never varied |
 | `opening_moves` | 8 | 8 | Moves sampled by visit count, for variety |
 | `dirichlet_alpha` / `_epsilon` | 0.3 / 0.25 | the same | Never varied |
@@ -82,6 +85,7 @@ The pool has no anchor above live200. Elo values above about 1450 extrapolate fr
 | `uttt_run3_iterNNNN` | block_deep | Run3, 64 sims, lr 2e-3 → 6e-4 → 2e-4; snapshots every 2 h | 45–50% vs deep27h; best about iter 2000 (49.7%) |
 | `uttt_run4_iter4703` | block_deep | Run3 final + 300 iterations at 200 sims, lr 6e-4 | **about 50.6% vs deep27h (252-714-234), the strongest net so far** |
 | `uttt_run4_iter4794` | block_deep | iter 4703 + 90 iterations at 400 sims | about 47–48% vs deep27h |
+| `uttt_run5_iter0670` | block_deep | iter 4703 + 670 iterations (11 h) at 200 sims, 2048 games, lr 6e-4, reuse 1.9–7.6 | about 49–50% vs deep27h, as strong as iter 4703; **the second reference for run6** |
 
 - The pod's live network and log from the end of run4 are in `checkpoints/pod_backup_2026-11-25/`.
 - The run4 change log is `checkpoints/uttt_run4_changes.log`.
@@ -130,6 +134,20 @@ The pool has no anchor above live200. Elo values above about 1450 extrapolate fr
      adaptation to the new targets.
    - Run4 ended in a RunPod hardware fault at iteration 4796. Its last setting, 200 sims with 100
      train steps from 4703, never ran.
+8. **Nov 26–27 – run5**, from `uttt_run4_iter4703` on one A40: 200 sims, 2048 games, lr 6e-4.
+
+   | Setting | Hours | Score vs deep27h |
+   |---|---|---|
+   | 400 × 1024 SGD (reuse 3.8) | 4.5 | 49.7% ± 0.9 |
+   | 800 × 1024 (reuse 7.6) | 3.8 | 47.6% ± 1.0 |
+   | 200 × 1024 (reuse 1.9) | 1.9 | 49.7% ± 1.4 |
+   | 200 × 1024, `value_q_weight` 0 | 0.8 | 50.8% ± 2.2, too short |
+
+   - vs live200: flat at 65–68%; the Elo estimate flat at about 1480–1500.
+   - Held-out and train loss flat, no overfitting.
+
+   Verdict: **`block_deep` is at capacity.** Three runs (about 60 h) ended at deep27h's strength
+   with lr, sims and reuse varied. Stopped at iteration 670 for run6 with a bigger network.
 
 ## 6. Where to go next
 
