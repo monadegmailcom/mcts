@@ -58,21 +58,27 @@ This playbook collects experience and recommendations for UTTT, from Nov 14 to N
 
 ## 4. Networks and their strength
 
-Elo pool `checkpoints/uttt_elo_pool.json`, calibrated Nov 21 with 48 games per pair (SE 28–36):
+Elo pool `checkpoints/uttt_elo_pool.json`, 48 games per pair (SE 26–29). Calibrated Nov 21;
+deep27h and run5_iter0670 added on Nov 27 (the old pairings were kept, only the new ones played).
+The refit moved every anchor down by 30–65 Elo, so compare Elo values only within one pool
+version. The Nov 21 pool is kept as `checkpoints/uttt_elo_pool_2026-11-21.json`.
 
-| Anchor | Elo |
-|---|---|
-| Random | 0 |
-| Minimax d1 | 556 |
-| MCTS-200, random rollouts | 603 |
-| Minimax d2 | 663 |
-| Minimax d3 | 819 |
-| `uttt_exp1_block` @100 | 1197 |
-| `uttt_exp4_block` @100 | 1221 |
-| `uttt_live200` @100 | 1371 |
+| Anchor | Elo Nov 27 | Elo Nov 21 |
+|---|---|---|
+| Random | 0 | 0 |
+| Minimax d1 | 527 | 556 |
+| MCTS-200, random rollouts | 571 | 603 |
+| Minimax d2 | 629 | 663 |
+| Minimax d3 | 780 | 819 |
+| `uttt_exp1_block` @100 | 1150 | 1197 |
+| `uttt_exp4_block` @100 | 1176 | 1221 |
+| `uttt_live200` @100 | 1307 | 1371 |
+| `uttt_deep27h_lr2e-4_block_deep` @100 | 1444 ± 28 | – |
+| `uttt_run5_iter0670` @100 | 1443 ± 28 | – |
 
-The pool has no anchor above live200. Elo values above about 1450 extrapolate from scores of
-67–72% against live200 and are uncertain. Calibrate deep27h or run4_iter4703 into the pool next.
+- deep27h vs run5_iter0670 head-to-head: 6-31-11 (45%), within the noise of the run5 evaluations
+  (49–50% over thousands of games).
+- Elo above about 1450 is no longer extrapolated: the pool has two anchors there.
 
 | Checkpoint | Preset | How it was trained | Strength |
 |---|---|---|---|
@@ -172,8 +178,7 @@ The open question: how do we get clearly above deep27h, to 55% or more?
    - deep24h needed about 15 h to plateau.
    - Plan at least 24 h, and use the 15-minute experiments only for the speed check.
 5. **Measurement.**
-   - Calibrate deep27h and run4_iter4703 into the Elo pool, so Elo above 1400 is measured instead of
-     extrapolated.
+   - Done Nov 27: deep27h and run5_iter0670 are anchors in the Elo pool (§4).
    - Once a net scores ≥ 65% vs deep27h, make it the new reference.
 
 **Ideas, not tried:**
